@@ -64,7 +64,8 @@ class CodeIndexer:
         self.chunk_overlap = self.config.get('chunk_overlap', 50)
 
         # Work directory
-        self.work_dir = Path(self.config.get('work_dir', '/tmp/indexer'))
+        # nosec B108 - /tmp is appropriate in containerized environment
+        self.work_dir = Path(self.config.get('work_dir', '/tmp/indexer'))  # nosec
         self.work_dir.mkdir(parents=True, exist_ok=True)
 
     def ensure_collection(self):

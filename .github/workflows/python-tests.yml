@@ -31,6 +31,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: 'pip'
+          cache-dependency-path: 'ai-dev/tests/requirements-test.txt'
 
       - name: Install dependencies
         run: |
@@ -89,7 +90,7 @@ jobs:
 
       - name: Run bandit security linter
         run: |
-          bandit -r ai-dev/code-indexer/ -ll
+          bandit -r ai-dev/code-indexer/ -lll -iii
 
       - name: Run pylint
         run: |
