@@ -20,8 +20,7 @@ from sentence_transformers import SentenceTransformer
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
@@ -34,38 +33,72 @@ class CodeIndexer:
         logger.info("Initializing Code Indexer...")
 
         # Load configuration
-        with open(config_path, 'r') as f:
+        with open(config_path, "r") as f:
             self.config = yaml.safe_load(f)
 
         # Initialize Qdrant client
-        qdrant_url = os.getenv('QDRANT_URL', self.config.get('qdrant_url', 'http://qdrant:6333'))
+        qdrant_url = os.getenv(
+            "QDRANT_URL", self.config.get("qdrant_url", "http://qdrant:6333")
+        )
         self.qdrant = QdrantClient(url=qdrant_url)
         logger.info(f"Connected to Qdrant at {qdrant_url}")
 
         # Initialize embedding model
-        model_name = self.config.get('embedding_model', 'sentence-transformers/all-MiniLM-L6-v2')
+        model_name = self.config.get(
+            "embedding_model", "sentence-transformers/all-MiniLM-L6-v2"
+        )
         logger.info(f"Loading embedding model: {model_name}")
         self.embedding_model = SentenceTransformer(model_name)
         self.embedding_dim = self.embedding_model.get_sentence_embedding_dimension()
 
         # Collection name
-        self.collection_name = self.config.get('collection_name', 'code_embeddings')
+        self.collection_name = self.config.get("collection_name", "code_embeddings")
 
         # Code file extensions to index
-        self.code_extensions = set(self.config.get('code_extensions', [
-            '.py', '.js', '.ts', '.tsx', '.jsx', '.java', '.go', '.rs',
-            '.cpp', '.c', '.h', '.hpp', '.cs', '.rb', '.php', '.swift',
-            '.kt', '.scala', '.sh', '.bash', '.yaml', '.yml', '.json',
-            '.md', '.sql', '.html', '.css', '.vue', '.dockerfile'
-        ]))
+        self.code_extensions = set(
+            self.config.get(
+                "code_extensions",
+                [
+                    ".py",
+                    ".js",
+                    ".ts",
+                    ".tsx",
+                    ".jsx",
+                    ".java",
+                    ".go",
+                    ".rs",
+                    ".cpp",
+                    ".c",
+                    ".h",
+                    ".hpp",
+                    ".cs",
+                    ".rb",
+                    ".php",
+                    ".swift",
+                    ".kt",
+                    ".scala",
+                    ".sh",
+                    ".bash",
+                    ".yaml",
+                    ".yml",
+                    ".json",
+                    ".md",
+                    ".sql",
+                    ".html",
+                    ".css",
+                    ".vue",
+                    ".dockerfile",
+                ],
+            )
+        )
 
         # Chunking parameters
-        self.chunk_size = self.config.get('chunk_size', 500)
-        self.chunk_overlap = self.config.get('chunk_overlap', 50)
+        self.chunk_size = self.config.get("chunk_size", 500)
+        self.chunk_overlap = self.config.get("chunk_overlap", 50)
 
         # Work directory
         # nosec B108 - /tmp is appropriate in containerized environment
-        self.work_dir = Path(self.config.get('work_dir', '/tmp/indexer'))  # nosec
+        self.work_dir = Path(self.config.get("work_dir", "/tmp/indexer"))  # nosec
         self.work_dir.mkdir(parents=True, exist_ok=True)
 
     def ensure_collection(self):
@@ -78,9 +111,8 @@ class CodeIndexer:
             self.qdrant.create_collection(
                 collection_name=self.collection_name,
                 vectors_config=VectorParams(
-                    size=self.embedding_dim,
-                    distance=Distance.COSINE
-                )
+                    size=self.embedding_dim, distance=Distance.COSINE
+                ),
             )
         else:
             logger.info(f"Collection {self.collection_name} already exists")
@@ -106,7 +138,7 @@ class CodeIndexer:
 
     def chunk_code(self, content: str, file_path: str) -> List[Dict[str, Any]]:
         """Chunk code into smaller pieces with overlap."""
-        lines = content.split('\n')
+        lines = content.split("\n")
         chunks = []
 
         # Simple line-based chunking
@@ -114,13 +146,15 @@ class CodeIndexer:
         overlap_lines = self.chunk_overlap
 
         for i in range(0, len(lines), chunk_lines - overlap_lines):
-            chunk_content = '\n'.join(lines[i:i + chunk_lines])
+            chunk_content = "\n".join(lines[i : i + chunk_lines])
             if chunk_content.strip():
-                chunks.append({
-                    'content': chunk_content,
-                    'start_line': i + 1,
-                    'end_line': min(i + chunk_lines, len(lines))
-                })
+                chunks.append(
+                    {
+                        "content": chunk_content,
+                        "start_line": i + 1,
+                        "end_line": min(i + chunk_lines, len(lines)),
+                    }
+                )
 
         return chunks
 
@@ -131,11 +165,19 @@ class CodeIndexer:
             return False
 
         # Skip hidden files and directories
-        if any(part.startswith('.') for part in file_path.parts):
+        if any(part.startswith(".") for part in file_path.parts):
             return False
 
         # Skip common non-code directories
-        skip_dirs = {'node_modules', 'venv', 'env', '__pycache__', 'dist', 'build', '.git'}
+        skip_dirs = {
+            "node_modules",
+            "venv",
+            "env",
+            "__pycache__",
+            "dist",
+            "build",
+            ".git",
+        }
         if any(d in file_path.parts for d in skip_dirs):
             return False
 
@@ -150,7 +192,7 @@ class CodeIndexer:
 
         # Find all code files
         code_files = []
-        for file_path in repo_path.rglob('*'):
+        for file_path in repo_path.rglob("*"):
             if file_path.is_file() and self.should_index_file(file_path):
                 code_files.append(file_path)
 
@@ -163,7 +205,7 @@ class CodeIndexer:
         for file_path in code_files:
             try:
                 # Read file content
-                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                     content = f.read()
 
                 # Skip empty files
@@ -178,25 +220,27 @@ class CodeIndexer:
 
                 for chunk in chunks:
                     # Generate embedding
-                    embedding = self.embedding_model.encode(chunk['content']).tolist()
+                    embedding = self.embedding_model.encode(chunk["content"]).tolist()
 
                     # Create unique ID based on content hash
-                    content_hash = hashlib.sha256(chunk['content'].encode()).hexdigest()[:16]
+                    content_hash = hashlib.sha256(
+                        chunk["content"].encode()
+                    ).hexdigest()[:16]
 
                     # Create point
                     point = PointStruct(
                         id=point_id,
                         vector=embedding,
                         payload={
-                            'repository': repo_name,
-                            'file_path': str(rel_path),
-                            'language': file_path.suffix[1:],  # Remove leading dot
-                            'content': chunk['content'],
-                            'start_line': chunk['start_line'],
-                            'end_line': chunk['end_line'],
-                            'indexed_at': datetime.utcnow().isoformat(),
-                            'content_hash': content_hash
-                        }
+                            "repository": repo_name,
+                            "file_path": str(rel_path),
+                            "language": file_path.suffix[1:],  # Remove leading dot
+                            "content": chunk["content"],
+                            "start_line": chunk["start_line"],
+                            "end_line": chunk["end_line"],
+                            "indexed_at": datetime.utcnow().isoformat(),
+                            "content_hash": content_hash,
+                        },
                     )
                     points.append(point)
                     point_id += 1
@@ -205,8 +249,7 @@ class CodeIndexer:
                     if len(points) >= 100:
                         logger.info(f"Uploading batch of {len(points)} embeddings...")
                         self.qdrant.upsert(
-                            collection_name=self.collection_name,
-                            points=points
+                            collection_name=self.collection_name, points=points
                         )
                         points = []
 
@@ -217,10 +260,7 @@ class CodeIndexer:
         # Upload remaining points
         if points:
             logger.info(f"Uploading final batch of {len(points)} embeddings...")
-            self.qdrant.upsert(
-                collection_name=self.collection_name,
-                points=points
-            )
+            self.qdrant.upsert(collection_name=self.collection_name, points=points)
 
         logger.info(f"Completed indexing {repo_name}: {point_id} chunks indexed")
 
@@ -232,15 +272,15 @@ class CodeIndexer:
         self.ensure_collection()
 
         # Get repositories from config
-        repositories = self.config.get('repositories', [])
+        repositories = self.config.get("repositories", [])
         if not repositories:
             logger.warning("No repositories configured for indexing")
             return
 
         # Index each repository
         for repo_config in repositories:
-            repo_url = repo_config.get('url')
-            repo_name = repo_config.get('name')
+            repo_url = repo_config.get("url")
+            repo_name = repo_config.get("name")
 
             if not repo_url or not repo_name:
                 logger.warning(f"Invalid repository config: {repo_config}")

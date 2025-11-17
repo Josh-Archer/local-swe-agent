@@ -13,11 +13,14 @@ from pathlib import Path
 @pytest.fixture(autouse=True)
 def mock_dependencies():
     """Mock heavy dependencies for faster tests."""
-    with patch.dict('sys.modules', {
-        'sentence_transformers': MagicMock(),
-        'qdrant_client': MagicMock(),
-        'qdrant_client.models': MagicMock(),
-    }):
+    with patch.dict(
+        "sys.modules",
+        {
+            "sentence_transformers": MagicMock(),
+            "qdrant_client": MagicMock(),
+            "qdrant_client.models": MagicMock(),
+        },
+    ):
         yield
 
 
@@ -32,27 +35,21 @@ def temp_workspace():
 def mock_config():
     """Sample configuration for testing."""
     return {
-        'qdrant': {
-            'collection_name': 'test-code-collection',
-            'vector_size': 384,
-            'distance': 'Cosine'
+        "qdrant": {
+            "collection_name": "test-code-collection",
+            "vector_size": 384,
+            "distance": "Cosine",
         },
-        'embedding': {
-            'model': 'all-MiniLM-L6-v2',
-            'batch_size': 32
+        "embedding": {"model": "all-MiniLM-L6-v2", "batch_size": 32},
+        "indexing": {
+            "chunk_size": 500,
+            "chunk_overlap": 50,
+            "file_extensions": [".py", ".js", ".java"],
+            "exclude_patterns": ["__pycache__", ".git", "node_modules"],
         },
-        'indexing': {
-            'chunk_size': 500,
-            'chunk_overlap': 50,
-            'file_extensions': ['.py', '.js', '.java'],
-            'exclude_patterns': ['__pycache__', '.git', 'node_modules']
-        },
-        'repositories': [
-            {
-                'name': 'test-repo',
-                'url': 'https://github.com/test/repo.git'
-            }
-        ]
+        "repositories": [
+            {"name": "test-repo", "url": "https://github.com/test/repo.git"}
+        ],
     }
 
 
@@ -60,7 +57,8 @@ def mock_config():
 def sample_code_file(temp_workspace):
     """Create a sample code file for testing."""
     code_file = temp_workspace / "sample.py"
-    code_file.write_text("""
+    code_file.write_text(
+        """
 def hello_world():
     '''A simple hello world function.'''
     print("Hello, World!")
@@ -71,7 +69,8 @@ class Calculator:
 
     def subtract(self, a, b):
         return a - b
-""")
+"""
+    )
     return code_file
 
 
@@ -131,7 +130,7 @@ class TestFileFiltering:
     def test_handles_binary_files(self, temp_workspace):
         """Test that binary files are handled properly."""
         binary_file = temp_workspace / "image.png"
-        binary_file.write_bytes(b'\x89PNG\r\n\x1a\n')
+        binary_file.write_bytes(b"\x89PNG\r\n\x1a\n")
 
         # Should not try to read as text
         assert binary_file.exists()
@@ -140,7 +139,7 @@ class TestFileFiltering:
 class TestGitOperations:
     """Test Git repository operations."""
 
-    @patch('git.Repo')
+    @patch("git.Repo")
     def test_clone_repository(self, mock_repo):
         """Test cloning a Git repository."""
         mock_repo.clone_from.return_value = Mock()
@@ -148,7 +147,7 @@ class TestGitOperations:
         # Would test actual clone function
         assert mock_repo is not None
 
-    @patch('git.Repo')
+    @patch("git.Repo")
     def test_update_existing_repository(self, mock_repo):
         """Test updating an existing repository."""
         mock_instance = Mock()
@@ -167,7 +166,7 @@ class TestGitOperations:
 class TestEmbeddingGeneration:
     """Test embedding generation."""
 
-    @patch('sentence_transformers.SentenceTransformer')
+    @patch("sentence_transformers.SentenceTransformer")
     def test_generate_embeddings(self, mock_model):
         """Test generating embeddings for code."""
         mock_model.return_value.encode.return_value = [[0.1] * 384]
@@ -190,7 +189,7 @@ class TestEmbeddingGeneration:
 class TestQdrantIntegration:
     """Test Qdrant vector database integration."""
 
-    @patch('qdrant_client.QdrantClient')
+    @patch("qdrant_client.QdrantClient")
     def test_create_collection(self, mock_client):
         """Test creating a Qdrant collection."""
         mock_instance = Mock()
@@ -199,7 +198,7 @@ class TestQdrantIntegration:
         # Would test collection creation
         assert True  # Placeholder
 
-    @patch('qdrant_client.QdrantClient')
+    @patch("qdrant_client.QdrantClient")
     def test_upsert_vectors(self, mock_client):
         """Test upserting vectors to Qdrant."""
         mock_instance = Mock()
@@ -208,7 +207,7 @@ class TestQdrantIntegration:
         # Would test vector upsert
         assert True  # Placeholder
 
-    @patch('qdrant_client.QdrantClient')
+    @patch("qdrant_client.QdrantClient")
     def test_handle_connection_failure(self, mock_client):
         """Test handling Qdrant connection failures."""
         mock_client.side_effect = Exception("Connection failed")
@@ -223,13 +222,13 @@ class TestConfigValidation:
 
     def test_valid_config(self, mock_config):
         """Test that valid config is accepted."""
-        assert 'qdrant' in mock_config
-        assert 'repositories' in mock_config
+        assert "qdrant" in mock_config
+        assert "repositories" in mock_config
 
     def test_missing_required_fields(self):
         """Test handling of missing required fields."""
-        invalid_config = {'qdrant': {}}
-        assert 'repositories' not in invalid_config
+        invalid_config = {"qdrant": {}}
+        assert "repositories" not in invalid_config
 
     def test_invalid_vector_size(self):
         """Test handling of invalid vector size."""
@@ -240,9 +239,9 @@ class TestConfigValidation:
 class TestEndToEnd:
     """End-to-end integration tests."""
 
-    @patch('git.Repo')
-    @patch('sentence_transformers.SentenceTransformer')
-    @patch('qdrant_client.QdrantClient')
+    @patch("git.Repo")
+    @patch("sentence_transformers.SentenceTransformer")
+    @patch("qdrant_client.QdrantClient")
     def test_full_indexing_pipeline(self, mock_qdrant, mock_model, mock_git):
         """Test the complete indexing pipeline."""
         # Setup mocks
@@ -270,6 +269,4 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "slow: marks tests as slow (deselect with '-m \"not slow\"')"
     )
-    config.addinivalue_line(
-        "markers", "integration: marks tests as integration tests"
-    )
+    config.addinivalue_line("markers", "integration: marks tests as integration tests")

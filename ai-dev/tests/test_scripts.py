@@ -13,11 +13,14 @@ SCRIPTS_DIR = Path(__file__).parent.parent / "scripts"
 class TestScriptSyntax:
     """Test that all shell scripts have valid syntax."""
 
-    @pytest.mark.parametrize("script", [
-        "deploy-safe.sh",
-        "check-plex-health.sh",
-        "validate-manifests.sh",
-    ])
+    @pytest.mark.parametrize(
+        "script",
+        [
+            "deploy-safe.sh",
+            "check-plex-health.sh",
+            "validate-manifests.sh",
+        ],
+    )
     def test_script_syntax(self, script):
         """Test shell script syntax with bash -n."""
         script_path = SCRIPTS_DIR / script
@@ -25,9 +28,7 @@ class TestScriptSyntax:
             pytest.skip(f"Script {script} not found")
 
         result = subprocess.run(
-            ["bash", "-n", str(script_path)],
-            capture_output=True,
-            text=True
+            ["bash", "-n", str(script_path)], capture_output=True, text=True
         )
         assert result.returncode == 0, f"Syntax error in {script}: {result.stderr}"
 
@@ -103,8 +104,7 @@ class TestManifestValidation:
                 continue
 
             result = subprocess.run(
-                ["yamllint", "-d", "relaxed", str(yaml_file)],
-                capture_output=True
+                ["yamllint", "-d", "relaxed", str(yaml_file)], capture_output=True
             )
             # Don't fail on warnings, just errors
             # assert result.returncode == 0, f"YAML lint failed for {yaml_file}"

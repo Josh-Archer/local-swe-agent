@@ -26,36 +26,32 @@ def temp_dir():
 def sample_config():
     """Sample YAML configuration for testing."""
     return {
-        'qdrant': {
-            'url': 'http://localhost:6333',
-            'collection_name': 'test-code',
-            'vector_size': 384,
-            'distance': 'Cosine'
+        "qdrant": {
+            "url": "http://localhost:6333",
+            "collection_name": "test-code",
+            "vector_size": 384,
+            "distance": "Cosine",
         },
-        'embedding': {
-            'model': 'all-MiniLM-L6-v2',
-            'batch_size': 32,
-            'max_length': 512
+        "embedding": {"model": "all-MiniLM-L6-v2", "batch_size": 32, "max_length": 512},
+        "indexing": {
+            "chunk_size": 500,
+            "chunk_overlap": 50,
+            "file_extensions": [".py", ".js", ".ts", ".java", ".go"],
+            "exclude_patterns": [
+                "__pycache__",
+                ".git",
+                "node_modules",
+                "venv",
+                ".pytest_cache",
+            ],
         },
-        'indexing': {
-            'chunk_size': 500,
-            'chunk_overlap': 50,
-            'file_extensions': ['.py', '.js', '.ts', '.java', '.go'],
-            'exclude_patterns': [
-                '__pycache__',
-                '.git',
-                'node_modules',
-                'venv',
-                '.pytest_cache'
-            ]
-        },
-        'repositories': [
+        "repositories": [
             {
-                'name': 'test-repo',
-                'url': 'https://github.com/test/repo.git',
-                'branch': 'main'
+                "name": "test-repo",
+                "url": "https://github.com/test/repo.git",
+                "branch": "main",
             }
-        ]
+        ],
     }
 
 
@@ -63,7 +59,7 @@ def sample_config():
 def config_file(temp_dir, sample_config):
     """Create a temporary config file."""
     config_path = temp_dir / "config.yaml"
-    with open(config_path, 'w') as f:
+    with open(config_path, "w") as f:
         yaml.dump(sample_config, f)
     return config_path
 
@@ -111,7 +107,7 @@ if __name__ == "__main__":
 @pytest.fixture
 def sample_javascript_code():
     """Sample JavaScript code for testing."""
-    return '''
+    return """
 /**
  * A sample JavaScript module
  */
@@ -138,7 +134,7 @@ function fibonacci(n) {
 }
 
 export { Calculator, fibonacci };
-'''
+"""
 
 
 @pytest.fixture
@@ -147,7 +143,7 @@ def mock_qdrant_client():
     client = MagicMock()
     client.get_collections.return_value = Mock(collections=[])
     client.create_collection.return_value = True
-    client.upsert.return_value = Mock(status='completed')
+    client.upsert.return_value = Mock(status="completed")
     return client
 
 
@@ -165,15 +161,16 @@ def mock_sentence_transformer():
 def mock_git_repo():
     """Mock Git repository for testing."""
     repo = MagicMock()
-    repo.working_dir = '/tmp/test-repo'
-    repo.remotes.origin.url = 'https://github.com/test/repo.git'
-    repo.head.commit.hexsha = 'abc123'
+    repo.working_dir = "/tmp/test-repo"
+    repo.remotes.origin.url = "https://github.com/test/repo.git"
+    repo.head.commit.hexsha = "abc123"
     return repo
 
 
 @pytest.fixture
 def create_test_repo(temp_dir):
     """Factory fixture to create test repositories."""
+
     def _create_repo(name: str, files: dict):
         """
         Create a test repository with specified files.
