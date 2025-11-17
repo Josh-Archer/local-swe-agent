@@ -2,13 +2,13 @@ name: Python Tests
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [ main, master, develop ]
     paths:
       - 'ai-dev/code-indexer/**'
       - 'ai-dev/tests/**'
       - '.github/workflows/python-tests.yml'
   pull_request:
-    branches: [ main, develop ]
+    branches: [ main, master, develop ]
     paths:
       - 'ai-dev/code-indexer/**'
       - 'ai-dev/tests/**'

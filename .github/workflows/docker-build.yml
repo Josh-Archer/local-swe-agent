@@ -2,13 +2,13 @@ name: Docker Build & Test
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [ main, master, develop ]
     paths:
       - 'ai-dev/code-indexer/Dockerfile'
       - 'ai-dev/code-indexer/*.py'
       - '.github/workflows/docker-build.yml'
   pull_request:
-    branches: [ main, develop ]
+    branches: [ main, master, develop ]
     paths:
       - 'ai-dev/code-indexer/Dockerfile'
   workflow_dispatch:
