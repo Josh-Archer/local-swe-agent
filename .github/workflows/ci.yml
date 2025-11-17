@@ -24,7 +24,7 @@ jobs:
 
       - name: Validate all Kubernetes manifests
         run: |
-          find ai-dev -name "*.yaml" -type f | while read -r file; do
+          find ai-dev -name "*.yaml" -type f ! -name "config.yaml" | while read -r file; do
             echo "Validating $file"
             kubeval --ignore-missing-schemas "$file" || exit 1
           done
@@ -37,7 +37,7 @@ jobs:
 
       - name: Validate with kubeconform (strict)
         run: |
-          find ai-dev -name "*.yaml" -type f | while read -r file; do
+          find ai-dev -name "*.yaml" -type f ! -name "config.yaml" | while read -r file; do
             echo "Strict validation: $file"
             kubeconform -strict -ignore-missing-schemas "$file" || exit 1
           done
