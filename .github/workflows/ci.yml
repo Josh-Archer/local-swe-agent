@@ -1,0 +1,141 @@
+name: CI - Validate Manifests
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+
+jobs:
+  validate-manifests:
+    name: Validate Kubernetes Manifests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install kubeval
+        run: |
+          wget https://github.com/instrumenta/kubeval/releases/latest/download/kubeval-linux-amd64.tar.gz
+          tar xf kubeval-linux-amd64.tar.gz
+          sudo mv kubeval /usr/local/bin
+
+      - name: Validate all Kubernetes manifests
+        run: |
+          find ai-dev -name "*.yaml" -type f | while read -r file; do
+            echo "Validating $file"
+            kubeval --ignore-missing-schemas "$file" || exit 1
+          done
+
+      - name: Install kubeconform
+        run: |
+          wget https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz
+          tar xf kubeconform-linux-amd64.tar.gz
+          sudo mv kubeconform /usr/local/bin
+
+      - name: Validate with kubeconform (strict)
+        run: |
+          find ai-dev -name "*.yaml" -type f | while read -r file; do
+            echo "Strict validation: $file"
+            kubeconform -strict -ignore-missing-schemas "$file" || exit 1
+          done
+
+      - name: Check YAML syntax
+        uses: ibiqlik/action-yamllint@v3
+        with:
+          file_or_dir: ai-dev/
+          config_data: |
+            extends: default
+            rules:
+              line-length:
+                max: 120
+                level: warning
+              comments:
+                min-spaces-from-content: 1
+              indentation:
+                spaces: 2
+
+  lint-shell-scripts:
+    name: Lint Shell Scripts
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run shellcheck
+        uses: ludeeus/action-shellcheck@master
+        with:
+          scandir: './ai-dev/scripts'
+
+  check-security:
+    name: Security Scanning
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy security scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'config'
+          scan-ref: 'ai-dev/'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: Check for secrets in code
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.repository.default_branch }}
+          head: HEAD
+          extra_args: --only-verified
+
+  test-deployment-dry-run:
+    name: Test Deployment (Dry Run)
+    runs-on: ubuntu-latest
+    needs: validate-manifests
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: test-cluster
+
+      - name: Test namespace creation
+        run: |
+          kubectl apply -f ai-dev/namespace/namespace.yaml --dry-run=server
+
+      - name: Test PVC creation (dry run)
+        run: |
+          kubectl apply -f ai-dev/storage/pvcs.yaml --dry-run=server || true
+
+      - name: Test deployment manifests (dry run)
+        run: |
+          for manifest in ai-dev/*/deployment*.yaml ai-dev/*/cronjob.yaml; do
+            if [ -f "$manifest" ]; then
+              echo "Testing $manifest"
+              kubectl apply -f "$manifest" --dry-run=server || true
+            fi
+          done
+
+      - name: Validate ConfigMaps
+        run: |
+          for cm in ai-dev/*/configmap.yaml ai-dev/*/*configmap.yaml; do
+            if [ -f "$cm" ]; then
+              echo "Testing $cm"
+              kubectl apply -f "$cm" --dry-run=server
+            fi
+          done

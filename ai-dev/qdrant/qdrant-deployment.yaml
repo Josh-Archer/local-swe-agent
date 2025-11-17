@@ -1,0 +1,91 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qdrant
+  namespace: ai-dev
+  labels:
+    app: qdrant
+    component: vector-database
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate  # Due to RWO volume
+  selector:
+    matchLabels:
+      app: qdrant
+  template:
+    metadata:
+      labels:
+        app: qdrant
+        component: vector-database
+    spec:
+      containers:
+      - name: qdrant
+        image: qdrant/qdrant:v1.11.3
+        ports:
+        - name: http
+          containerPort: 6333
+          protocol: TCP
+        - name: grpc
+          containerPort: 6334
+          protocol: TCP
+        env:
+        - name: QDRANT__SERVICE__GRPC_PORT
+          value: "6334"
+        - name: QDRANT__SERVICE__HTTP_PORT
+          value: "6333"
+        - name: QDRANT__STORAGE__STORAGE_PATH
+          value: "/qdrant/storage"
+        - name: QDRANT__CLUSTER__ENABLED
+          value: "false"
+        volumeMounts:
+        - name: storage
+          mountPath: /qdrant/storage
+        resources:
+          requests:
+            memory: "2Gi"
+            cpu: "1000m"
+          limits:
+            memory: "4Gi"
+            cpu: "2000m"
+        livenessProbe:
+          httpGet:
+            path: /
+            port: http
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+        readinessProbe:
+          httpGet:
+            path: /readiness
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+      volumes:
+      - name: storage
+        persistentVolumeClaim:
+          claimName: qdrant-storage
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: qdrant
+  namespace: ai-dev
+  labels:
+    app: qdrant
+spec:
+  type: ClusterIP
+  ports:
+  - name: http
+    port: 6333
+    targetPort: http
+    protocol: TCP
+  - name: grpc
+    port: 6334
+    targetPort: grpc
+    protocol: TCP
+  selector:
+    app: qdrant

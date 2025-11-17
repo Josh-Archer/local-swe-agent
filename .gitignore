@@ -1,0 +1,234 @@
+# AI-Dev System .gitignore
+
+# ============================================================================
+# SECURITY - NEVER COMMIT THESE
+# ============================================================================
+# Kubernetes Secrets
+*secret*.yaml
+*-secrets.yaml
+*.kubeconfig
+kubeconfig
+
+# Credentials and Keys
+.env
+.env.*
+*.pem
+*.key
+*.crt
+credentials.json
+service-account.json
+*-key.json
+
+# GitHub Tokens
+.github-token
+github-token.txt
+
+# SSH Keys
+id_rsa
+id_rsa.pub
+id_ed25519
+id_ed25519.pub
+
+# ============================================================================
+# Python
+# ============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+env/
+venv/
+ENV/
+.venv
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+*.egg
+.eggs/
+
+# Testing
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+*.cover
+.hypothesis/
+.tox/
+coverage.xml
+.cache
+nosetests.xml
+
+# MyPy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Jupyter
+.ipynb_checkpoints
+*.ipynb
+
+# ============================================================================
+# IDEs and Editors
+# ============================================================================
+# VSCode
+.vscode/
+*.code-workspace
+
+# PyCharm
+.idea/
+*.iml
+*.iws
+
+# Sublime
+*.sublime-project
+*.sublime-workspace
+
+# Vim
+*.swp
+*.swo
+*~
+.netrwhist
+
+# Emacs
+*~
+\#*\#
+.\#*
+
+# ============================================================================
+# Operating Systems
+# ============================================================================
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+*.stackdump
+[Dd]esktop.ini
+
+# Linux
+.directory
+.Trash-*
+
+# ============================================================================
+# Docker
+# ============================================================================
+.dockerignore
+docker-compose.override.yml
+
+# ============================================================================
+# Kubernetes
+# ============================================================================
+# Temporary kubeconfig files
+*.kubeconfig.tmp
+kube-config-*
+
+# Helm
+*.tgz
+.helm/
+
+# ============================================================================
+# Logs and Databases
+# ============================================================================
+*.log
+*.sql
+*.sqlite
+*.sqlite3
+*.db
+
+# ============================================================================
+# AI-Dev Specific
+# ============================================================================
+# Model caches
+models/.cache/
+*.safetensors
+*.bin
+*.onnx
+
+# Vector database
+qdrant-storage/
+vector-db/
+
+# Code indexer cache
+indexer-cache/
+.code-index/
+
+# Large model files (use LFS or external storage)
+*.model
+*.pt
+*.pth
+*.h5
+*.ckpt
+
+# Temporary workspace
+workspace/
+tmp/
+temp/
+
+# Downloaded repositories
+repos/
+repositories/
+
+# ============================================================================
+# Build and Deployment
+# ============================================================================
+# Terraform
+*.tfstate
+*.tfstate.backup
+.terraform/
+terraform.tfvars
+
+# Ansible
+*.retry
+
+# Local configuration overrides
+*-local.yaml
+*-override.yaml
+local-*.yaml
+
+# ============================================================================
+# Documentation Build
+# ============================================================================
+site/
+docs/_build/
+docs/.doctrees/
+
+# ============================================================================
+# Backup Files
+# ============================================================================
+*.bak
+*.backup
+*.old
+*.orig
+*.tmp
+
+# ============================================================================
+# Archives
+# ============================================================================
+*.zip
+*.tar
+*.tar.gz
+*.rar
+*.7z
+
+# ============================================================================
+# Allowed Exceptions
+# ============================================================================
+# Allow specific example files
+!example-secret.yaml
+!.github/
+!.pre-commit-config.yaml
+!.secrets.baseline

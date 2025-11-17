@@ -1,0 +1,72 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: swe-agent-config
+  namespace: ai-dev
+  labels:
+    app: swe-agent
+data:
+  # SWE-agent configuration
+  config.yaml: |
+    # Model configuration - points to our vLLM server
+    model:
+      model_name: "deepseek-coder-6.7b-instruct"
+      base_url: "http://vllm-server.ai-dev.svc.cluster.local:8000/v1"
+      per_instance_cost_limit: 2.00
+      temperature: 0.2
+      top_p: 0.95
+
+    # Agent configuration
+    agent:
+      max_steps: 50
+      timeout: 600  # 10 minutes
+      system_template: |
+        You are an autonomous software engineering agent.
+        You have access to tools to read, edit, and execute code.
+        Your goal is to solve GitHub issues by making the necessary code changes.
+        Always verify your changes by running tests when available.
+
+    # Environment configuration
+    environment:
+      # Use Docker for isolated execution
+      type: "docker"
+      image: "python:3.11"
+      timeout: 1800  # 30 minutes
+
+    # Logging
+    logging:
+      level: "INFO"
+      format: "json"
+
+  # Wrapper script for running SWE-agent tasks
+  run-swe-agent.sh: |
+    #!/bin/bash
+    set -e
+
+    # Default values
+    ISSUE_URL="${ISSUE_URL:-}"
+    REPO_URL="${REPO_URL:-}"
+    OPEN_PR="${OPEN_PR:-false}"
+
+    if [ -z "$ISSUE_URL" ] && [ -z "$REPO_URL" ]; then
+        echo "Error: Either ISSUE_URL or REPO_URL must be set"
+        exit 1
+    fi
+
+    # Build command
+    CMD="sweagent run --config /config/config.yaml"
+
+    if [ -n "$ISSUE_URL" ]; then
+        CMD="$CMD --issue_url $ISSUE_URL"
+    fi
+
+    if [ -n "$REPO_URL" ]; then
+        CMD="$CMD --repo $REPO_URL"
+    fi
+
+    if [ "$OPEN_PR" = "true" ]; then
+        CMD="$CMD --open_pr"
+    fi
+
+    echo "Running: $CMD"
+    exec $CMD

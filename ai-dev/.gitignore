@@ -1,0 +1,77 @@
+# AI-dev .gitignore
+
+# Secrets - NEVER commit these!
+**/secret.yaml
+**/secrets.yaml
+**/*-secret.yaml
+*.key
+*.pem
+
+# Exclude specific secret files that contain actual credentials
+swe-agent/secret-template.yaml  # Keep template
+!swe-agent/secret-template.yaml # But ignore if accidentally named wrong
+
+# Local development
+*.local
+.env
+.env.local
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+*~
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.iml
+.DS_Store
+
+# Kubernetes
+*.kubeconfig
+
+# Docker
+*.tar
+*.tar.gz
+
+# Models (if downloaded locally)
+models/
+*.bin
+*.safetensors
+*.gguf
+
+# Logs
+*.log
+logs/
+
+# Cache
+.cache/
+*.cache

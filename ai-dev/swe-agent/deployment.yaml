@@ -1,0 +1,149 @@
+---
+# SWE-agent service deployment for handling webhooks/API requests
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: swe-agent-server
+  namespace: ai-dev
+  labels:
+    app: swe-agent
+    component: server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: swe-agent
+      component: server
+  template:
+    metadata:
+      labels:
+        app: swe-agent
+        component: server
+    spec:
+      # Run on non-GPU node (CPU-only workload)
+      nodeSelector:
+        kubernetes.io/hostname: homelab2
+
+      serviceAccountName: swe-agent
+
+      containers:
+      - name: swe-agent
+        image: sweagent/swe-agent:latest
+        imagePullPolicy: Always
+
+        env:
+        # Point to our vLLM API
+        - name: LM_BASE_URL
+          value: "http://vllm-server.ai-dev.svc.cluster.local:8000/v1"
+        - name: LM_MODEL
+          value: "deepseek-coder-6.7b-instruct"
+        - name: OPENAI_API_KEY
+          value: "dummy-key"  # vLLM doesn't require real key
+
+        # GitHub token for creating PRs (provide via secret)
+        - name: GITHUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: swe-agent-secrets
+              key: github-token
+              optional: true
+
+        volumeMounts:
+        - name: config
+          mountPath: /config
+        - name: docker-sock
+          mountPath: /var/run/docker.sock
+        - name: workspace
+          mountPath: /workspace
+
+        resources:
+          requests:
+            memory: "4Gi"
+            cpu: "2"
+          limits:
+            memory: "8Gi"
+            cpu: "4"
+
+        # Health checks
+        livenessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - "pgrep -f sweagent || exit 1"
+          initialDelaySeconds: 30
+          periodSeconds: 30
+
+      volumes:
+      - name: config
+        configMap:
+          name: swe-agent-config
+          defaultMode: 0755
+      - name: docker-sock
+        hostPath:
+          path: /var/run/docker.sock
+          type: Socket
+      - name: workspace
+        emptyDir:
+          sizeLimit: 20Gi
+
+---
+# Service for SWE-agent (if exposing API)
+apiVersion: v1
+kind: Service
+metadata:
+  name: swe-agent
+  namespace: ai-dev
+  labels:
+    app: swe-agent
+spec:
+  type: ClusterIP
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 8080
+    protocol: TCP
+  selector:
+    app: swe-agent
+    component: server
+
+---
+# ServiceAccount for SWE-agent
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: swe-agent
+  namespace: ai-dev
+  labels:
+    app: swe-agent
+
+---
+# Role for SWE-agent to create Jobs
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: swe-agent
+  namespace: ai-dev
+rules:
+- apiGroups: ["batch"]
+  resources: ["jobs"]
+  verbs: ["create", "get", "list", "watch", "delete"]
+- apiGroups: [""]
+  resources: ["pods", "pods/log"]
+  verbs: ["get", "list", "watch"]
+
+---
+# RoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: swe-agent
+  namespace: ai-dev
+subjects:
+- kind: ServiceAccount
+  name: swe-agent
+  namespace: ai-dev
+roleRef:
+  kind: Role
+  name: swe-agent
+  apiGroup: rbac.authorization.k8s.io

@@ -1,0 +1,43 @@
+# Kustomize configuration for AI-dev system
+# Deploy all components with: kubectl apply -k ai-dev/
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: ai-dev
+
+resources:
+  # Core namespace
+  - namespace/namespace.yaml
+
+  # Storage
+  - storage/pvcs.yaml
+
+  # Qdrant vector database
+  - qdrant/qdrant-deployment.yaml
+
+  # vLLM inference server
+  - vllm/vllm-configmap.yaml
+  - vllm/vllm-deployment.yaml
+
+  # Code indexer (comment out if not using initially)
+  - code-indexer/configmap.yaml
+  - code-indexer/cronjob.yaml
+
+  # SWE-agent
+  - swe-agent/configmap.yaml
+  - swe-agent/deployment.yaml
+  # Note: Create swe-agent-secrets manually before deploying
+
+  # Ingress
+  - ingress/ingressroute.yaml
+
+# Common labels for all resources
+commonLabels:
+  system: ai-dev
+  managed-by: kustomize
+
+# Annotations
+commonAnnotations:
+  project: "ai-dev-coding-assistant"
+  documentation: "https://github.com/yourusername/grok-servaar/tree/main/ai-dev"

@@ -1,0 +1,60 @@
+# Code Indexer Configuration
+
+# Qdrant connection
+qdrant_url: "http://qdrant.ai-dev.svc.cluster.local:6333"
+collection_name: "code_embeddings"
+
+# Embedding model
+embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
+
+# Chunking parameters
+chunk_size: 500  # Number of lines per chunk
+chunk_overlap: 50  # Overlap between chunks
+
+# Working directory
+work_dir: "/workspace"
+
+# Code file extensions to index
+code_extensions:
+  - .py
+  - .js
+  - .ts
+  - .tsx
+  - .jsx
+  - .java
+  - .go
+  - .rs
+  - .cpp
+  - .c
+  - .h
+  - .hpp
+  - .cs
+  - .rb
+  - .php
+  - .swift
+  - .kt
+  - .scala
+  - .sh
+  - .bash
+  - .yaml
+  - .yml
+  - .json
+  - .md
+  - .sql
+  - .html
+  - .css
+  - .vue
+  - .dockerfile
+
+# Repositories to index
+# Add your repositories here
+repositories:
+  # Example:
+  # - name: "grok-servaar"
+  #   url: "https://github.com/yourusername/grok-servaar.git"
+  # - name: "my-project"
+  #   url: "https://github.com/yourusername/my-project.git"
+
+  # Placeholder - configure with your actual repositories
+  - name: "example-repo"
+    url: "https://github.com/example/repo.git"

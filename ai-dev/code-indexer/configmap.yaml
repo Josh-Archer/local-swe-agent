@@ -1,0 +1,60 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: code-indexer-config
+  namespace: ai-dev
+  labels:
+    app: code-indexer
+data:
+  config.yaml: |
+    # Qdrant connection
+    qdrant_url: "http://qdrant.ai-dev.svc.cluster.local:6333"
+    collection_name: "code_embeddings"
+
+    # Embedding model
+    embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
+
+    # Chunking parameters
+    chunk_size: 500  # Number of lines per chunk
+    chunk_overlap: 50  # Overlap between chunks
+
+    # Working directory
+    work_dir: "/workspace"
+
+    # Code file extensions to index
+    code_extensions:
+      - .py
+      - .js
+      - .ts
+      - .tsx
+      - .jsx
+      - .java
+      - .go
+      - .rs
+      - .cpp
+      - .c
+      - .h
+      - .hpp
+      - .cs
+      - .rb
+      - .php
+      - .swift
+      - .kt
+      - .scala
+      - .sh
+      - .bash
+      - .yaml
+      - .yml
+      - .json
+      - .md
+      - .sql
+      - .html
+      - .css
+      - .vue
+      - .dockerfile
+
+    # Repositories to index
+    repositories:
+      # TODO: Configure with your actual repositories
+      # - name: "grok-servaar"
+      #   url: "https://github.com/yourusername/grok-servaar.git"

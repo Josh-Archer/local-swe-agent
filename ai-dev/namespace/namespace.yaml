@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ai-dev
+  labels:
+    name: ai-dev
+    environment: production
+    purpose: llm-development
+  annotations:
+    description: "Fine-tuned coding LLM system with RAG and SWE-agent"

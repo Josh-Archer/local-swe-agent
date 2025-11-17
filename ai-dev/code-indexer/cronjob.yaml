@@ -1,0 +1,188 @@
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: code-indexer
+  namespace: ai-dev
+  labels:
+    app: code-indexer
+spec:
+  # Run daily at 2 AM
+  schedule: "0 2 * * *"
+
+  # Keep last 3 successful and 1 failed job
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+
+  # Job template
+  jobTemplate:
+    metadata:
+      labels:
+        app: code-indexer
+    spec:
+      # Allow 1 hour to complete
+      activeDeadlineSeconds: 3600
+
+      template:
+        metadata:
+          labels:
+            app: code-indexer
+        spec:
+          restartPolicy: OnFailure
+
+          initContainers:
+          - name: install-deps
+            image: python:3.11-slim
+            command: ["/bin/bash", "-c"]
+            args:
+            - |
+              pip install --no-cache-dir \
+                qdrant-client==1.11.3 \
+                sentence-transformers==3.2.1 \
+                gitpython==3.1.43 \
+                pyyaml==6.0.2 \
+                transformers==4.46.2 \
+                torch==2.5.1 \
+                --extra-index-url https://download.pytorch.org/whl/cpu
+            volumeMounts:
+            - name: pip-cache
+              mountPath: /root/.cache/pip
+
+          containers:
+          - name: indexer
+            image: python:3.11-slim
+            imagePullPolicy: IfNotPresent
+            command: ["/bin/bash", "-c"]
+            args:
+            - |
+              apt-get update && apt-get install -y git curl && \
+              pip install --no-cache-dir \
+                qdrant-client==1.11.3 \
+                sentence-transformers==3.2.1 \
+                gitpython==3.1.43 \
+                pyyaml==6.0.2 \
+                transformers==4.46.2 \
+                torch==2.5.1 \
+                --extra-index-url https://download.pytorch.org/whl/cpu && \
+              python3 /app/index_code.py
+
+            env:
+            - name: QDRANT_URL
+              value: "http://qdrant.ai-dev.svc.cluster.local:6333"
+
+            volumeMounts:
+            - name: config
+              mountPath: /app/config.yaml
+              subPath: config.yaml
+            - name: script
+              mountPath: /app/index_code.py
+              subPath: index_code.py
+            - name: workspace
+              mountPath: /workspace
+            - name: cache
+              mountPath: /root/.cache
+            - name: pip-cache
+              mountPath: /root/.cache/pip
+
+            resources:
+              requests:
+                memory: "2Gi"
+                cpu: "1"
+              limits:
+                memory: "4Gi"
+                cpu: "2"
+
+          volumes:
+          - name: config
+            configMap:
+              name: code-indexer-config
+          - name: script
+            configMap:
+              name: code-indexer-script
+          - name: workspace
+            emptyDir: {}
+          - name: cache
+            persistentVolumeClaim:
+              claimName: indexer-cache
+          - name: pip-cache
+            emptyDir: {}
+
+---
+# Manual job template - create jobs from this for on-demand indexing
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: code-indexer-manual
+  namespace: ai-dev
+  labels:
+    app: code-indexer
+    type: manual
+spec:
+  activeDeadlineSeconds: 3600
+  backoffLimit: 3
+
+  template:
+    metadata:
+      labels:
+        app: code-indexer
+    spec:
+      restartPolicy: OnFailure
+
+      containers:
+      - name: indexer
+        image: python:3.11-slim
+        imagePullPolicy: IfNotPresent
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          apt-get update && apt-get install -y git curl && \
+          pip install --no-cache-dir \
+            qdrant-client==1.11.3 \
+            sentence-transformers==3.2.1 \
+            gitpython==3.1.43 \
+            pyyaml==6.0.2 \
+            transformers==4.46.2 \
+            torch==2.5.1 \
+            --extra-index-url https://download.pytorch.org/whl/cpu && \
+          python3 /app/index_code.py
+
+        env:
+        - name: QDRANT_URL
+          value: "http://qdrant.ai-dev.svc.cluster.local:6333"
+
+        volumeMounts:
+        - name: config
+          mountPath: /app/config.yaml
+          subPath: config.yaml
+        - name: script
+          mountPath: /app/index_code.py
+          subPath: index_code.py
+        - name: workspace
+          mountPath: /workspace
+        - name: cache
+          mountPath: /root/.cache
+        - name: pip-cache
+          mountPath: /root/.cache/pip
+
+        resources:
+          requests:
+            memory: "2Gi"
+            cpu: "1"
+          limits:
+            memory: "4Gi"
+            cpu: "2"
+
+      volumes:
+      - name: config
+        configMap:
+          name: code-indexer-config
+      - name: script
+        configMap:
+          name: code-indexer-script
+      - name: workspace
+        emptyDir: {}
+      - name: cache
+        persistentVolumeClaim:
+          claimName: indexer-cache
+      - name: pip-cache
+        emptyDir: {}

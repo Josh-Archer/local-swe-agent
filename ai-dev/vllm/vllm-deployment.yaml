@@ -1,0 +1,220 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-server
+  namespace: ai-dev
+  labels:
+    app: vllm
+    component: inference-server
+  annotations:
+    description: "vLLM inference server with OpenAI-compatible API"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate  # Due to GPU and RWO volumes
+  selector:
+    matchLabels:
+      app: vllm
+  template:
+    metadata:
+      labels:
+        app: vllm
+        component: inference-server
+      annotations:
+        # CRITICAL: GPU webhook annotation for automatic GPU device mounting
+        gpu-directories: nvidia
+    spec:
+      # Node selection for GPU node (homelabai)
+      nodeSelector:
+        kubernetes.io/hostname: homelabai
+
+      # NVIDIA runtime class (may be set automatically by webhook, but explicit is safer)
+      runtimeClassName: nvidia
+
+      # Init container to download model if not present
+      initContainers:
+      - name: model-downloader
+        image: python:3.11-slim
+        command: ["/bin/bash", "/scripts/download-model.sh"]
+        env:
+        - name: MODEL_NAME
+          valueFrom:
+            configMapKeyRef:
+              name: vllm-config
+              key: MODEL_NAME
+        - name: MODEL_PATH
+          valueFrom:
+            configMapKeyRef:
+              name: vllm-config
+              key: MODEL_PATH
+        - name: HF_HOME
+          value: "/models/.cache"
+        volumeMounts:
+        - name: models
+          mountPath: /models
+        - name: scripts
+          mountPath: /scripts
+        resources:
+          requests:
+            memory: "2Gi"
+            cpu: "2"
+          limits:
+            memory: "4Gi"
+            cpu: "4"
+
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai:v0.6.3.post1
+        command:
+        - python3
+        - -m
+        - vllm.entrypoints.openai.api_server
+        args:
+        - --model=$(MODEL_PATH)
+        - --host=$(HOST)
+        - --port=$(PORT)
+        - --gpu-memory-utilization=$(GPU_MEMORY_UTILIZATION)
+        - --max-model-len=$(MAX_MODEL_LEN)
+        - --dtype=$(DTYPE)
+        - --trust-remote-code
+        - --served-model-name=$(SERVED_MODEL_NAME)
+        - --enable-prefix-caching
+        - --max-num-seqs=$(MAX_NUM_SEQS)
+        # Quantization enabled for AWQ model
+        - --quantization=$(QUANTIZATION)
+        # Uncomment to enable LoRA adapters
+        # - --enable-lora
+        # - --lora-modules=custom=/adapters/custom-lora
+        ports:
+        - name: http
+          containerPort: 8000
+          protocol: TCP
+        env:
+        - name: MODEL_PATH
+          valueFrom:
+            configMapKeyRef:
+              name: vllm-config
+              key: MODEL_PATH
+        - name: HOST
+          valueFrom:
+            configMapKeyRef:
+              name: vllm-config
+              key: HOST
+        - name: PORT
+          valueFrom:
+            configMapKeyRef:
+              name: vllm-config
+              key: PORT
+        - name: GPU_MEMORY_UTILIZATION
+          valueFrom:
+            configMapKeyRef:
+              name: vllm-config
+              key: GPU_MEMORY_UTILIZATION
+        - name: MAX_MODEL_LEN
+          valueFrom:
+            configMapKeyRef:
+              name: vllm-config
+              key: MAX_MODEL_LEN
+        - name: DTYPE
+          valueFrom:
+            configMapKeyRef:
+              name: vllm-config
+              key: DTYPE
+        - name: QUANTIZATION
+          valueFrom:
+            configMapKeyRef:
+              name: vllm-config
+              key: QUANTIZATION
+        - name: SERVED_MODEL_NAME
+          valueFrom:
+            configMapKeyRef:
+              name: vllm-config
+              key: SERVED_MODEL_NAME
+        - name: MAX_NUM_SEQS
+          valueFrom:
+            configMapKeyRef:
+              name: vllm-config
+              key: MAX_NUM_SEQS
+        - name: CUDA_VISIBLE_DEVICES
+          value: "0"
+        - name: NVIDIA_VISIBLE_DEVICES
+          value: "all"
+        - name: NVIDIA_DRIVER_CAPABILITIES
+          value: "compute,utility"
+        - name: HF_HOME
+          value: "/models/.cache"
+        volumeMounts:
+        - name: models
+          mountPath: /models
+        - name: adapters
+          mountPath: /adapters
+        - name: shm
+          mountPath: /dev/shm
+        resources:
+          requests:
+            memory: "12Gi"
+            cpu: "4"
+            nvidia.com/gpu.shared: "2"  # Time-sliced GPU (2/8 shares, others: Ollama=1, TTS=1, Whisper=2)
+          limits:
+            memory: "20Gi"
+            cpu: "8"
+            nvidia.com/gpu.shared: "2"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 120  # Model loading takes time
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 60
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        startupProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 30  # Allow up to 5 minutes for startup
+
+      volumes:
+      - name: models
+        persistentVolumeClaim:
+          claimName: model-storage
+      - name: adapters
+        persistentVolumeClaim:
+          claimName: adapter-storage
+      - name: scripts
+        configMap:
+          name: vllm-config
+          defaultMode: 0755
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 4Gi  # Shared memory for tensor operations
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-server
+  namespace: ai-dev
+  labels:
+    app: vllm
+spec:
+  type: ClusterIP
+  ports:
+  - name: http
+    port: 8000
+    targetPort: http
+    protocol: TCP
+  selector:
+    app: vllm

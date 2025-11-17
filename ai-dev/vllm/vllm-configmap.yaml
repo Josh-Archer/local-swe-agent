@@ -1,0 +1,66 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vllm-config
+  namespace: ai-dev
+  labels:
+    app: vllm
+data:
+  # Model configuration
+  MODEL_NAME: "TheBloke/deepseek-coder-6.7B-instruct-AWQ"
+  MODEL_PATH: "/models/deepseek-coder-6.7b-instruct-awq"
+
+  # vLLM performance settings
+  GPU_MEMORY_UTILIZATION: "0.70"  # Leave headroom for Plex (AWQ uses much less memory)
+  MAX_MODEL_LEN: "8192"
+  DTYPE: "auto"
+  QUANTIZATION: "awq"  # or "gptq" - requires quantized model
+  TRUST_REMOTE_CODE: "true"
+
+  # API settings
+  HOST: "0.0.0.0"
+  PORT: "8000"
+
+  # Performance tuning
+  MAX_NUM_SEQS: "256"  # Batch size
+  TENSOR_PARALLEL_SIZE: "1"  # Single GPU
+  ENABLE_PREFIX_CACHING: "true"
+
+  # OpenAI compatibility
+  SERVED_MODEL_NAME: "deepseek-coder-6.7b-instruct"
+  DISABLE_LOG_REQUESTS: "false"
+
+  # Download script for models
+  download-model.sh: |
+    #!/bin/bash
+    set -e
+
+    MODEL_NAME="${MODEL_NAME:-deepseek-ai/deepseek-coder-6.7b-instruct}"
+    MODEL_PATH="${MODEL_PATH:-/models/deepseek-coder-6.7b-instruct}"
+
+    if [ -d "$MODEL_PATH" ] && [ "$(ls -A $MODEL_PATH)" ]; then
+        echo "Model already exists at $MODEL_PATH"
+        exit 0
+    fi
+
+    echo "Downloading model $MODEL_NAME to $MODEL_PATH..."
+    pip install -U huggingface_hub
+
+    python3 << EOF
+    from huggingface_hub import snapshot_download
+    import os
+
+    model_name = os.environ.get('MODEL_NAME', 'deepseek-ai/deepseek-coder-6.7b-instruct')
+    model_path = os.environ.get('MODEL_PATH', '/models/deepseek-coder-6.7b-instruct')
+
+    print(f"Downloading {model_name} to {model_path}...")
+    snapshot_download(
+        repo_id=model_name,
+        local_dir=model_path,
+        local_dir_use_symlinks=False,
+        revision="main"
+    )
+    print("Download complete!")
+    EOF
+
+    echo "Model download completed successfully"

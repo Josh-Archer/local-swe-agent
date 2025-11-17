@@ -1,0 +1,71 @@
+---
+# PVC for storing base models and quantized models
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: model-storage
+  namespace: ai-dev
+  labels:
+    app: vllm
+    component: model-storage
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 50Gi  # Base model (4-bit quantized ~5GB) + space for multiple models
+
+---
+# PVC for storing LoRA adapters and checkpoints
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: adapter-storage
+  namespace: ai-dev
+  labels:
+    app: vllm
+    component: adapter-storage
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 10Gi  # LoRA adapters are small (50-200MB each)
+
+---
+# PVC for Qdrant vector database
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: qdrant-storage
+  namespace: ai-dev
+  labels:
+    app: qdrant
+    component: vector-db
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 20Gi  # Vector embeddings + metadata
+
+---
+# PVC for code indexer cache and temporary files
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: indexer-cache
+  namespace: ai-dev
+  labels:
+    app: code-indexer
+    component: cache
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 10Gi  # Git clones and temporary processing

@@ -1,0 +1,99 @@
+---
+# Template for running SWE-agent on a specific GitHub issue
+# Usage:
+#   kubectl create -f swe-agent-job.yaml
+# Or customize with environment variables:
+#   cat job-template.yaml | \
+#     sed 's|ISSUE_URL_PLACEHOLDER|https://github.com/owner/repo/issues/123|' | \
+#     kubectl apply -f -
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: swe-agent-issue-NNNN  # Replace NNNN with issue number
+  namespace: ai-dev
+  labels:
+    app: swe-agent
+    type: issue-resolver
+spec:
+  # Allow 2 hours to complete
+  activeDeadlineSeconds: 7200
+  backoffLimit: 2
+
+  template:
+    metadata:
+      labels:
+        app: swe-agent
+        type: issue-resolver
+    spec:
+      restartPolicy: Never
+
+      # Run on non-GPU node
+      nodeSelector:
+        kubernetes.io/hostname: homelab2
+
+      serviceAccountName: swe-agent
+
+      containers:
+      - name: swe-agent
+        image: sweagent/swe-agent:latest
+        imagePullPolicy: Always
+
+        command: ["/bin/bash", "/config/run-swe-agent.sh"]
+
+        env:
+        # Configure the issue URL or repository
+        - name: ISSUE_URL
+          value: "ISSUE_URL_PLACEHOLDER"  # Replace with actual issue URL
+
+        # - name: REPO_URL
+        #   value: "https://github.com/owner/repo"
+
+        # Whether to open a PR automatically
+        - name: OPEN_PR
+          value: "true"
+
+        # Model configuration
+        - name: LM_BASE_URL
+          value: "http://vllm-server.ai-dev.svc.cluster.local:8000/v1"
+        - name: LM_MODEL
+          value: "deepseek-coder-6.7b-instruct"
+        - name: OPENAI_API_KEY
+          value: "dummy-key"
+
+        # GitHub token
+        - name: GITHUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: swe-agent-secrets
+              key: github-token
+              optional: true
+
+        volumeMounts:
+        - name: config
+          mountPath: /config
+        - name: docker-sock
+          mountPath: /var/run/docker.sock
+        - name: workspace
+          mountPath: /workspace
+
+        resources:
+          requests:
+            memory: "8Gi"
+            cpu: "4"
+          limits:
+            memory: "16Gi"
+            cpu: "8"
+
+      volumes:
+      - name: config
+        configMap:
+          name: swe-agent-config
+          defaultMode: 0755
+      - name: docker-sock
+        hostPath:
+          path: /var/run/docker.sock
+          type: Socket
+      - name: workspace
+        emptyDir:
+          sizeLimit: 30Gi

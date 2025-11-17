@@ -1,0 +1,113 @@
+name: Python Tests
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'ai-dev/code-indexer/**'
+      - 'ai-dev/tests/**'
+      - '.github/workflows/python-tests.yml'
+  pull_request:
+    branches: [ main, develop ]
+    paths:
+      - 'ai-dev/code-indexer/**'
+      - 'ai-dev/tests/**'
+  workflow_dispatch:
+
+jobs:
+  test-python-code:
+    name: Test Python Code
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.11']
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            qdrant-client==1.11.3 \
+            sentence-transformers==3.2.1 \
+            gitpython==3.1.43 \
+            pyyaml==6.0.2 \
+            transformers==4.46.2 \
+            torch==2.5.1 \
+            --extra-index-url https://download.pytorch.org/whl/cpu
+          pip install pytest pytest-cov pytest-mock black flake8 mypy
+
+      - name: Lint with black
+        run: |
+          black --check ai-dev/code-indexer/index_code.py ai-dev/tests/
+
+      - name: Lint with flake8
+        run: |
+          flake8 ai-dev/code-indexer/ ai-dev/tests/ --max-line-length=120 --ignore=E203,W503
+
+      - name: Type check with mypy
+        run: |
+          mypy ai-dev/code-indexer/index_code.py --ignore-missing-imports || true
+
+      - name: Run unit tests
+        run: |
+          pytest ai-dev/tests/ -v --cov=ai-dev/code-indexer --cov-report=xml --cov-report=term
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        if: matrix.python-version == '3.11'
+        with:
+          file: ./coverage.xml
+          flags: unittests
+          name: codecov-umbrella
+          fail_ci_if_error: false
+
+  lint-python:
+    name: Python Linting & Security
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install linting tools
+        run: |
+          pip install bandit pylint safety
+
+      - name: Run bandit security linter
+        run: |
+          bandit -r ai-dev/code-indexer/ -ll
+
+      - name: Run pylint
+        run: |
+          pip install \
+            qdrant-client==1.11.3 \
+            sentence-transformers==3.2.1 \
+            gitpython==3.1.43 \
+            pyyaml==6.0.2
+          pylint ai-dev/code-indexer/index_code.py --disable=C,R --max-line-length=120 || true
+
+      - name: Check dependencies for vulnerabilities
+        run: |
+          pip install \
+            qdrant-client==1.11.3 \
+            sentence-transformers==3.2.1 \
+            gitpython==3.1.43 \
+            pyyaml==6.0.2 \
+            transformers==4.46.2 \
+            torch==2.5.1 \
+            --extra-index-url https://download.pytorch.org/whl/cpu
+          safety check --json || true
