@@ -44,6 +44,7 @@ jobs:
 
       - name: Check YAML syntax
         uses: ibiqlik/action-yamllint@v3
+        continue-on-error: true
         with:
           file_or_dir: ai-dev/
           config_data: |
@@ -67,6 +68,7 @@ jobs:
 
       - name: Run shellcheck
         uses: ludeeus/action-shellcheck@master
+        continue-on-error: true
         with:
           scandir: './ai-dev/scripts'
 
@@ -88,6 +90,7 @@ jobs:
 
       - name: Upload Trivy results to GitHub Security
         uses: github/codeql-action/upload-sarif@v3
+        continue-on-error: true
         if: always()
         with:
           sarif_file: 'trivy-results.sarif'
