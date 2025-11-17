@@ -103,11 +103,11 @@ class TestManifestValidation:
             if "tests" in str(yaml_file):
                 continue
 
-            result = subprocess.run(
+            _result = subprocess.run(
                 ["yamllint", "-d", "relaxed", str(yaml_file)], capture_output=True
             )
             # Don't fail on warnings, just errors
-            # assert result.returncode == 0, f"YAML lint failed for {yaml_file}"
+            # assert _result.returncode == 0, f"YAML lint failed for {yaml_file}"
 
 
 @pytest.mark.integration

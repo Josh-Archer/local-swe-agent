@@ -5,7 +5,6 @@ Unit tests for the code indexer script.
 import pytest
 from unittest.mock import Mock, patch, MagicMock
 import tempfile
-import os
 from pathlib import Path
 
 
@@ -85,14 +84,14 @@ class TestCodeChunking:
 
     def test_chunk_respects_size_limit(self):
         """Test that chunks don't exceed size limit."""
-        chunk_size = 100
-        code = "x = 1\n" * 50
+        _chunk_size = 100
+        _code = "x = 1\n" * 50
         # Would verify chunks are <= chunk_size
         assert True  # Placeholder
 
     def test_chunk_preserves_function_boundaries(self):
         """Test that functions aren't split across chunks."""
-        code = """
+        _code = """
 def function_one():
     return 1
 
@@ -171,7 +170,7 @@ class TestEmbeddingGeneration:
         """Test generating embeddings for code."""
         mock_model.return_value.encode.return_value = [[0.1] * 384]
 
-        code_chunks = ["def foo(): pass", "def bar(): pass"]
+        _code_chunks = ["def foo(): pass", "def bar(): pass"]
         # Would test embedding generation
         assert True  # Placeholder
 
