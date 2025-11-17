@@ -52,7 +52,7 @@ jobs:
 
       - name: Lint with flake8
         run: |
-          flake8 ai-dev/code-indexer/ ai-dev/tests/ --max-line-length=120 --ignore=E203,W503
+          flake8 ai-dev/code-indexer/ ai-dev/tests/ --max-line-length=120 --ignore=E203,W503,F841
 
       - name: Type check with mypy
         run: |

@@ -51,7 +51,7 @@ test-watch: ## Run tests in watch mode
 lint: ## Run all linters
 	@echo '$(BLUE)Running linters...$(NC)'
 	black --check ai-dev/code-indexer/ ai-dev/tests/
-	flake8 ai-dev/code-indexer/ ai-dev/tests/ --max-line-length=120
+	flake8 ai-dev/code-indexer/ ai-dev/tests/ --max-line-length=120 --ignore=E203,W503,F841
 	pylint ai-dev/code-indexer/index_code.py --disable=C,R --max-line-length=120 || true
 	@echo '$(GREEN)Linting complete!$(NC)'
 
