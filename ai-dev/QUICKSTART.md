@@ -8,7 +8,8 @@ Get your AI-dev system running in 30 minutes.
 - [ ] kubectl configured and working
 - [ ] Longhorn storage available
 - [ ] Traefik ingress controller deployed
-- [ ] Docker installed locally (for building indexer)
+- [ ] Docker installed locally (**required** — code-indexer is build-yourself)
+- [ ] Code-indexer image built **and** pushed (or preloaded on nodes) — hard gate
 
 ## Step-by-Step Installation
 
@@ -24,22 +25,26 @@ repositories:
     url: "https://github.com/yourusername/my-app.git"
 ```
 
-### Step 2: Build Code Indexer Image (5 min)
+### Step 2: Build and Push Code Indexer Image (required, 5 min)
+
+Code-indexer is **not** published by default. Manifests use a clear placeholder
+(`ghcr.io/YOUR_ORG/local-swe-agent/code-indexer:CHANGE_ME`). Deploy will fail
+validation until you replace it with a real tag.
 
 ```bash
 cd code-indexer
 
-# Build image
-docker build -t code-indexer:latest .
+# Build and push (hard prerequisite)
+docker build -t ghcr.io/<your-org>/local-swe-agent/code-indexer:<tag> .
+docker push ghcr.io/<your-org>/local-swe-agent/code-indexer:<tag>
 
-# Tag for your registry (if using one)
-docker tag code-indexer:latest your-registry/code-indexer:latest
-docker push your-registry/code-indexer:latest
-
-# Update cronjob.yaml with your image name
+# Replace BOTH image: lines in cronjob.yaml with that exact reference.
+# imagePullPolicy: Always  → only if the tag exists in the registry
+# imagePullPolicy: IfNotPresent / Never → only for node-local images
 ```
 
-**Alternative**: Skip for now and deploy without code indexer initially.
+`./scripts/validate-manifests.sh` fails if the placeholder remains or if
+`imagePullPolicy: Always` is set on a local/unpublished image name.
 
 ### Step 3: Create Secrets (2 min)
 

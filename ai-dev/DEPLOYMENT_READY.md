@@ -83,22 +83,23 @@ env:
 
 ## 📋 Pre-Deployment Tasks (You Need to Do)
 
-### 1. Build Code Indexer Image (Required)
+### 1. Build Code Indexer Image (HARD PREREQUISITE)
+
+Code-indexer is build-yourself. Manifests ship with placeholder
+`ghcr.io/YOUR_ORG/local-swe-agent/code-indexer:CHANGE_ME`. Validation fails
+until you replace it; a bad `imagePullPolicy` (e.g. Always on a local-only tag)
+also fails `scripts/validate-manifests.sh`.
 
 ```bash
 cd ai-dev/code-indexer
 
-# Build
-docker build -t code-indexer:latest .
+# Build + push (required)
+docker build -t ghcr.io/<your-org>/local-swe-agent/code-indexer:<tag> .
+docker push ghcr.io/<your-org>/local-swe-agent/code-indexer:<tag>
 
-# Option A: Push to registry
-docker tag code-indexer:latest your-registry.io/code-indexer:latest
-docker push your-registry.io/code-indexer:latest
-
-# Then update cronjob.yaml with your image path
-
-# Option B: Use local (if cluster can access Docker daemon)
-# No push needed, update cronjob.yaml to: code-indexer:latest
+# Replace BOTH image: lines in code-indexer/cronjob.yaml with that reference.
+# Use imagePullPolicy: Always only for published registry tags.
+# For node-local images: image: code-indexer:<tag> + imagePullPolicy: IfNotPresent|Never
 ```
 
 ### 2. Configure Your Repositories (Required)

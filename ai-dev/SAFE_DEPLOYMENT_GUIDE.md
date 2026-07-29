@@ -47,26 +47,32 @@ kubectl exec -n ai ollama-xxxxx -- nvidia-smi
 # Note VRAM usage
 ```
 
-### Build Prerequisites
+### Build Prerequisites (HARD — code-indexer is build-yourself)
+
+Manifests intentionally use a placeholder image that will **not** pull:
+
+`ghcr.io/YOUR_ORG/local-swe-agent/code-indexer:CHANGE_ME`
+
+`scripts/validate-manifests.sh` fails until you replace it and use a safe pull policy.
 
 ```bash
-# 1. Build code-indexer Docker image
+# 1. Build code-indexer Docker image (required before deploy)
 cd ai-dev/code-indexer
-docker build -t code-indexer:latest .
+docker build -t ghcr.io/<your-org>/local-swe-agent/code-indexer:<tag> .
 
-# 2. Tag for your registry (if using one)
-# Option A: Use local registry
-# docker tag code-indexer:latest localhost:5000/code-indexer:latest
-# docker push localhost:5000/code-indexer:latest
+# 2. Publish so cluster nodes can pull (preferred)
+docker push ghcr.io/<your-org>/local-swe-agent/code-indexer:<tag>
 
-# Option B: Use external registry
-# docker tag code-indexer:latest your-registry.io/code-indexer:latest
-# docker push your-registry.io/code-indexer:latest
-
-# 3. Update cronjob.yaml with your image path
-# Edit: code-indexer/cronjob.yaml
-# Change: image: code-indexer:latest
-# To: image: your-registry.io/code-indexer:latest
+# 3. Edit code-indexer/cronjob.yaml — replace BOTH image: lines with the
+#    exact reference you pushed. Remove YOUR_ORG / CHANGE_ME.
+#
+#    imagePullPolicy:
+#      Always       → only if the tag exists in a registry the cluster can pull
+#      IfNotPresent → local/node-preloaded images
+#      Never        → must already exist on the node
+#
+# Optional after CI package publish:
+#   ghcr.io/josh-archer/local-swe-agent/code-indexer:latest
 
 cd ../..
 ```

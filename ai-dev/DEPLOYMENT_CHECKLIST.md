@@ -13,7 +13,7 @@ Use this checklist to ensure proper deployment and configuration.
 - [ ] kubectl can access cluster: `kubectl cluster-info`
 
 ### Prerequisites Installed
-- [ ] Docker (for building code-indexer image)
+- [ ] Docker (**required** — code-indexer image is build-yourself, not public)
 - [ ] Python 3.11+ (for testing scripts)
 - [ ] Git
 - [ ] kubectl
@@ -21,6 +21,7 @@ Use this checklist to ensure proper deployment and configuration.
 
 ### Configuration Files Ready
 - [ ] Repositories configured in `code-indexer/configmap.yaml`
+- [ ] **Code-indexer image built and pushed**; placeholder removed from `cronjob.yaml`
 - [ ] GitHub token generated with `repo` and `workflow` scopes
 - [ ] Domain name configured (e.g., code-llm.archer.casa)
 - [ ] TLS certificates available (or cert-manager configured)
@@ -54,12 +55,14 @@ Use this checklist to ensure proper deployment and configuration.
 - [ ] Verify: `kubectl get secret api-auth-secret -n ai-dev`
 - [ ] See templates: `ingress/example-secret.yaml`, `swe-agent/secret-template.yaml`
 
-### 4. Build and Push Code Indexer Image
-- [ ] Build Docker image: `cd code-indexer && docker build -t code-indexer:latest .`
-- [ ] Tag for registry: `docker tag code-indexer:latest your-registry/code-indexer:latest`
-- [ ] Push to registry: `docker push your-registry/code-indexer:latest`
-- [ ] Update image name in `code-indexer/cronjob.yaml`
-- [ ] (Alternative) Skip if deploying without code indexer initially
+### 4. Build and Push Code Indexer Image (HARD PREREQUISITE)
+Code-indexer is build-yourself. Manifests ship with
+`ghcr.io/YOUR_ORG/local-swe-agent/code-indexer:CHANGE_ME` — that tag will not pull.
+- [ ] Build: `cd code-indexer && docker build -t ghcr.io/<org>/local-swe-agent/code-indexer:<tag> .`
+- [ ] Push: `docker push ghcr.io/<org>/local-swe-agent/code-indexer:<tag>`
+- [ ] Replace **both** CronJob and Job `image:` values in `code-indexer/cronjob.yaml`
+- [ ] Set `imagePullPolicy: Always` only for pushed registry tags; use `IfNotPresent`/`Never` for local-only
+- [ ] Confirm `bash scripts/validate-manifests.sh` passes (fails on placeholder / bad pull policy)
 
 ### 5. Deploy Qdrant Vector Database
 - [ ] Apply deployment: `kubectl apply -f qdrant/qdrant-deployment.yaml`

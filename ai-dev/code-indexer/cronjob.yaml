@@ -1,4 +1,19 @@
 ---
+# HARD PREREQUISITE: the code-indexer image is build-yourself.
+# It is not published to a public registry by default.
+#
+# Before deploy:
+#   1. cd ai-dev/code-indexer
+#   2. docker build -t <registry>/local-swe-agent/code-indexer:<tag> .
+#   3. docker push <registry>/local-swe-agent/code-indexer:<tag>
+#   4. Replace IMAGE below with that exact reference (no CHANGE_ME / YOUR_*)
+#
+# Published GHCR example (after CI push to master, if packages are enabled):
+#   ghcr.io/josh-archer/local-swe-agent/code-indexer:latest
+#
+# Local / node-preloaded image (pull policy must NOT be Always):
+#   code-indexer:latest
+#   imagePullPolicy: IfNotPresent   # or Never
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -30,41 +45,14 @@ spec:
         spec:
           restartPolicy: OnFailure
 
-          initContainers:
-          - name: install-deps
-            image: python:3.11-slim
-            command: ["/bin/bash", "-c"]
-            args:
-            - |
-              pip install --no-cache-dir \
-                qdrant-client==1.11.3 \
-                sentence-transformers==3.2.1 \
-                gitpython==3.1.43 \
-                pyyaml==6.0.2 \
-                transformers==4.46.2 \
-                torch==2.5.1 \
-                --extra-index-url https://download.pytorch.org/whl/cpu
-            volumeMounts:
-            - name: pip-cache
-              mountPath: /root/.cache/pip
-
           containers:
           - name: indexer
-            image: python:3.11-slim
+            # PLACEHOLDER — replace before deploy (validate-manifests.sh will fail otherwise)
+            image: ghcr.io/YOUR_ORG/local-swe-agent/code-indexer:CHANGE_ME
+            # Use Always only for a tag you have actually pushed to a registry.
+            # For local-only images use IfNotPresent or Never.
             imagePullPolicy: IfNotPresent
-            command: ["/bin/bash", "-c"]
-            args:
-            - |
-              apt-get update && apt-get install -y git curl && \
-              pip install --no-cache-dir \
-                qdrant-client==1.11.3 \
-                sentence-transformers==3.2.1 \
-                gitpython==3.1.43 \
-                pyyaml==6.0.2 \
-                transformers==4.46.2 \
-                torch==2.5.1 \
-                --extra-index-url https://download.pytorch.org/whl/cpu && \
-              python3 /app/index_code.py
+            # Image ENTRYPOINT runs index_code.py; override config via ConfigMap mount.
 
             env:
             - name: QDRANT_URL
@@ -74,15 +62,10 @@ spec:
             - name: config
               mountPath: /app/config.yaml
               subPath: config.yaml
-            - name: script
-              mountPath: /app/index_code.py
-              subPath: index_code.py
             - name: workspace
               mountPath: /workspace
             - name: cache
               mountPath: /root/.cache
-            - name: pip-cache
-              mountPath: /root/.cache/pip
 
             resources:
               requests:
@@ -96,19 +79,15 @@ spec:
           - name: config
             configMap:
               name: code-indexer-config
-          - name: script
-            configMap:
-              name: code-indexer-script
           - name: workspace
             emptyDir: {}
           - name: cache
             persistentVolumeClaim:
               claimName: indexer-cache
-          - name: pip-cache
-            emptyDir: {}
 
 ---
 # Manual job template - create jobs from this for on-demand indexing
+# Same image prerequisite as the CronJob above.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -130,21 +109,9 @@ spec:
 
       containers:
       - name: indexer
-        image: python:3.11-slim
+        # PLACEHOLDER — replace before deploy (validate-manifests.sh will fail otherwise)
+        image: ghcr.io/YOUR_ORG/local-swe-agent/code-indexer:CHANGE_ME
         imagePullPolicy: IfNotPresent
-        command: ["/bin/bash", "-c"]
-        args:
-        - |
-          apt-get update && apt-get install -y git curl && \
-          pip install --no-cache-dir \
-            qdrant-client==1.11.3 \
-            sentence-transformers==3.2.1 \
-            gitpython==3.1.43 \
-            pyyaml==6.0.2 \
-            transformers==4.46.2 \
-            torch==2.5.1 \
-            --extra-index-url https://download.pytorch.org/whl/cpu && \
-          python3 /app/index_code.py
 
         env:
         - name: QDRANT_URL
@@ -154,15 +121,10 @@ spec:
         - name: config
           mountPath: /app/config.yaml
           subPath: config.yaml
-        - name: script
-          mountPath: /app/index_code.py
-          subPath: index_code.py
         - name: workspace
           mountPath: /workspace
         - name: cache
           mountPath: /root/.cache
-        - name: pip-cache
-          mountPath: /root/.cache/pip
 
         resources:
           requests:
@@ -176,13 +138,8 @@ spec:
       - name: config
         configMap:
           name: code-indexer-config
-      - name: script
-        configMap:
-          name: code-indexer-script
       - name: workspace
         emptyDir: {}
       - name: cache
         persistentVolumeClaim:
           claimName: indexer-cache
-      - name: pip-cache
-        emptyDir: {}
