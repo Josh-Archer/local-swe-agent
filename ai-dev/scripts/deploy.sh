@@ -58,11 +58,35 @@ echo -e "${BLUE}Step 2: Creating namespace...${NC}"
 kubectl apply -f "$AI_DEV_DIR/namespace/namespace.yaml"
 echo ""
 
+echo -e "${BLUE}Step 2b: PriorityClasses (Plex > AI GPU)...${NC}"
+if [ -f "$AI_DEV_DIR/scheduling/priority-classes.yaml" ]; then
+    kubectl apply -f "$AI_DEV_DIR/scheduling/priority-classes.yaml"
+else
+    echo -e "${YELLOW}Warning: scheduling/priority-classes.yaml not found${NC}"
+fi
+echo ""
+
 echo -e "${BLUE}Step 3: Creating storage...${NC}"
 apply_manifests "storage" "Persistent Volume Claims"
 
 echo -e "${BLUE}Step 4: Deploying Qdrant...${NC}"
 apply_manifests "qdrant" "Qdrant Vector Database"
+
+echo -e "${BLUE}Step 4b: Hard GPU admission (coexistence with Plex)...${NC}"
+if [ -f "$SCRIPT_DIR/check-gpu-admission.sh" ]; then
+    set +e
+    bash "$SCRIPT_DIR/check-gpu-admission.sh"
+    ADMIT_RC=$?
+    set -e
+    if [ "$ADMIT_RC" -ne 0 ]; then
+        echo -e "${RED}GPU admission denied (exit ${ADMIT_RC}) — see ai-dev/GPU_CONSTRAINTS.md${NC}"
+        exit "$ADMIT_RC"
+    fi
+else
+    echo -e "${RED}check-gpu-admission.sh missing${NC}"
+    exit 31
+fi
+echo ""
 
 echo -e "${BLUE}Step 5: Deploying vLLM server...${NC}"
 apply_manifests "vllm" "vLLM Inference Server"

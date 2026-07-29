@@ -1,0 +1,44 @@
+---
+# Cluster-scoped PriorityClasses for GPU coexistence with Plex.
+# HARD constraint (optional install): when both Plex and AI workloads are
+# scheduled with these classes, the kube-scheduler prefers Plex over ai-dev
+# GPU jobs under node pressure / preemption.
+#
+# Apply once per cluster (not namespaced):
+#   kubectl apply -f ai-dev/scheduling/priority-classes.yaml
+#
+# Plex (media namespace, managed outside this repo) should set:
+#   priorityClassName: plex-media-critical
+# AI-dev GPU workloads (vLLM) set:
+#   priorityClassName: ai-dev-gpu
+
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: plex-media-critical
+  labels:
+    system: media-protection
+    purpose: gpu-coexistence
+value: 1000000
+globalDefault: false
+# Never preempt other pods from Plex itself; Plex is protected by higher value.
+preemptionPolicy: Never
+description: >-
+  Critical media / Plex workloads on the shared GPU node. Higher than AI
+  workloads so scheduler and preemption prefer keeping Plex runnable.
+
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: ai-dev-gpu
+  labels:
+    system: ai-dev
+    purpose: gpu-coexistence
+value: 1000
+globalDefault: false
+# Allow higher-priority pods (e.g. Plex) to preempt this class under pressure.
+preemptionPolicy: PreemptLowerPriority
+description: >-
+  Best-effort AI GPU workloads (vLLM, training). Lower priority than Plex;
+  may be preempted when media needs the node.

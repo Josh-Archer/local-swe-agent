@@ -169,17 +169,11 @@ health-check: ## Check all component health
 	@echo '$(BLUE)Running health checks...$(NC)'
 	@echo 'vLLM:' && kubectl exec -n ai-dev -l app=vllm -- curl -f http://localhost:8000/health || echo 'Failed'
 	@echo 'Qdrant:' && kubectl exec -n ai-dev -l app=qdrant -- curl -f http://localhost:6333 || echo 'Failed'
+	@echo 'GPU admission:' && bash ai-dev/scripts/check-gpu-admission.sh || echo 'Failed'
 	@echo 'Plex:' && bash ai-dev/scripts/check-plex-health.sh || echo 'Failed'
 
-# LLM GPU vs remote fallback (see ai-dev/GPU_FALLBACK.md)
-llm-status: ## Show LLM mode / GPU path status
-	@bash ai-dev/scripts/llm-mode.sh status
-
-llm-fallback: ## Switch to non-GPU remote fallback (REASON= optional)
-	@bash ai-dev/scripts/llm-mode.sh fallback --reason "$(or $(REASON),Plex priority / homelabai drained)"
-
-llm-gpu: ## Restore local GPU (vLLM) path (REASON= optional)
-	@bash ai-dev/scripts/llm-mode.sh gpu --reason "$(or $(REASON),homelabai available)"
+gpu-admit: ## Hard GPU admission gate (fail if GPU busy / Plex down)
+	bash ai-dev/scripts/check-gpu-admission.sh
 
 # Cleanup
 clean: ## Clean temporary files

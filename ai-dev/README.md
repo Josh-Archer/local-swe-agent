@@ -58,7 +58,7 @@ A complete coding assistant system running on Kubernetes with:
 - **Features**: LoRA adapter support, prefix caching, batching
 - **GPU**: Time-sliced (2/8 shares = 25% GPU time) with 70% memory limit
 - **GPU Sharing**: Shares GPU with Plex, Ollama (1), TTS (1), Whisper (2)
-- **Non-GPU fallback**: When `homelabai` is drained or Plex needs priority, switch clients to a remote OpenAI-compatible base URL via `scripts/llm-mode.sh` ([GPU_FALLBACK.md](GPU_FALLBACK.md))
+- **Coexistence**: Hard admission gate + PriorityClasses (Plex > AI); see [GPU_CONSTRAINTS.md](GPU_CONSTRAINTS.md)
 - **See**: [GPU_TIMESLICING.md](GPU_TIMESLICING.md) for detailed GPU configuration
 
 ### 2. Qdrant Vector Database

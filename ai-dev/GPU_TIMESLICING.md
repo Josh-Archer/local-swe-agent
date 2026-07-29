@@ -6,6 +6,8 @@ This document explains how GPU time-slicing is configured in your cluster and ho
 
 Your K3s cluster uses **NVIDIA GPU time-slicing** to allow multiple workloads to share a single GPU (NVIDIA 3080 Ti on `homelabai` node). This enables Plex transcoding, Ollama, Whisper, TTS, and vLLM to all use the same GPU without conflicts.
 
+**Hard vs soft coexistence rules** (admission, PriorityClasses, explicit GPU-busy failure modes) are documented in **[GPU_CONSTRAINTS.md](GPU_CONSTRAINTS.md)**. Deploy paths call `scripts/check-gpu-admission.sh` before scheduling AI GPU work; health scripts are no longer advisory-only for hard failures.
+
 ## GPU Configuration
 
 ### NVIDIA Device Plugin
@@ -403,6 +405,26 @@ kubectl describe pod -n ai-dev -l app=vllm | grep /dev/nvidia
 2. Ensure `runtimeClassName: nvidia` is set
 3. Check GPU webhook is running
 4. Verify node has GPU: `kubectl describe node homelabai`
+
+## Hard admission (GPU busy)
+
+Before deploying or scaling AI GPU consumers:
+
+```bash
+bash scripts/check-gpu-admission.sh
+# exit 10 = insufficient free shares (GPU busy)
+# exit 20 = Plex not healthy
+# exit 30 = GPU node missing/NotReady
+```
+
+PriorityClasses (`scheduling/priority-classes.yaml`):
+
+| Class | Value | Workload |
+|-------|-------|----------|
+| `plex-media-critical` | 1000000 | Plex (media ns) |
+| `ai-dev-gpu` | 1000 | vLLM / AI-dev GPU |
+
+See [GPU_CONSTRAINTS.md](GPU_CONSTRAINTS.md) for the full hard/soft matrix.
 
 ## Best Practices
 
