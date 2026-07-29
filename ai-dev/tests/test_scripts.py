@@ -20,8 +20,8 @@ class TestScriptSyntax:
             "check-plex-health.sh",
             "check-gpu-admission.sh",
             "validate-manifests.sh",
-            "swap-model.sh",
-            "check-model-health.sh",
+            "guardrails-check.sh",
+            "run-guarded-issue-job.sh",
         ],
     )
     def test_script_syntax(self, script):

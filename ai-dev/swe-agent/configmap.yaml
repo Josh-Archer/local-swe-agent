@@ -28,6 +28,8 @@ data:
         You have access to tools to read, edit, and execute code.
         Your goal is to solve GitHub issues by making the necessary code changes.
         Always verify your changes by running tests when available.
+        Respect repository guardrails: only touch allowlisted paths, keep
+        the change set small, and never force-push.
 
     # Environment configuration
     environment:
@@ -41,19 +43,301 @@ data:
       level: "INFO"
       format: "json"
 
-  # Wrapper script for running SWE-agent tasks
+  # Default guardrails for the issue-to-PR demo workflow
+  guardrails.yaml: |
+    # Path prefixes (or simple globs) the agent may modify.
+    # Overridden at runtime by PATH_ALLOWLIST (comma-separated).
+    path_allowlist:
+      - "ai-dev/"
+      - "scripts/"
+      - "docs/"
+      - "*.md"
+
+    # Maximum files changed in a single agent run
+    max_changed_files: 10
+
+    # Force-push is forbidden for demo / guarded workflows
+    allow_force_push: false
+
+    # When true, OPEN_PR is ignored unless HUMAN_APPROVED=true
+    require_human_approval: true
+
+  # Post-run guardrail checker (also available as scripts/guardrails-check.sh)
+  guardrails-check.sh: |
+    #!/bin/bash
+    # Validate a working tree / range against guarded issue-to-PR policy.
+    # Usage:
+    #   guardrails-check.sh [--repo-dir DIR] [--base REF]
+    # Env:
+    #   PATH_ALLOWLIST       comma-separated prefixes/globs (default: ai-dev/,scripts/,docs/,*.md)
+    #   MAX_CHANGED_FILES    integer (default: 10)
+    #   ALLOW_FORCE_PUSH     true|false (default: false)
+    #   ENFORCE_GUARDRAILS   true|false (default: true) — when false, warn only
+    set -euo pipefail
+
+    REPO_DIR="${REPO_DIR:-.}"
+    BASE_REF="${BASE_REF:-}"
+    PATH_ALLOWLIST="${PATH_ALLOWLIST:-ai-dev/,scripts/,docs/,*.md}"
+    MAX_CHANGED_FILES="${MAX_CHANGED_FILES:-10}"
+    ALLOW_FORCE_PUSH="${ALLOW_FORCE_PUSH:-false}"
+    ENFORCE_GUARDRAILS="${ENFORCE_GUARDRAILS:-true}"
+
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --repo-dir) REPO_DIR="$2"; shift 2 ;;
+        --base) BASE_REF="$2"; shift 2 ;;
+        --allowlist) PATH_ALLOWLIST="$2"; shift 2 ;;
+        --max-files) MAX_CHANGED_FILES="$2"; shift 2 ;;
+        --allow-force-push) ALLOW_FORCE_PUSH="$2"; shift 2 ;;
+        --enforce) ENFORCE_GUARDRAILS="$2"; shift 2 ;;
+        -h|--help)
+          echo "Usage: guardrails-check.sh [--repo-dir DIR] [--base REF] [--allowlist LIST] [--max-files N]"
+          exit 0
+          ;;
+        *) echo "Unknown arg: $1" >&2; exit 2 ;;
+      esac
+    done
+
+    cd "$REPO_DIR"
+
+    if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      echo "ERROR: $REPO_DIR is not a git repository" >&2
+      exit 1
+    fi
+
+    if [[ -z "$BASE_REF" ]]; then
+      if git rev-parse --verify origin/master >/dev/null 2>&1; then
+        BASE_REF="origin/master"
+      elif git rev-parse --verify origin/main >/dev/null 2>&1; then
+        BASE_REF="origin/main"
+      elif git rev-parse --verify HEAD >/dev/null 2>&1; then
+        BASE_REF="HEAD"
+      else
+        echo "ERROR: could not determine base ref" >&2
+        exit 1
+      fi
+    fi
+
+    # Collect changed files (committed + unstaged vs base when possible)
+    CHANGED=()
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && CHANGED+=("$line")
+    done < <(
+      {
+        git diff --name-only "${BASE_REF}...HEAD" 2>/dev/null || true
+        git diff --name-only "$BASE_REF" 2>/dev/null || true
+        git diff --name-only --cached 2>/dev/null || true
+        git ls-files --others --exclude-standard 2>/dev/null || true
+      } | sed '/^$/d' | sort -u
+    )
+
+    FAIL=0
+    COUNT=${#CHANGED[@]}
+
+    echo "=== Guardrails check ==="
+    echo "Repo:              $(pwd)"
+    echo "Base:              $BASE_REF"
+    echo "Changed files:     $COUNT (max $MAX_CHANGED_FILES)"
+    echo "Path allowlist:    $PATH_ALLOWLIST"
+    echo "Allow force-push:  $ALLOW_FORCE_PUSH"
+    echo ""
+
+    # Max files
+    if [[ "$COUNT" -gt "$MAX_CHANGED_FILES" ]]; then
+      echo "FAIL: changed file count $COUNT exceeds MAX_CHANGED_FILES=$MAX_CHANGED_FILES"
+      FAIL=1
+    else
+      echo "OK:   file count within limit"
+    fi
+
+    # Path allowlist: each changed path must match at least one rule
+    IFS=',' read -r -a RULES <<< "$PATH_ALLOWLIST"
+    path_allowed() {
+      local f="$1" rule
+      for rule in "${RULES[@]}"; do
+        # trim whitespace
+        rule="${rule#"${rule%%[![:space:]]*}"}"
+        rule="${rule%"${rule##*[![:space:]]}"}"
+        [[ -z "$rule" ]] && continue
+        if [[ "$rule" == */ ]]; then
+          [[ "$f" == "$rule"* ]] && return 0
+        elif [[ "$rule" == *\** || "$rule" == *\?* ]]; then
+          # shellcheck disable=SC2254
+          case "$f" in
+            $rule) return 0 ;;
+          esac
+          local base
+          base="$(basename "$f")"
+          # shellcheck disable=SC2254
+          case "$base" in
+            $rule) return 0 ;;
+          esac
+        else
+          [[ "$f" == "$rule" || "$f" == "$rule"/* ]] && return 0
+        fi
+      done
+      return 1
+    }
+
+    if [[ "$COUNT" -eq 0 ]]; then
+      echo "OK:   no changed files to path-check"
+    else
+      for f in "${CHANGED[@]}"; do
+        if path_allowed "$f"; then
+          echo "OK:   allowlisted: $f"
+        else
+          echo "FAIL: path not allowlisted: $f"
+          FAIL=1
+        fi
+      done
+    fi
+
+    # No force-push unless explicitly allowed
+    allow_fp="$(echo "$ALLOW_FORCE_PUSH" | tr '[:upper:]' '[:lower:]')"
+    if [[ "$allow_fp" != "true" ]]; then
+      if [[ "${GIT_PUSH_FORCE:-false}" == "true" || "${FORCE_PUSH:-false}" == "true" ]]; then
+        echo "FAIL: force-push requested but ALLOW_FORCE_PUSH=false"
+        FAIL=1
+      else
+        echo "OK:   force-push disabled"
+      fi
+      if [[ "${GIT_PUSH_OPTS:-}" == *"--force"* || "${GIT_PUSH_OPTS:-}" == *"-f"* ]]; then
+        echo "FAIL: GIT_PUSH_OPTS contains force flag"
+        FAIL=1
+      fi
+    else
+      echo "WARN: force-push is allowed (not recommended for demo)"
+    fi
+
+    echo ""
+    enforce="$(echo "$ENFORCE_GUARDRAILS" | tr '[:upper:]' '[:lower:]')"
+    if [[ "$FAIL" -ne 0 ]]; then
+      echo "=== GUARDRAILS FAILED ==="
+      if [[ "$enforce" == "true" ]]; then
+        exit 1
+      fi
+      echo "(ENFORCE_GUARDRAILS=false — continuing with warnings)"
+      exit 0
+    fi
+
+    echo "=== GUARDRAILS PASSED ==="
+    exit 0
+
   run-swe-agent.sh: |
     #!/bin/bash
-    set -e
+    set -euo pipefail
 
-    # Default values
     ISSUE_URL="${ISSUE_URL:-}"
+    ISSUE_NUMBER="${ISSUE_NUMBER:-}"
+    ISSUE_LABEL="${ISSUE_LABEL:-}"
+    GITHUB_OWNER="${GITHUB_OWNER:-}"
+    GITHUB_REPO="${GITHUB_REPO:-}"
     REPO_URL="${REPO_URL:-}"
     OPEN_PR="${OPEN_PR:-false}"
+    REQUIRE_HUMAN_APPROVAL="${REQUIRE_HUMAN_APPROVAL:-true}"
+    HUMAN_APPROVED="${HUMAN_APPROVED:-false}"
+    PATH_ALLOWLIST="${PATH_ALLOWLIST:-ai-dev/,scripts/,docs/,*.md}"
+    MAX_CHANGED_FILES="${MAX_CHANGED_FILES:-10}"
+    ALLOW_FORCE_PUSH="${ALLOW_FORCE_PUSH:-false}"
+    ENFORCE_GUARDRAILS="${ENFORCE_GUARDRAILS:-true}"
+    WORKSPACE="${WORKSPACE:-/workspace}"
 
-    if [ -z "$ISSUE_URL" ] && [ -z "$REPO_URL" ]; then
-        echo "Error: Either ISSUE_URL or REPO_URL must be set"
+    # Strip placeholder tokens left by the template
+    strip_placeholder() {
+      local v="$1"
+      case "$v" in
+        ""|*_PLACEHOLDER|PLACEHOLDER) echo "" ;;
+        *) echo "$v" ;;
+      esac
+    }
+
+    ISSUE_URL="$(strip_placeholder "$ISSUE_URL")"
+    ISSUE_NUMBER="$(strip_placeholder "$ISSUE_NUMBER")"
+    ISSUE_LABEL="$(strip_placeholder "$ISSUE_LABEL")"
+    GITHUB_OWNER="$(strip_placeholder "$GITHUB_OWNER")"
+    GITHUB_REPO="$(strip_placeholder "$GITHUB_REPO")"
+
+    echo "=== Guarded SWE-agent run ==="
+    echo "Owner/repo:     ${GITHUB_OWNER:-?}/${GITHUB_REPO:-?}"
+    echo "Issue number:   ${ISSUE_NUMBER:-"(none)"}"
+    echo "Issue label:    ${ISSUE_LABEL:-"(none)"}"
+    echo "Issue URL:      ${ISSUE_URL:-"(resolve)"}"
+    echo "OPEN_PR:        $OPEN_PR"
+    echo "Human approval: require=$REQUIRE_HUMAN_APPROVAL approved=$HUMAN_APPROVED"
+    echo "Guardrails:     allowlist=$PATH_ALLOWLIST max_files=$MAX_CHANGED_FILES force_push=$ALLOW_FORCE_PUSH"
+    echo ""
+
+    # Resolve ISSUE_URL from number or label when needed
+    resolve_issue_url() {
+      if [[ -n "$ISSUE_URL" ]]; then
+        return 0
+      fi
+
+      if [[ -z "$GITHUB_OWNER" || -z "$GITHUB_REPO" ]]; then
+        if [[ -n "$REPO_URL" ]]; then
+          # Parse https://github.com/owner/repo(.git)
+          local path
+          path="$(echo "$REPO_URL" | sed -E 's|https?://github.com/||; s|\.git$||; s|/$||')"
+          GITHUB_OWNER="${path%%/*}"
+          GITHUB_REPO="${path#*/}"
+          GITHUB_REPO="${GITHUB_REPO%%/*}"
+        fi
+      fi
+
+      if [[ -n "$ISSUE_NUMBER" && -n "$GITHUB_OWNER" && -n "$GITHUB_REPO" ]]; then
+        ISSUE_URL="https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}/issues/${ISSUE_NUMBER}"
+        echo "Resolved issue URL from number: $ISSUE_URL"
+        return 0
+      fi
+
+      if [[ -n "$ISSUE_LABEL" && -n "$GITHUB_OWNER" && -n "$GITHUB_REPO" ]]; then
+        if [[ -z "${GITHUB_TOKEN:-}" ]]; then
+          echo "ERROR: GITHUB_TOKEN required to resolve issue by label" >&2
+          exit 1
+        fi
+        echo "Resolving first open issue with label '$ISSUE_LABEL' on ${GITHUB_OWNER}/${GITHUB_REPO}..."
+        local api="https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/issues?state=open&labels=$(printf %s "$ISSUE_LABEL" | sed 's/ /%20/g')&per_page=1"
+        local num
+        num="$(curl -fsSL -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json" "$api" \
+          | sed -n 's/.*"number":[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)"
+        if [[ -z "$num" ]]; then
+          echo "ERROR: no open issues found with label '$ISSUE_LABEL'" >&2
+          exit 1
+        fi
+        ISSUE_NUMBER="$num"
+        ISSUE_URL="https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}/issues/${ISSUE_NUMBER}"
+        echo "Resolved issue URL from label: $ISSUE_URL"
+        return 0
+      fi
+
+      return 1
+    }
+
+    if ! resolve_issue_url; then
+      if [[ -z "$ISSUE_URL" && -z "$REPO_URL" ]]; then
+        echo "Error: provide ISSUE_URL, or GITHUB_OWNER+GITHUB_REPO with ISSUE_NUMBER or ISSUE_LABEL, or REPO_URL" >&2
         exit 1
+      fi
+    fi
+
+    # Human approval gate: never open a PR unless explicitly approved
+    req_ha=$(echo "$REQUIRE_HUMAN_APPROVAL" | tr "[:upper:]" "[:lower:]")
+    open_pr_l=$(echo "$OPEN_PR" | tr "[:upper:]" "[:lower:]")
+    human_ok=$(echo "$HUMAN_APPROVED" | tr "[:upper:]" "[:lower:]")
+    if [[ "$req_ha" == "true" && "$open_pr_l" == "true" && "$human_ok" != "true" ]]; then
+      echo "WARNING: OPEN_PR=true but REQUIRE_HUMAN_APPROVAL=true and HUMAN_APPROVED!=true"
+      echo "         Forcing OPEN_PR=false. Re-run with HUMAN_APPROVED=true after review."
+      OPEN_PR="false"
+    fi
+
+    # Never allow force-push in this wrapper
+    allow_fp=$(echo "$ALLOW_FORCE_PUSH" | tr "[:upper:]" "[:lower:]")
+    if [[ "$allow_fp" != "true" ]]; then
+      unset GIT_PUSH_FORCE FORCE_PUSH || true
+      export GIT_PUSH_OPTS="${GIT_PUSH_OPTS:-}"
+      # Strip any force flags
+      GIT_PUSH_OPTS="$(echo "$GIT_PUSH_OPTS" | sed -E 's/(^|[[:space:]])--force(-with-lease)?($|[[:space:]])/ /g; s/(^|[[:space:]])-f($|[[:space:]])/ /g')"
+      export GIT_PUSH_OPTS
     fi
 
     # Resolve endpoint from env (deployment injects ACTIVE_* from llm-endpoint-config)
@@ -89,19 +373,75 @@ data:
     rm -f "${CONFIG_FILE}.bak"
 
     # Build command
-    CMD="sweagent run --config $CONFIG_FILE"
+    CMD=(sweagent run --config /config/config.yaml)
 
-    if [ -n "$ISSUE_URL" ]; then
-        CMD="$CMD --issue_url $ISSUE_URL"
+    if [[ -n "$ISSUE_URL" ]]; then
+      CMD+=(--issue_url "$ISSUE_URL")
     fi
 
-    if [ -n "$REPO_URL" ]; then
-        CMD="$CMD --repo $REPO_URL"
+    if [[ -n "$REPO_URL" ]]; then
+      CMD+=(--repo "$REPO_URL")
+    elif [[ -n "$GITHUB_OWNER" && -n "$GITHUB_REPO" ]]; then
+      CMD+=(--repo "https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}")
     fi
 
-    if [ "$OPEN_PR" = "true" ]; then
-        CMD="$CMD --open_pr"
+    open_pr_l=$(echo "$OPEN_PR" | tr "[:upper:]" "[:lower:]")
+    if [[ "$open_pr_l" == "true" ]]; then
+      CMD+=(--open_pr)
     fi
 
-    echo "Running: $CMD"
-    exec $CMD
+    echo "Running: ${CMD[*]}"
+    set +e
+    "${CMD[@]}"
+    AGENT_RC=$?
+    set -e
+
+    echo ""
+    echo "Agent exit code: $AGENT_RC"
+
+    # Post-run guardrails on workspace clones if present
+    if [[ -x /config/guardrails-check.sh ]]; then
+      CHECK=/config/guardrails-check.sh
+    else
+      CHECK="$(dirname "$0")/guardrails-check.sh"
+    fi
+
+    if [[ -f "$CHECK" ]]; then
+      # Prefer common workspace layouts used by SWE-agent
+      FOUND=0
+      for d in "$WORKSPACE"/* "$WORKSPACE" .; do
+        if [[ -d "$d/.git" ]]; then
+          FOUND=1
+          echo "Running guardrails on $d"
+          PATH_ALLOWLIST="$PATH_ALLOWLIST" \
+          MAX_CHANGED_FILES="$MAX_CHANGED_FILES" \
+          ALLOW_FORCE_PUSH="$ALLOW_FORCE_PUSH" \
+          ENFORCE_GUARDRAILS="$ENFORCE_GUARDRAILS" \
+          bash "$CHECK" --repo-dir "$d" || {
+            echo "Guardrails failed for $d" >&2
+            exit 1
+          }
+        fi
+      done
+      if [[ "$FOUND" -eq 0 ]]; then
+        echo "Note: no git workspace found for post-run guardrails (agent may have cleaned up)."
+      fi
+    fi
+
+    if [[ "$AGENT_RC" -ne 0 ]]; then
+      exit "$AGENT_RC"
+    fi
+
+    open_pr_l=$(echo "$OPEN_PR" | tr "[:upper:]" "[:lower:]")
+    if [[ "$open_pr_l" != "true" ]]; then
+      echo ""
+      echo "=== Human approval gate ==="
+      echo "Agent completed without opening a PR (OPEN_PR=false or approval required)."
+      echo "Next steps:"
+      echo "  1. Review job logs and any pushed branch."
+      echo "  2. Confirm guardrails passed."
+      echo "  3. Open the PR manually, or re-run with OPEN_PR=true HUMAN_APPROVED=true."
+      echo "See: ai-dev/swe-agent/GUARDED_ISSUE_TO_PR.md"
+    fi
+
+    exit 0
