@@ -19,6 +19,7 @@ class TestScriptSyntax:
             "deploy-safe.sh",
             "check-plex-health.sh",
             "validate-manifests.sh",
+            "llm-mode.sh",
         ],
     )
     def test_script_syntax(self, script):
@@ -90,6 +91,63 @@ class TestCheckPlexHealthScript:
             content = f.read()
             # Should reference kubectl
             assert "kubectl" in content
+
+
+class TestLlmModeScript:
+    """Tests for llm-mode.sh (GPU vs non-GPU fallback)."""
+
+    def test_script_exists(self):
+        """Test that llm-mode.sh exists."""
+        script = SCRIPTS_DIR / "llm-mode.sh"
+        assert script.exists()
+
+    def test_has_proper_shebang(self):
+        """Test that script has proper shebang."""
+        script = SCRIPTS_DIR / "llm-mode.sh"
+        with open(script, encoding="utf-8") as f:
+            first_line = f.readline().strip()
+            assert first_line.startswith("#!")
+            assert "bash" in first_line
+
+    def test_set_errexit(self):
+        """Test that script uses set -e for error handling."""
+        script = SCRIPTS_DIR / "llm-mode.sh"
+        with open(script, encoding="utf-8") as f:
+            content = f.read()
+            assert "set -e" in content or "set -o errexit" in content
+
+    def test_documents_status_and_modes(self):
+        """Test that script supports status, gpu, and fallback commands."""
+        script = SCRIPTS_DIR / "llm-mode.sh"
+        with open(script, encoding="utf-8") as f:
+            content = f.read()
+            assert "status" in content
+            assert "fallback" in content
+            assert "GPU path" in content
+            assert "llm-endpoint-config" in content
+            assert "FALLBACK_BASE_URL" in content
+            assert "ACTIVE_BASE_URL" in content
+
+    def test_endpoint_configmap_exists(self):
+        """Test that llm-endpoint ConfigMap manifest exists with fallback keys."""
+        cm = Path(__file__).parent.parent / "vllm" / "llm-endpoint-configmap.yaml"
+        assert cm.exists()
+        with open(cm, encoding="utf-8") as f:
+            content = f.read()
+            assert "LLM_MODE" in content
+            assert "FALLBACK_BASE_URL" in content
+            assert "ACTIVE_BASE_URL" in content
+            assert "STATUS_MESSAGE" in content
+
+    def test_gpu_fallback_docs_exist(self):
+        """Test that coexistence docs exist."""
+        docs = Path(__file__).parent.parent / "GPU_FALLBACK.md"
+        assert docs.exists()
+        with open(docs, encoding="utf-8") as f:
+            content = f.read()
+            assert "Plex" in content
+            assert "FALLBACK_BASE_URL" in content
+            assert "DISABLED" in content
 
 
 class TestManifestValidation:

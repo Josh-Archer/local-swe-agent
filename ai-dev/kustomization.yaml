@@ -16,9 +16,10 @@ resources:
   # Qdrant vector database
   - qdrant/qdrant-deployment.yaml
 
-  # vLLM inference server
+  # vLLM inference server + LLM endpoint routing (GPU vs remote fallback)
   - vllm/vllm-configmap.yaml
   - vllm/vllm-deployment.yaml
+  - vllm/llm-endpoint-configmap.yaml
 
   # Code indexer (comment out if not using initially)
   - code-indexer/configmap.yaml

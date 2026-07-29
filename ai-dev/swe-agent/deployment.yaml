@@ -32,13 +32,35 @@ spec:
         imagePullPolicy: Always
 
         env:
-        # Point to our vLLM API
+        # Active endpoint from llm-endpoint-config (gpu vs remote fallback)
+        # Switch with: bash ai-dev/scripts/llm-mode.sh {gpu|fallback|status}
         - name: LM_BASE_URL
-          value: "http://vllm-server.ai-dev.svc.cluster.local:8000/v1"
+          valueFrom:
+            configMapKeyRef:
+              name: llm-endpoint-config
+              key: ACTIVE_BASE_URL
         - name: LM_MODEL
-          value: "deepseek-coder-6.7b-instruct"
+          valueFrom:
+            configMapKeyRef:
+              name: llm-endpoint-config
+              key: ACTIVE_MODEL
+        - name: LLM_MODE
+          valueFrom:
+            configMapKeyRef:
+              name: llm-endpoint-config
+              key: LLM_MODE
+        - name: LLM_STATUS_MESSAGE
+          valueFrom:
+            configMapKeyRef:
+              name: llm-endpoint-config
+              key: STATUS_MESSAGE
+        # Prefer real key from secret when using remote APIs; run script defaults to dummy-key for local vLLM
         - name: OPENAI_API_KEY
-          value: "dummy-key"  # vLLM doesn't require real key
+          valueFrom:
+            secretKeyRef:
+              name: swe-agent-secrets
+              key: openai-api-key
+              optional: true
 
         # GitHub token for creating PRs (provide via secret)
         - name: GITHUB_TOKEN

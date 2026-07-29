@@ -58,6 +58,7 @@ A complete coding assistant system running on Kubernetes with:
 - **Features**: LoRA adapter support, prefix caching, batching
 - **GPU**: Time-sliced (2/8 shares = 25% GPU time) with 70% memory limit
 - **GPU Sharing**: Shares GPU with Plex, Ollama (1), TTS (1), Whisper (2)
+- **Non-GPU fallback**: When `homelabai` is drained or Plex needs priority, switch clients to a remote OpenAI-compatible base URL via `scripts/llm-mode.sh` ([GPU_FALLBACK.md](GPU_FALLBACK.md))
 - **See**: [GPU_TIMESLICING.md](GPU_TIMESLICING.md) for detailed GPU configuration
 
 ### 2. Qdrant Vector Database
@@ -96,7 +97,8 @@ ai-dev/
 │   └── qdrant-deployment.yaml      # Vector database
 ├── vllm/
 │   ├── vllm-configmap.yaml         # Model and performance config
-│   └── vllm-deployment.yaml        # Inference server with GPU
+│   ├── vllm-deployment.yaml        # Inference server with GPU
+│   └── llm-endpoint-configmap.yaml # GPU vs remote fallback routing
 ├── code-indexer/
 │   ├── Dockerfile                  # Indexer container image
 │   ├── index_code.py               # Python indexing script
@@ -114,7 +116,9 @@ ai-dev/
 │   ├── validate-manifests.sh       # Pre-deployment validation
 │   ├── deploy.sh                   # Full deployment script
 │   ├── test-vllm-api.py            # API testing
-│   └── check-plex-health.sh        # GPU conflict detection
+│   ├── check-plex-health.sh        # GPU conflict detection
+│   └── llm-mode.sh                 # GPU vs remote fallback mode switch
+├── GPU_FALLBACK.md                  # Non-GPU fallback when homelabai drained
 └── README.md                        # This file
 ```
 

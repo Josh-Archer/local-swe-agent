@@ -171,6 +171,16 @@ health-check: ## Check all component health
 	@echo 'Qdrant:' && kubectl exec -n ai-dev -l app=qdrant -- curl -f http://localhost:6333 || echo 'Failed'
 	@echo 'Plex:' && bash ai-dev/scripts/check-plex-health.sh || echo 'Failed'
 
+# LLM GPU vs remote fallback (see ai-dev/GPU_FALLBACK.md)
+llm-status: ## Show LLM mode / GPU path status
+	@bash ai-dev/scripts/llm-mode.sh status
+
+llm-fallback: ## Switch to non-GPU remote fallback (REASON= optional)
+	@bash ai-dev/scripts/llm-mode.sh fallback --reason "$(or $(REASON),Plex priority / homelabai drained)"
+
+llm-gpu: ## Restore local GPU (vLLM) path (REASON= optional)
+	@bash ai-dev/scripts/llm-mode.sh gpu --reason "$(or $(REASON),homelabai available)"
+
 # Cleanup
 clean: ## Clean temporary files
 	@echo '$(BLUE)Cleaning temporary files...$(NC)'

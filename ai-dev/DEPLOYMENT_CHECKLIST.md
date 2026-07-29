@@ -208,11 +208,16 @@ kubectl rollout undo deployment/vllm-server --to-revision=2 -n ai-dev
 
 ### Emergency GPU Release
 ```bash
-# Immediately free GPU for Plex
-kubectl scale deployment vllm-server --replicas=0 -n ai-dev
+# Preferred: free GPU and switch clients to remote OpenAI-compatible endpoint
+# Docs: GPU_FALLBACK.md
+bash scripts/llm-mode.sh fallback --reason "Plex emergency"
+bash scripts/llm-mode.sh status   # expect GPU path: DISABLED
 
 # Verify Plex recovered
 bash scripts/check-plex-health.sh
+
+# Scale-only emergency (clients still point at vLLM until llm-mode fallback):
+kubectl scale deployment vllm-server --replicas=0 -n ai-dev
 ```
 
 ## Troubleshooting Quick Reference
