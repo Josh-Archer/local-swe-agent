@@ -43,16 +43,25 @@ docker push your-registry/code-indexer:latest
 
 ### Step 3: Create Secrets (2 min)
 
+Deploy scripts **refuse placeholder/default credentials**. Create real secrets first
+(see `ingress/example-secret.yaml` and `swe-agent/secret-template.yaml`).
+
 ```bash
-# GitHub token for SWE-agent (get from: https://github.com/settings/tokens/new)
-# Required scopes: repo, workflow
+# Namespace
 kubectl create namespace ai-dev
+
+# GitHub token for SWE-agent (https://github.com/settings/tokens/new)
+# Required scopes: repo, workflow — use a real token, not a placeholder
 kubectl create secret generic swe-agent-secrets \
-  --from-literal=github-token=ghp_YourGitHubTokenHere \
+  --from-literal=github-token="$GITHUB_TOKEN" \
   -n ai-dev
 
-# API auth (optional)
-# Default: user/password - CHANGE IN PRODUCTION!
+# API auth (required before deploying ingress)
+# Generate: htpasswd -nbB admin 'your-strong-password' > /tmp/auth
+kubectl create secret generic api-auth-secret \
+  --from-file=users=/tmp/auth \
+  -n ai-dev
+rm -f /tmp/auth
 ```
 
 ### Step 4: Deploy Everything (10 min)

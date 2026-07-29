@@ -64,7 +64,8 @@ ai-dev/
 │   └── secret-template.yaml           # GitHub token template
 │
 ├── ingress/
-│   └── ingressroute.yaml              # Traefik + auth + rate limiting
+│   ├── ingressroute.yaml              # Traefik + auth middleware + rate limiting
+│   └── example-secret.yaml            # api-auth-secret template (no real creds)
 │
 └── scripts/
     ├── validate-manifests.sh          # Pre-deployment validation

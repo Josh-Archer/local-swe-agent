@@ -227,8 +227,10 @@ docs/.doctrees/
 # ============================================================================
 # Allowed Exceptions
 # ============================================================================
-# Allow specific example files
+# Allow committed templates / examples (no real credentials)
 !example-secret.yaml
+!**/*secret-template.yaml
+!**/*-template.yaml
 !.github/
 !.pre-commit-config.yaml
 !.secrets.baseline

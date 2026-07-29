@@ -31,9 +31,11 @@ resources:
   # SWE-agent
   - swe-agent/configmap.yaml
   - swe-agent/deployment.yaml
-  # Note: Create swe-agent-secrets manually before deploying
+  # Note: Create swe-agent-secrets and api-auth-secret manually before deploying.
+  # Templates (no real credentials): swe-agent/secret-template.yaml,
+  # ingress/example-secret.yaml. Deploy scripts refuse placeholders/defaults.
 
-  # Ingress
+  # Ingress (requires api-auth-secret in-cluster; secret is not applied from git)
   - ingress/ingressroute.yaml
 
 # Common labels for all resources

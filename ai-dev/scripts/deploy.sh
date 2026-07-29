@@ -38,8 +38,10 @@ apply_manifests() {
     fi
 
     for file in "$AI_DEV_DIR/$dir"/*.yaml; do
-        if [ -f "$file" ] && [[ ! "$file" =~ "template" ]]; then
-            echo "  Applying $(basename $file)..."
+        base=$(basename "$file")
+        # Never apply templates / example secrets (placeholders only)
+        if [ -f "$file" ] && [[ ! "$base" =~ template ]] && [[ ! "$base" =~ example-secret ]] && [[ ! "$base" =~ example- ]]; then
+            echo "  Applying $base..."
             kubectl apply -f "$file"
         fi
     done
@@ -48,10 +50,45 @@ apply_manifests() {
     echo ""
 }
 
-# Validate manifests first
+# Validate manifests first (includes placeholder credential refusal)
 echo -e "${BLUE}Step 1: Validating manifests...${NC}"
 bash "$SCRIPT_DIR/validate-manifests.sh"
 echo ""
+
+# Pre-flight: refuse deploy if secrets still look like placeholders / defaults
+require_real_secret() {
+    local name=$1
+    local ns=${2:-ai-dev}
+    if ! kubectl get secret "$name" -n "$ns" &>/dev/null; then
+        echo -e "${RED}✗ Required secret ${name} not found in namespace ${ns}${NC}"
+        return 1
+    fi
+    # Decode all data values and reject known placeholders / defaults
+    local default_b64="dXNlcjokYXByMSRQN0RnOUNuMyRXeUE3QzdyWEF6S1FYVG5xVkxVdTcwCg=="
+    local decoded
+    decoded=$(kubectl get secret "$name" -n "$ns" -o jsonpath='{.data}' 2>/dev/null || true)
+    if echo "$decoded" | grep -qF "$default_b64"; then
+        echo -e "${RED}✗ Secret ${name} still uses the insecure default user/password hash${NC}"
+        return 1
+    fi
+    local keys values key val plain
+    keys=$(kubectl get secret "$name" -n "$ns" -o jsonpath='{.data}' 2>/dev/null | tr ',' '\n' | sed -n 's/.*"\([^"]*\)":.*/\1/p' || true)
+    # Portable check: dump secret data keys and base64-decode each
+    for key in $(kubectl get secret "$name" -n "$ns" -o go-template='{{range $k,$v := .data}}{{printf "%s\n" $k}}{{end}}' 2>/dev/null); do
+        val=$(kubectl get secret "$name" -n "$ns" -o "jsonpath={.data.$key}" 2>/dev/null)
+        plain=$(printf '%s' "$val" | base64 -d 2>/dev/null || printf '%s' "$val" | base64 -D 2>/dev/null || true)
+        if echo "$plain" | grep -qE 'REPLACE_WITH_|CHANGE_ME|CHANGE_THIS|yourpassword|YourToken|ghp_Your|ghp_YOUR|PLACEHOLDER|user:password'; then
+            echo -e "${RED}✗ Secret ${name} key '${key}' contains a placeholder value${NC}"
+            return 1
+        fi
+        if [ "$val" = "$default_b64" ] || echo "$plain" | grep -qF '$apr1$P7Dg9Cn3$WyA7C7rXAzKQXTnqVLUu70'; then
+            echo -e "${RED}✗ Secret ${name} uses the documented insecure default password hash${NC}"
+            return 1
+        fi
+    done
+    echo -e "${GREEN}✓ Secret ${name} present and not a known placeholder${NC}"
+    return 0
+}
 
 # Apply in order
 echo -e "${BLUE}Step 2: Creating namespace...${NC}"
@@ -95,9 +132,29 @@ echo -e "${BLUE}Step 6: Deploying code indexer...${NC}"
 apply_manifests "code-indexer" "Code Indexer"
 
 echo -e "${BLUE}Step 7: Deploying SWE-agent...${NC}"
-apply_manifests "swe-agent" "SWE-agent"
+if kubectl get secret swe-agent-secrets -n ai-dev &>/dev/null; then
+    if ! require_real_secret swe-agent-secrets ai-dev; then
+        echo -e "${RED}Fix swe-agent-secrets before deploying SWE-agent.${NC}"
+        echo "  See: swe-agent/secret-template.yaml"
+        exit 1
+    fi
+    apply_manifests "swe-agent" "SWE-agent"
+else
+    echo -e "${YELLOW}Warning: swe-agent-secrets missing — applying SWE-agent RBAC/config only if present${NC}"
+    echo "  Create with: kubectl create secret generic swe-agent-secrets --from-literal=github-token=... -n ai-dev"
+    apply_manifests "swe-agent" "SWE-agent"
+fi
 
 echo -e "${BLUE}Step 8: Configuring ingress...${NC}"
+# Ingress basicAuth middleware requires a real secret; refuse placeholders / absence
+if ! require_real_secret api-auth-secret ai-dev; then
+    echo -e "${RED}Refusing to deploy ingress: create api-auth-secret with real credentials first.${NC}"
+    echo "  htpasswd -nbB admin 'your-strong-password' > /tmp/auth"
+    echo "  kubectl create secret generic api-auth-secret --from-file=users=/tmp/auth -n ai-dev"
+    echo "  rm -f /tmp/auth"
+    echo "  See: ingress/example-secret.yaml"
+    exit 1
+fi
 apply_manifests "ingress" "Traefik Ingress"
 
 echo ""

@@ -37,14 +37,22 @@ Use this checklist to ensure proper deployment and configuration.
 - [ ] Check Longhorn dashboard for volumes
 
 ### 3. Secrets Configuration
-- [ ] Create GitHub token secret:
+- [ ] Create GitHub token secret (real token, not a placeholder):
   ```bash
   kubectl create secret generic swe-agent-secrets \
-    --from-literal=github-token=ghp_YOUR_TOKEN \
+    --from-literal=github-token="$GITHUB_TOKEN" \
     -n ai-dev
   ```
 - [ ] Verify secret: `kubectl get secret swe-agent-secrets -n ai-dev`
-- [ ] (Optional) Update API auth credentials in `ingress/ingressroute.yaml`
+- [ ] Create API auth secret before ingress (required; deploy refuses placeholders):
+  ```bash
+  htpasswd -nbB admin 'your-strong-password' > /tmp/auth
+  kubectl create secret generic api-auth-secret \
+    --from-file=users=/tmp/auth -n ai-dev
+  rm -f /tmp/auth
+  ```
+- [ ] Verify: `kubectl get secret api-auth-secret -n ai-dev`
+- [ ] See templates: `ingress/example-secret.yaml`, `swe-agent/secret-template.yaml`
 
 ### 4. Build and Push Code Indexer Image
 - [ ] Build Docker image: `cd code-indexer && docker build -t code-indexer:latest .`

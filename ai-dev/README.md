@@ -166,20 +166,47 @@ Update `code-indexer/cronjob.yaml` with your image name.
 
 ### 3. Configure Secrets
 
+Deploy scripts **refuse placeholder or default credentials**. Create real secrets
+before deploying SWE-agent or ingress. Templates (no real credentials) live at:
+
+- `swe-agent/secret-template.yaml`
+- `ingress/example-secret.yaml` (includes optional SealedSecret sketch)
+
 **GitHub Token** (for SWE-agent):
 ```bash
+# Prefer env var / file so the token is not saved in shell history
+export GITHUB_TOKEN="ghp_..."   # real token from https://github.com/settings/tokens
 kubectl create secret generic swe-agent-secrets \
-  --from-literal=github-token=ghp_YourTokenHere \
+  --from-literal=github-token="$GITHUB_TOKEN" \
   -n ai-dev
 ```
 
-**API Authentication** (optional):
-```bash
-# Generate password hash
-htpasswd -nb admin yourpassword | base64
+**API Authentication** (required before deploying ingress):
 
-# Update ingress/ingressroute.yaml with the hash
+Traefik `basicAuth` middleware expects secret `api-auth-secret` with key `users`
+(htpasswd file contents). Without a real secret, ingress is refused (would be
+open or broken).
+
+```bash
+# Generate htpasswd line (bcrypt; needs apache2-utils / httpd-tools)
+htpasswd -nbB admin 'your-strong-password' > /tmp/auth
+
+# Or APR1 via openssl:
+# echo "admin:$(openssl passwd -apr1 'your-strong-password')" > /tmp/auth
+
+# Create the secret (do not commit this file)
+kubectl create secret generic api-auth-secret \
+  --from-file=users=/tmp/auth \
+  -n ai-dev
+rm -f /tmp/auth
+
+# Optional: base64 form if hand-writing a Secret manifest locally
+# base64 -w0 /tmp/auth   # Linux
 ```
+
+**Checks**: `scripts/validate-manifests.sh` and both deploy scripts reject known
+insecure defaults (historical `user`/`password` hash) and placeholder markers
+such as `REPLACE_WITH_`, `CHANGE_ME`, `ghp_Your`, etc.
 
 ### 4. Validate Manifests
 
@@ -450,7 +477,7 @@ python3 scripts/test-vllm-api.py --url http://localhost:8000
 ```
 
 **Common issues**:
-- Auth required: Use credentials from `api-auth-secret`
+- Auth required: Use the username/password you put in `api-auth-secret` (see `ingress/example-secret.yaml`)
 - Rate limited: Check middleware configuration
 - Model not loaded: Check vLLM logs
 - Out of VRAM: Reduce concurrent requests or model size
@@ -514,10 +541,11 @@ kubectl scale deployment vllm-server --replicas=1 -n ai-dev
 
 ## Security Considerations
 
-- **API Authentication**: Enable basic auth in production
-- **GitHub Tokens**: Use fine-grained tokens with minimal scopes
+- **API Authentication**: Ingress deploy requires `api-auth-secret` with real htpasswd data
+- **GitHub Tokens**: Use fine-grained tokens with minimal scopes; see `swe-agent/secret-template.yaml`
 - **Network Policies**: Restrict ingress to vLLM (optional)
-- **Secrets**: Never commit secrets to Git
+- **Secrets**: Never commit secrets to Git; only templates/examples are tracked
+- **Placeholders**: Deploy checks refuse default/placeholder credentials
 - **Rate Limiting**: Enabled by default (100 req/s)
 
 ## Performance Benchmarks

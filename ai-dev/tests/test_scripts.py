@@ -16,6 +16,7 @@ class TestScriptSyntax:
         "script",
         [
             "deploy-safe.sh",
+            "deploy.sh",
             "check-plex-health.sh",
             "check-gpu-admission.sh",
             "validate-manifests.sh",
@@ -231,6 +232,37 @@ class TestManifestValidation:
             )
             # Don't fail on warnings, just errors
             # assert _result.returncode == 0, f"YAML lint failed for {yaml_file}"
+
+    def test_ingressroute_has_no_embedded_default_auth(self):
+        """Ingress must not ship the historical default user/password secret."""
+        ingress = Path(__file__).parent.parent / "ingress" / "ingressroute.yaml"
+        content = ingress.read_text(encoding="utf-8")
+        assert "dXNlcjokYXByMSRQN0RnOUNuMyRXeUE3QzdyWEF6S1FYVG5xVkxVdTcwCg==" not in content
+        assert "$apr1$P7Dg9Cn3$WyA7C7rXAzKQXTnqVLUu70" not in content
+        # Middleware still wires basicAuth to an out-of-band secret
+        assert "api-auth-secret" in content
+        assert "kind: Secret" not in content
+
+    def test_auth_secret_templates_exist_without_real_creds(self):
+        """Templates document generation and only use placeholder markers."""
+        ai_dev = Path(__file__).parent.parent
+        example = ai_dev / "ingress" / "example-secret.yaml"
+        swe = ai_dev / "swe-agent" / "secret-template.yaml"
+        assert example.exists()
+        assert swe.exists()
+        example_text = example.read_text(encoding="utf-8")
+        swe_text = swe.read_text(encoding="utf-8")
+        assert "REPLACE_WITH_" in example_text or "REPLACE_WITH_" in swe_text
+        assert "dXNlcjokYXByMSRQN0RnOUNuMyRXeUE3QzdyWEF6S1FYVG5xVkxVdTcwCg==" not in example_text
+        assert "htpasswd" in example_text
+
+    def test_validate_manifests_refuses_placeholders(self):
+        """validate-manifests.sh must contain placeholder refusal logic."""
+        script = SCRIPTS_DIR / "validate-manifests.sh"
+        content = script.read_text(encoding="utf-8")
+        assert "check_auth_placeholders" in content
+        assert "REPLACE_WITH_" in content
+        assert "dXNlcjokYXByMSRQN0RnOUNuMyRXeUE3QzdyWEF6S1FYVG5xVkxVdTcwCg==" in content
 
 
 @pytest.mark.integration
