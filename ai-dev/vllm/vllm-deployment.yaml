@@ -8,11 +8,13 @@ metadata:
     app: vllm
     component: inference-server
   annotations:
-    description: "vLLM inference server with OpenAI-compatible API"
+    description: "vLLM inference server with OpenAI-compatible API. Model identity lives in ConfigMap vllm-config; swap with scripts/swap-model.sh (no full stack redeploy)."
 spec:
   replicas: 1
   strategy:
-    type: Recreate  # Due to GPU and RWO volumes
+    # Recreate required: single GPU + RWO model PVC cannot run two pods side-by-side.
+    # Model hot-swap = ConfigMap apply + rollout of this Deployment only (brief downtime).
+    type: Recreate
   selector:
     matchLabels:
       app: vllm
@@ -24,6 +26,10 @@ spec:
       annotations:
         # CRITICAL: GPU webhook annotation for automatic GPU device mounting
         gpu-directories: nvidia
+        # Operators: after editing vllm-config, run scripts/swap-model.sh (or
+        # kubectl rollout restart deployment/vllm-server -n ai-dev). ConfigMap
+        # env keys are only loaded at pod start — live reload is not supported.
+        ai-dev.local/model-config: "vllm-config"
     spec:
       # Node selection for GPU node (homelabai)
       nodeSelector:
@@ -37,7 +43,7 @@ spec:
       # NVIDIA runtime class (may be set automatically by webhook, but explicit is safer)
       runtimeClassName: nvidia
 
-      # Init container to download model if not present
+      # Init container: downloads model into model-storage PVC if MODEL_PATH is empty
       initContainers:
       - name: model-downloader
         image: python:3.11-slim
@@ -53,6 +59,11 @@ spec:
             configMapKeyRef:
               name: vllm-config
               key: MODEL_PATH
+        - name: MODEL_REVISION
+          valueFrom:
+            configMapKeyRef:
+              name: vllm-config
+              key: MODEL_REVISION
         - name: HF_HOME
           value: "/models/.cache"
         volumeMounts:
@@ -141,6 +152,16 @@ spec:
             configMapKeyRef:
               name: vllm-config
               key: MAX_NUM_SEQS
+        - name: MODEL_NAME
+          valueFrom:
+            configMapKeyRef:
+              name: vllm-config
+              key: MODEL_NAME
+        - name: MODEL_REVISION
+          valueFrom:
+            configMapKeyRef:
+              name: vllm-config
+              key: MODEL_REVISION
         - name: CUDA_VISIBLE_DEVICES
           value: "0"
         - name: NVIDIA_VISIBLE_DEVICES

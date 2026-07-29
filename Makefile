@@ -165,6 +165,15 @@ test-api: ## Test vLLM API
 	@echo '$(BLUE)Testing vLLM API...$(NC)'
 	python3 ai-dev/scripts/test-vllm-api.py --url http://localhost:8000
 
+# Model hot-swap (ConfigMap + vLLM only — no full stack redeploy)
+swap-model: ## Apply vllm-config and rollout vLLM only (see MODEL_HOT_SWAP.md)
+	@echo '$(BLUE)Config-driven model hot-swap...$(NC)'
+	bash ai-dev/scripts/swap-model.sh
+
+check-model-health: ## Post-model-change health checks for vLLM
+	@echo '$(BLUE)Checking model health...$(NC)'
+	bash ai-dev/scripts/check-model-health.sh
+
 health-check: ## Check all component health
 	@echo '$(BLUE)Running health checks...$(NC)'
 	@echo 'vLLM:' && kubectl exec -n ai-dev -l app=vllm -- curl -f http://localhost:8000/health || echo 'Failed'

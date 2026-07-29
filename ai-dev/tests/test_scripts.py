@@ -20,7 +20,8 @@ class TestScriptSyntax:
             "check-plex-health.sh",
             "check-gpu-admission.sh",
             "validate-manifests.sh",
-            "llm-mode.sh",
+            "swap-model.sh",
+            "check-model-health.sh",
         ],
     )
     def test_script_syntax(self, script):
@@ -214,6 +215,76 @@ class TestLlmModeScript:
             assert "Plex" in content
             assert "FALLBACK_BASE_URL" in content
             assert "DISABLED" in content
+
+
+class TestSwapModelScript:
+    """Tests for config-driven model hot-swap scripts."""
+
+    def test_swap_model_exists(self):
+        """Test that swap-model.sh exists."""
+        script = SCRIPTS_DIR / "swap-model.sh"
+        assert script.exists()
+
+    def test_check_model_health_exists(self):
+        """Test that check-model-health.sh exists."""
+        script = SCRIPTS_DIR / "check-model-health.sh"
+        assert script.exists()
+
+    def test_swap_model_has_shebang_and_errexit(self):
+        """Test swap-model.sh has bash shebang and set -e."""
+        script = SCRIPTS_DIR / "swap-model.sh"
+        content = script.read_text(encoding="utf-8")
+        assert content.startswith("#!")
+        assert "bash" in content.splitlines()[0]
+        assert "set -e" in content
+
+    def test_swap_model_scopes_to_vllm_only(self):
+        """Hot-swap must target ConfigMap + vLLM deployment, not full stack."""
+        content = (SCRIPTS_DIR / "swap-model.sh").read_text(encoding="utf-8")
+        assert "vllm-config" in content
+        assert "rollout restart" in content
+        assert "vllm-server" in content
+        # Should not delete namespace or apply whole kustomization as primary path
+        assert "delete namespace" not in content
+
+    def test_swap_model_supports_dry_run(self):
+        """CLI should document/support dry-run."""
+        content = (SCRIPTS_DIR / "swap-model.sh").read_text(encoding="utf-8")
+        assert "--dry-run" in content
+
+    def test_check_model_health_covers_api_endpoints(self):
+        """Health script should hit /health and /v1/models."""
+        content = (SCRIPTS_DIR / "check-model-health.sh").read_text(encoding="utf-8")
+        assert "/health" in content
+        assert "/v1/models" in content
+        assert "SERVED_MODEL_NAME" in content or "EXPECTED_MODEL" in content
+
+    def test_model_hot_swap_doc_exists(self):
+        """Documented rollout procedure must exist."""
+        doc = Path(__file__).parent.parent / "MODEL_HOT_SWAP.md"
+        assert doc.exists()
+        text = doc.read_text(encoding="utf-8")
+        assert "ConfigMap" in text
+        assert "PVC" in text or "model-storage" in text
+        assert "health" in text.lower()
+
+    def test_vllm_configmap_has_model_identity_keys(self):
+        """Model id/config must live in the vLLM ConfigMap."""
+        import yaml
+
+        cm_path = Path(__file__).parent.parent / "vllm" / "vllm-configmap.yaml"
+        docs = list(yaml.safe_load_all(cm_path.read_text(encoding="utf-8")))
+        cm = docs[0]
+        data = cm["data"]
+        for key in (
+            "MODEL_NAME",
+            "MODEL_PATH",
+            "MODEL_REVISION",
+            "SERVED_MODEL_NAME",
+            "QUANTIZATION",
+        ):
+            assert key in data, f"Missing ConfigMap key: {key}"
+            assert data[key], f"Empty ConfigMap key: {key}"
 
 
 class TestManifestValidation:

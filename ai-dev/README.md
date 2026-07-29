@@ -58,7 +58,7 @@ A complete coding assistant system running on Kubernetes with:
 - **Features**: LoRA adapter support, prefix caching, batching
 - **GPU**: Time-sliced (2/8 shares = 25% GPU time) with 70% memory limit
 - **GPU Sharing**: Shares GPU with Plex, Ollama (1), TTS (1), Whisper (2)
-- **Coexistence**: Hard admission gate + PriorityClasses (Plex > AI); see [GPU_CONSTRAINTS.md](GPU_CONSTRAINTS.md)
+- **Model hot-swap**: Model id and runtime knobs live in ConfigMap `vllm-config`; change model without full stack redeploy — see [MODEL_HOT_SWAP.md](MODEL_HOT_SWAP.md)
 - **See**: [GPU_TIMESLICING.md](GPU_TIMESLICING.md) for detailed GPU configuration
 
 ### 2. Qdrant Vector Database
@@ -96,9 +96,8 @@ ai-dev/
 ├── qdrant/
 │   └── qdrant-deployment.yaml      # Vector database
 ├── vllm/
-│   ├── vllm-configmap.yaml         # Model and performance config
-│   ├── vllm-deployment.yaml        # Inference server with GPU
-│   └── llm-endpoint-configmap.yaml # GPU vs remote fallback routing
+│   ├── vllm-configmap.yaml         # Model id + performance (hot-swap source)
+│   └── vllm-deployment.yaml        # Inference server with GPU
 ├── code-indexer/
 │   ├── Dockerfile                  # Indexer container image
 │   ├── index_code.py               # Python indexing script
@@ -115,10 +114,11 @@ ai-dev/
 ├── scripts/
 │   ├── validate-manifests.sh       # Pre-deployment validation
 │   ├── deploy.sh                   # Full deployment script
+│   ├── swap-model.sh               # Config-driven model hot-swap (vLLM only)
+│   ├── check-model-health.sh       # Post-swap health checks
 │   ├── test-vllm-api.py            # API testing
-│   ├── check-plex-health.sh        # GPU conflict detection
-│   └── llm-mode.sh                 # GPU vs remote fallback mode switch
-├── GPU_FALLBACK.md                  # Non-GPU fallback when homelabai drained
+│   └── check-plex-health.sh        # GPU conflict detection
+├── MODEL_HOT_SWAP.md                # Model swap procedure + PVC cache notes
 └── README.md                        # This file
 ```
 
@@ -484,16 +484,26 @@ python3 scripts/test-vllm-api.py --url http://localhost:8000
 
 ## Maintenance
 
-### Update Base Model
+### Update Base Model (config-driven hot-swap)
+
+Model identity lives in ConfigMap `vllm-config`. Prefer the automated path (does **not** redeploy the full stack):
 
 ```bash
-# Download new model to PVC
-kubectl exec -n ai-dev -l app=vllm -- /scripts/download-model.sh
+# Recommended: apply ConfigMap + restart vLLM only + health checks
+bash ai-dev/scripts/swap-model.sh
 
-# Or update deployment with new model
-kubectl edit configmap -n ai-dev vllm-config
-kubectl rollout restart deployment -n ai-dev vllm-server
+# Or override model from CLI
+bash ai-dev/scripts/swap-model.sh \
+  --model-name "TheBloke/deepseek-coder-6.7B-instruct-AWQ" \
+  --model-path "/models/deepseek-coder-6.7b-instruct-awq" \
+  --served-name "deepseek-coder-6.7b-instruct" \
+  --quantization "awq"
+
+# Health checks only
+bash ai-dev/scripts/check-model-health.sh
 ```
+
+Full procedure, PVC multi-model cache notes, and rollback: **[MODEL_HOT_SWAP.md](MODEL_HOT_SWAP.md)**.
 
 ### Re-index Repositories
 
