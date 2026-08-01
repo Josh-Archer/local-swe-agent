@@ -53,13 +53,33 @@ spec:
         - name: OPEN_PR
           value: "true"
 
-        # Model configuration
+        # Model configuration — follows llm-endpoint-config (gpu | fallback)
         - name: LM_BASE_URL
-          value: "http://vllm-server.ai-dev.svc.cluster.local:8000/v1"
+          valueFrom:
+            configMapKeyRef:
+              name: llm-endpoint-config
+              key: ACTIVE_BASE_URL
         - name: LM_MODEL
-          value: "deepseek-coder-6.7b-instruct"
+          valueFrom:
+            configMapKeyRef:
+              name: llm-endpoint-config
+              key: ACTIVE_MODEL
+        - name: LLM_MODE
+          valueFrom:
+            configMapKeyRef:
+              name: llm-endpoint-config
+              key: LLM_MODE
+        - name: LLM_STATUS_MESSAGE
+          valueFrom:
+            configMapKeyRef:
+              name: llm-endpoint-config
+              key: STATUS_MESSAGE
         - name: OPENAI_API_KEY
-          value: "dummy-key"
+          valueFrom:
+            secretKeyRef:
+              name: swe-agent-secrets
+              key: openai-api-key
+              optional: true
 
         # GitHub token
         - name: GITHUB_TOKEN

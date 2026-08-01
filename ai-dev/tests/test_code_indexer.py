@@ -56,8 +56,7 @@ def mock_config():
 def sample_code_file(temp_workspace):
     """Create a sample code file for testing."""
     code_file = temp_workspace / "sample.py"
-    code_file.write_text(
-        """
+    code_file.write_text("""
 def hello_world():
     '''A simple hello world function.'''
     print("Hello, World!")
@@ -68,8 +67,7 @@ class Calculator:
 
     def subtract(self, a, b):
         return a - b
-"""
-    )
+""")
     return code_file
 
 

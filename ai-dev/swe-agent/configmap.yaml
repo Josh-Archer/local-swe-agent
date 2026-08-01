@@ -7,8 +7,11 @@ metadata:
     app: swe-agent
 data:
   # SWE-agent configuration
+  # base_url / model_name defaults match GPU mode; run-swe-agent.sh overrides from
+  # LM_BASE_URL / LM_MODEL (wired to llm-endpoint-config ACTIVE_* keys).
+  # Switch modes: bash ai-dev/scripts/llm-mode.sh {gpu|fallback|status}
   config.yaml: |
-    # Model configuration - points to our vLLM server
+    # Model configuration — overridden at runtime by LM_BASE_URL / LM_MODEL when set
     model:
       model_name: "deepseek-coder-6.7b-instruct"
       base_url: "http://vllm-server.ai-dev.svc.cluster.local:8000/v1"
@@ -53,8 +56,40 @@ data:
         exit 1
     fi
 
+    # Resolve endpoint from env (deployment injects ACTIVE_* from llm-endpoint-config)
+    LM_BASE_URL="${LM_BASE_URL:-http://vllm-server.ai-dev.svc.cluster.local:8000/v1}"
+    LM_MODEL="${LM_MODEL:-deepseek-coder-6.7b-instruct}"
+    LLM_MODE="${LLM_MODE:-gpu}"
+    LLM_STATUS_MESSAGE="${LLM_STATUS_MESSAGE:-}"
+    # Local vLLM accepts any key; remote providers need swe-agent-secrets openai-api-key
+    export OPENAI_API_KEY="${OPENAI_API_KEY:-dummy-key}"
+
+    echo "=== LLM endpoint status ==="
+    echo "LLM_MODE: ${LLM_MODE}"
+    if [ -n "$LLM_STATUS_MESSAGE" ]; then
+        echo "STATUS:   ${LLM_STATUS_MESSAGE}"
+    fi
+    if [ "$LLM_MODE" = "fallback" ]; then
+        echo "GPU path: DISABLED (using remote/fallback base URL)"
+    else
+        echo "GPU path: ENABLED (local vLLM)"
+    fi
+    echo "LM_BASE_URL: ${LM_BASE_URL}"
+    echo "LM_MODEL:    ${LM_MODEL}"
+    echo "==========================="
+
+    # Materialize config with active endpoint (config.yaml defaults are GPU-local)
+    CONFIG_FILE="/tmp/swe-agent-config.yaml"
+    cp /config/config.yaml "$CONFIG_FILE"
+    # Replace first model_name and base_url under model: (portable sed)
+    sed -i.bak \
+        -e "s|model_name:.*|model_name: \"${LM_MODEL}\"|" \
+        -e "s|base_url:.*|base_url: \"${LM_BASE_URL}\"|" \
+        "$CONFIG_FILE"
+    rm -f "${CONFIG_FILE}.bak"
+
     # Build command
-    CMD="sweagent run --config /config/config.yaml"
+    CMD="sweagent run --config $CONFIG_FILE"
 
     if [ -n "$ISSUE_URL" ]; then
         CMD="$CMD --issue_url $ISSUE_URL"

@@ -1,0 +1,42 @@
+# LLM endpoint routing: GPU (local vLLM) vs non-GPU fallback
+# Switch modes with: bash ai-dev/scripts/llm-mode.sh {status|gpu|fallback}
+# See: ai-dev/GPU_FALLBACK.md
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: llm-endpoint-config
+  namespace: ai-dev
+  labels:
+    app: llm-endpoint
+    component: routing
+  annotations:
+    description: "Active LLM base URL and mode (gpu | fallback) for SWE-agent and clients"
+data:
+  # Active mode: "gpu" (local vLLM on homelabai) or "fallback" (remote/CPU OpenAI-compatible)
+  LLM_MODE: "gpu"
+
+  # Human-readable status (updated by llm-mode.sh)
+  STATUS_MESSAGE: "GPU path ENABLED — local vLLM on homelabai (http://vllm-server.ai-dev.svc.cluster.local:8000/v1)"
+
+  # Currently active endpoint and model (clients should prefer these keys)
+  ACTIVE_BASE_URL: "http://vllm-server.ai-dev.svc.cluster.local:8000/v1"
+  ACTIVE_MODEL: "deepseek-coder-6.7b-instruct"
+
+  # GPU / local vLLM path (default when homelabai has capacity)
+  GPU_BASE_URL: "http://vllm-server.ai-dev.svc.cluster.local:8000/v1"
+  GPU_MODEL: "deepseek-coder-6.7b-instruct"
+
+  # Non-GPU fallback: remote OpenAI-compatible API (or CPU-side gateway)
+  # Override FALLBACK_BASE_URL before switching, e.g.:
+  #   kubectl -n ai-dev create configmap llm-endpoint-config --from-literal=FALLBACK_BASE_URL=https://api.openai.com/v1 --dry-run=client -o yaml | kubectl apply -f -
+  # Or: FALLBACK_BASE_URL=https://... bash ai-dev/scripts/llm-mode.sh fallback
+  FALLBACK_BASE_URL: "https://api.openai.com/v1"
+  FALLBACK_MODEL: "gpt-4o-mini"
+
+  # When true, llm-mode.sh fallback scales vllm-server to 0 (frees GPU for Plex)
+  SCALE_DOWN_VLLM_ON_FALLBACK: "true"
+
+  # Optional reason recorded on last mode change
+  LAST_REASON: "initial-deploy"
+  LAST_CHANGED_AT: ""

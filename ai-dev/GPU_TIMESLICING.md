@@ -264,10 +264,16 @@ kubectl rollout restart deployment -n ai-dev vllm-server
 ### Temporarily Freeing GPU for Plex
 
 ```bash
-# Scale down vLLM (emergency)
-kubectl scale deployment -n ai-dev vllm-server --replicas=0
+# Preferred: non-GPU fallback (scales down vLLM AND re-points SWE-agent at remote base URL)
+# See GPU_FALLBACK.md for remote/base URL config and status
+bash ai-dev/scripts/llm-mode.sh fallback --reason "Plex priority"
+bash ai-dev/scripts/llm-mode.sh status   # GPU path: DISABLED
 
-# Scale back up
+# Restore local GPU path later
+bash ai-dev/scripts/llm-mode.sh gpu --reason "media load normal"
+
+# Emergency scale only (does not reconfigure client base URL):
+kubectl scale deployment -n ai-dev vllm-server --replicas=0
 kubectl scale deployment -n ai-dev vllm-server --replicas=1
 ```
 
