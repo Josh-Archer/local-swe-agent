@@ -17,9 +17,16 @@ except ImportError:
 
 
 class VLLMTester:
-    def __init__(self, base_url: str, api_key: Optional[str] = None):
+    def __init__(
+        self,
+        base_url: str,
+        api_key: Optional[str] = None,
+        model: Optional[str] = None,
+    ):
         self.base_url = base_url.rstrip('/')
         self.api_key = api_key or "dummy-key"
+        # SERVED_MODEL_NAME from ConfigMap (override after model hot-swap)
+        self.model = model or os.getenv("VLLM_MODEL", "deepseek-coder-6.7b-instruct")
         self.headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json"
@@ -68,7 +75,7 @@ class VLLMTester:
         """Test /v1/completions endpoint."""
         print("\nTesting /v1/completions endpoint...")
         payload = {
-            "model": "deepseek-coder-6.7b-instruct",
+            "model": self.model,
             "prompt": "def fibonacci(n):",
             "max_tokens": 100,
             "temperature": 0.2,
@@ -101,7 +108,7 @@ class VLLMTester:
         """Test /v1/chat/completions endpoint."""
         print("\nTesting /v1/chat/completions endpoint...")
         payload = {
-            "model": "deepseek-coder-6.7b-instruct",
+            "model": self.model,
             "messages": [
                 {
                     "role": "system",
@@ -144,6 +151,7 @@ class VLLMTester:
         print("vLLM API Test Suite")
         print("=" * 60)
         print(f"Base URL: {self.base_url}")
+        print(f"Model:    {self.model}")
         print()
 
         results = []
@@ -181,10 +189,15 @@ def main():
         default=os.getenv("OPENAI_API_KEY"),
         help="API key (optional)"
     )
+    parser.add_argument(
+        "--model",
+        default=os.getenv("VLLM_MODEL", "deepseek-coder-6.7b-instruct"),
+        help="Served model name (SERVED_MODEL_NAME from vllm-config ConfigMap)"
+    )
 
     args = parser.parse_args()
 
-    tester = VLLMTester(args.url, args.api_key)
+    tester = VLLMTester(args.url, args.api_key, model=args.model)
     success = tester.run_all_tests()
 
     sys.exit(0 if success else 1)

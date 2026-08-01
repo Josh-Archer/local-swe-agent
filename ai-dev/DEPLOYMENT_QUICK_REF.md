@@ -102,6 +102,29 @@ kubectl describe node homelabai | grep -A 10 "Allocated"
 
 ---
 
+## 🔄 Model Hot-Swap (no full redeploy)
+
+Model id and runtime knobs live in ConfigMap `vllm-config`. Swap without touching Qdrant/indexer/SWE-agent:
+
+```bash
+# Recommended automation (apply ConfigMap + restart vLLM + health checks)
+bash ai-dev/scripts/swap-model.sh
+
+# CLI override example
+bash ai-dev/scripts/swap-model.sh \
+  --model-name "TheBloke/deepseek-coder-6.7B-instruct-AWQ" \
+  --model-path "/models/deepseek-coder-6.7b-instruct-awq" \
+  --served-name "deepseek-coder-6.7b-instruct"
+
+# Health only
+bash ai-dev/scripts/check-model-health.sh
+# or: make swap-model / make check-model-health
+```
+
+PVC `model-storage` caches each `MODEL_PATH` under `/models`; re-using a path skips download. Full notes: `ai-dev/MODEL_HOT_SWAP.md`.
+
+---
+
 ## 🚨 Emergency Rollback
 
 ### Quick (Just vLLM)

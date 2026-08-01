@@ -1,5 +1,9 @@
 ---
-# PVC for storing base models and quantized models
+# PVC for storing base models and quantized models.
+# Multi-model cache for config-driven hot-swap (see MODEL_HOT_SWAP.md):
+#   - Each MODEL_PATH is a directory under /models (e.g. /models/deepseek-...)
+#   - Init container skips download when MODEL_PATH is non-empty
+#   - Old models are not auto-pruned; free space manually if the volume fills
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -8,13 +12,15 @@ metadata:
   labels:
     app: vllm
     component: model-storage
+  annotations:
+    description: "Persistent multi-model cache for vLLM; survives pod restarts and model hot-swaps"
 spec:
   accessModes:
     - ReadWriteOnce
   storageClassName: longhorn
   resources:
     requests:
-      storage: 50Gi  # Base model (4-bit quantized ~5GB) + space for multiple models
+      storage: 50Gi  # ~4-6Gi per 7B AWQ model; size for several cached models
 
 ---
 # PVC for storing LoRA adapters and checkpoints
