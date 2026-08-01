@@ -10,6 +10,9 @@ resources:
   # Core namespace
   - namespace/namespace.yaml
 
+  # Cluster-scoped PriorityClasses (Plex > AI GPU); protect media under pressure
+  - scheduling/priority-classes.yaml
+
   # Storage
   - storage/pvcs.yaml
 

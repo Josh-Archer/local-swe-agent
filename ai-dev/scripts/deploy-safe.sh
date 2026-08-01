@@ -95,15 +95,29 @@ else
 fi
 
 echo -n "Checking Plex baseline health... "
-if kubectl get pods -n media -l app=plex &>/dev/null; then
+if kubectl get pods -n media -l app=plex --no-headers 2>/dev/null | grep -q .; then
     PLEX_STATUS=$(kubectl get pods -n media -l app=plex -o jsonpath='{.items[0].status.phase}')
     if [ "$PLEX_STATUS" = "Running" ]; then
         echo -e "${GREEN}✓ Plex is Running${NC}"
     else
-        echo -e "${YELLOW}⚠ Plex status: ${PLEX_STATUS}${NC}"
+        echo -e "${RED}✗ Plex status: ${PLEX_STATUS}${NC}"
+        echo -e "${RED}Hard constraint: refuse deploy while Plex is unhealthy (see GPU_CONSTRAINTS.md)${NC}"
+        if [ "${FORCE_GPU_ADMISSION:-0}" != "1" ] || [ "${ALLOW_GPU_OVERRIDE:-0}" != "1" ]; then
+            exit 20
+        fi
+        echo -e "${YELLOW}⚠ Break-glass override active — continuing despite Plex status${NC}"
     fi
 else
-    echo -e "${YELLOW}⚠ Plex not found (may be okay)${NC}"
+    echo -e "${YELLOW}⚠ Plex not found (may be okay in non-prod)${NC}"
+fi
+
+echo ""
+echo -e "${BLUE}Applying PriorityClasses (Plex > AI GPU)...${NC}"
+if [ -f "$AI_DEV_DIR/scheduling/priority-classes.yaml" ]; then
+    kubectl apply -f "$AI_DEV_DIR/scheduling/priority-classes.yaml"
+    echo -e "${GREEN}✓ PriorityClasses applied (plex-media-critical, ai-dev-gpu)${NC}"
+else
+    echo -e "${YELLOW}⚠ priority-classes.yaml missing — vLLM may fail if priorityClassName is set${NC}"
 fi
 
 echo ""
@@ -166,13 +180,15 @@ prompt_continue "Phase 2" "Qdrant deployed and responding."
 echo ""
 echo -e "${RED}═══ Phase 3: vLLM Inference Server (GPU WORKLOAD) ═══${NC}"
 echo -e "${YELLOW}⚠️  CRITICAL: This will allocate GPU resources${NC}"
+echo -e "${YELLOW}⚠️  HARD admission gate runs before apply (not advisory-only)${NC}"
 echo -e "${YELLOW}⚠️  Plex health will be checked immediately after${NC}"
 echo ""
 
 if [ "$INTERACTIVE" = "1" ]; then
     echo -e "${CYAN}Pre-GPU Deployment Check:${NC}"
+    echo "- Hard GPU admission (free shares, Plex, node Ready)"
     echo "- Current GPU allocation will be shown"
-    echo "- Plex health will be verified"
+    echo "- Plex health will be verified after deploy"
     echo "- You can abort now if needed"
     echo ""
     read -p "Deploy vLLM with GPU? (y/N): " -n 1 -r
@@ -188,6 +204,26 @@ fi
 echo "Current GPU allocation:"
 kubectl describe node homelabai | grep -A 5 "Allocated resources:" | grep nvidia || echo "No GPU resources allocated yet"
 echo ""
+
+# HARD ENFORCE: refuse Phase 3 when GPU is busy or Plex unhealthy
+echo -e "${RED}Running hard GPU admission gate...${NC}"
+if [ -f "$SCRIPT_DIR/check-gpu-admission.sh" ]; then
+    set +e
+    bash "$SCRIPT_DIR/check-gpu-admission.sh"
+    ADMIT_RC=$?
+    set -e
+    if [ "$ADMIT_RC" -ne 0 ]; then
+        echo ""
+        echo -e "${RED}✗ GPU admission DENIED (exit ${ADMIT_RC})${NC}"
+        echo -e "${RED}Failure mode: GPU busy or coexistence hard constraint failed.${NC}"
+        echo "See: ai-dev/GPU_CONSTRAINTS.md"
+        echo "Break-glass (both required): ALLOW_GPU_OVERRIDE=1 FORCE_GPU_ADMISSION=1"
+        exit "$ADMIT_RC"
+    fi
+else
+    echo -e "${RED}✗ check-gpu-admission.sh missing — cannot hard-enforce GPU coexistence${NC}"
+    exit 31
+fi
 
 echo "Deploying vLLM ConfigMap..."
 kubectl apply -f "$AI_DEV_DIR/vllm/vllm-configmap.yaml"
@@ -242,27 +278,23 @@ if [ -f "$SCRIPT_DIR/check-plex-health.sh" ]; then
     else
         echo -e "${RED}✗✗✗ Plex health check FAILED ✗✗✗${NC}"
         echo ""
+        echo -e "${RED}Hard constraint: post-GPU Plex failure aborts deploy (not advisory).${NC}"
         echo -e "${YELLOW}EMERGENCY ROLLBACK OPTIONS:${NC}"
         echo "1. Scale down vLLM: kubectl scale deployment -n ai-dev vllm-server --replicas=0"
         echo "2. Delete vLLM: kubectl delete deployment -n ai-dev vllm-server"
         echo "3. Full rollback: kubectl delete namespace ai-dev"
         echo ""
-        read -p "Continue anyway? (y/N): " -n 1 -r
-        echo
-        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        if [ "${FORCE_GPU_ADMISSION:-0}" = "1" ] && [ "${ALLOW_GPU_OVERRIDE:-0}" = "1" ]; then
+            echo -e "${YELLOW}⚠ Break-glass override — continuing despite Plex health failure${NC}"
+        else
             echo -e "${YELLOW}Deployment aborted due to Plex health check failure${NC}"
-            exit 1
+            echo "Break-glass (both required): ALLOW_GPU_OVERRIDE=1 FORCE_GPU_ADMISSION=1"
+            exit 20
         fi
     fi
 else
-    echo -e "${YELLOW}⚠ Plex health check script not found${NC}"
-    echo "Manually verify Plex is still working!"
-    echo ""
-    read -p "Continue? (y/N): " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        exit 1
-    fi
+    echo -e "${RED}✗ Plex health check script not found — hard gate required${NC}"
+    exit 31
 fi
 
 prompt_continue "Phase 3" "vLLM deployed with GPU. Plex health verified."

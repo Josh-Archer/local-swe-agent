@@ -29,6 +29,11 @@ spec:
       nodeSelector:
         kubernetes.io/hostname: homelabai
 
+      # Lower priority than Plex (plex-media-critical). Apply PriorityClasses first:
+      #   kubectl apply -f ai-dev/scheduling/priority-classes.yaml
+      # If the class is missing, the pod fails admission — that is intentional hard enforce.
+      priorityClassName: ai-dev-gpu
+
       # NVIDIA runtime class (may be set automatically by webhook, but explicit is safer)
       runtimeClassName: nvidia
 

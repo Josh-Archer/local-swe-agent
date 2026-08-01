@@ -17,6 +17,7 @@ class TestScriptSyntax:
         [
             "deploy-safe.sh",
             "check-plex-health.sh",
+            "check-gpu-admission.sh",
             "validate-manifests.sh",
             "llm-mode.sh",
         ],
@@ -90,6 +91,71 @@ class TestCheckPlexHealthScript:
             content = f.read()
             # Should reference kubectl
             assert "kubectl" in content
+
+    def test_documents_hard_fail_modes(self):
+        """Plex health must distinguish hard failures from soft warnings."""
+        script = SCRIPTS_DIR / "check-plex-health.sh"
+        content = script.read_text(encoding="utf-8")
+        assert "HARD FAIL" in content or "Hard failures" in content
+        assert "HARD_FAIL" in content
+
+
+class TestCheckGpuAdmissionScript:
+    """Tests for hard GPU admission gate (issue #4)."""
+
+    def test_script_exists(self):
+        script = SCRIPTS_DIR / "check-gpu-admission.sh"
+        assert script.exists()
+
+    def test_has_shebang_and_errexit(self):
+        script = SCRIPTS_DIR / "check-gpu-admission.sh"
+        content = script.read_text(encoding="utf-8")
+        assert content.startswith("#!/bin/bash")
+        assert "set -e" in content
+
+    def test_documents_explicit_exit_codes(self):
+        """GPU busy / Plex / node failures must use documented exit codes."""
+        content = (SCRIPTS_DIR / "check-gpu-admission.sh").read_text(encoding="utf-8")
+        for code in ("10", "11", "20", "30", "31"):
+            assert code in content
+        assert "GPU busy" in content or "insufficient free" in content.lower()
+
+    def test_requires_dual_flag_override(self):
+        """Silent override must not be possible — both force flags required."""
+        content = (SCRIPTS_DIR / "check-gpu-admission.sh").read_text(encoding="utf-8")
+        assert "FORCE_GPU_ADMISSION" in content
+        assert "ALLOW_GPU_OVERRIDE" in content
+
+    def test_deploy_safe_calls_admission_gate(self):
+        """deploy-safe must hard-call admission before vLLM, not advisory-only."""
+        content = (SCRIPTS_DIR / "deploy-safe.sh").read_text(encoding="utf-8")
+        assert "check-gpu-admission.sh" in content
+        assert "Continue anyway" not in content
+
+
+class TestGpuConstraintsDocsAndScheduling:
+    """Hard vs soft constraints docs and PriorityClass manifests."""
+
+    def test_constraints_doc_exists(self):
+        doc = Path(__file__).parent.parent / "GPU_CONSTRAINTS.md"
+        assert doc.exists()
+        text = doc.read_text(encoding="utf-8")
+        assert "Hard constraints" in text
+        assert "Soft constraints" in text
+        assert "GPU busy" in text or "exit **10**" in text
+
+    def test_priority_classes_manifest(self):
+        manifest = Path(__file__).parent.parent / "scheduling" / "priority-classes.yaml"
+        assert manifest.exists()
+        text = manifest.read_text(encoding="utf-8")
+        assert "plex-media-critical" in text
+        assert "ai-dev-gpu" in text
+        assert "PriorityClass" in text
+
+    def test_vllm_uses_ai_priority_class(self):
+        dep = Path(__file__).parent.parent / "vllm" / "vllm-deployment.yaml"
+        text = dep.read_text(encoding="utf-8")
+        assert "priorityClassName: ai-dev-gpu" in text
 
 
 class TestLlmModeScript:
