@@ -237,7 +237,10 @@ class TestManifestValidation:
         """Ingress must not ship the historical default user/password secret."""
         ingress = Path(__file__).parent.parent / "ingress" / "ingressroute.yaml"
         content = ingress.read_text(encoding="utf-8")
-        assert "dXNlcjokYXByMSRQN0RnOUNuMyRXeUE3QzdyWEF6S1FYVG5xVkxVdTcwCg==" not in content
+        assert (
+            "dXNlcjokYXByMSRQN0RnOUNuMyRXeUE3QzdyWEF6S1FYVG5xVkxVdTcwCg=="
+            not in content
+        )
         assert "$apr1$P7Dg9Cn3$WyA7C7rXAzKQXTnqVLUu70" not in content
         # Middleware still wires basicAuth to an out-of-band secret
         assert "api-auth-secret" in content
@@ -253,7 +256,10 @@ class TestManifestValidation:
         example_text = example.read_text(encoding="utf-8")
         swe_text = swe.read_text(encoding="utf-8")
         assert "REPLACE_WITH_" in example_text or "REPLACE_WITH_" in swe_text
-        assert "dXNlcjokYXByMSRQN0RnOUNuMyRXeUE3QzdyWEF6S1FYVG5xVkxVdTcwCg==" not in example_text
+        assert (
+            "dXNlcjokYXByMSRQN0RnOUNuMyRXeUE3QzdyWEF6S1FYVG5xVkxVdTcwCg=="
+            not in example_text
+        )
         assert "htpasswd" in example_text
 
     def test_validate_manifests_refuses_placeholders(self):
