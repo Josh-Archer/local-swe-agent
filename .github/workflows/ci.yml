@@ -119,7 +119,7 @@ jobs:
 
       - name: Test namespace creation
         run: |
-          kubectl apply -f ai-dev/namespace/namespace.yaml --dry-run=server
+          kubectl apply -f ai-dev/namespace/namespace.yaml
 
       - name: Test PVC creation (dry run)
         run: |
