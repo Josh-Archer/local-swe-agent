@@ -334,12 +334,19 @@ class TestManifestValidation:
         assert "htpasswd" in example_text
 
     def test_validate_manifests_refuses_placeholders(self):
-        """validate-manifests.sh must contain placeholder refusal logic."""
+        """validate-manifests.sh refuses placeholder images / bad pull policies."""
         script = SCRIPTS_DIR / "validate-manifests.sh"
         content = script.read_text(encoding="utf-8")
-        assert "check_auth_placeholders" in content
-        assert "REPLACE_WITH_" in content
-        assert "dXNlcjokYXByMSRQN0RnOUNuMyRXeUE3QzdyWEF6S1FYVG5xVkxVdTcwCg==" in content
+        assert "is_placeholder_image" in content
+        assert "CHANGE_ME" in content
+        assert "check_images_in_file" in content
+        # Auth placeholder refusal lives in deploy scripts (cluster secrets).
+        deploy_safe = (SCRIPTS_DIR / "deploy-safe.sh").read_text(encoding="utf-8")
+        assert "REPLACE_WITH_" in deploy_safe
+        assert (
+            "dXNlcjokYXByMSRQN0RnOUNuMyRXeUE3QzdyWEF6S1FYVG5xVkxVdTcwCg=="
+            in deploy_safe
+        )
 
 
 @pytest.mark.integration
