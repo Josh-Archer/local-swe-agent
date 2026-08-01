@@ -105,10 +105,11 @@ ai-dev/
 │   ├── configmap.yaml              # Kubernetes ConfigMap
 │   └── cronjob.yaml                # Scheduled indexing job
 ├── swe-agent/
-│   ├── configmap.yaml              # SWE-agent configuration
+│   ├── configmap.yaml              # SWE-agent configuration + guardrails
 │   ├── deployment.yaml             # SWE-agent server
-│   ├── job-template.yaml           # Template for issue resolution
-│   └── secret-template.yaml        # GitHub token
+│   ├── job-template.yaml           # Guarded issue-to-PR job template
+│   ├── GUARDED_ISSUE_TO_PR.md      # Demo walkthrough + human approval gate
+│   └── secret-template.yaml        # GitHub token (create manually)
 ├── ingress/
 │   └── ingressroute.yaml           # Traefik + middleware + auth
 ├── scripts/
@@ -325,21 +326,35 @@ Configure custom model in `~/.claude-code/config.json`:
 }
 ```
 
-### Using SWE-agent
+### Using SWE-agent (guarded issue → PR)
 
-**Resolve a GitHub issue**:
+Preferred path uses **issue number or label**, guardrails (path allowlist, max files, no force-push), and a **human approval gate** before any PR is opened:
+
 ```bash
-# Edit job-template.yaml with issue URL
-cat swe-agent/job-template.yaml | \
-  sed 's|ISSUE_URL_PLACEHOLDER|https://github.com/owner/repo/issues/123|' | \
-  kubectl apply -f -
+# By issue number
+bash scripts/run-guarded-issue-job.sh --repo owner/repo --issue 123
+
+# By label (first open issue with that label)
+bash scripts/run-guarded-issue-job.sh --repo owner/repo --label ai-fix
 
 # Monitor
 kubectl logs -n ai-dev -f job/swe-agent-issue-123
 ```
 
+After the agent finishes, review the branch and open the PR yourself, or re-run with `--open-pr --approved`.
+
+Full walkthrough: [swe-agent/GUARDED_ISSUE_TO_PR.md](swe-agent/GUARDED_ISSUE_TO_PR.md)
+
+**Legacy one-off (URL only)**:
+```bash
+cat swe-agent/job-template.yaml | \
+  sed 's|ISSUE_URL_PLACEHOLDER|https://github.com/owner/repo/issues/123|' | \
+  sed 's|ISSUE_NUMBER_PLACEHOLDER|123|g' | \
+  kubectl apply -f -
+```
+
 **Automatic nightly issue resolution**:
-Configure a CronJob similar to code-indexer that queries GitHub for issues labeled "ai-fix".
+Configure a CronJob similar to code-indexer that queries GitHub for issues labeled "ai-fix", still with `OPEN_PR=false` until humans approve.
 
 ## Configuration
 

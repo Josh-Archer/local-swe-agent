@@ -177,7 +177,18 @@ claude config add-model \
 claude --model local-deepseek "Write a Python function to parse YAML"
 ```
 
-### Step 10: Test SWE-agent (Optional)
+### Step 10: Test SWE-agent guarded issue → PR (Optional)
+
+Preferred demo path (issue number/label, path allowlist, max files, no force-push, human approval before PR):
+
+```bash
+bash scripts/run-guarded-issue-job.sh --repo youruser/yourrepo --issue 1
+# Review logs, then open PR manually or re-run with --open-pr --approved
+```
+
+Full walkthrough: `swe-agent/GUARDED_ISSUE_TO_PR.md`
+
+Legacy URL-only job:
 
 Find a simple GitHub issue in your repository, then:
 
@@ -191,7 +202,7 @@ cat swe-agent/job-template.yaml | \
 kubectl logs -n ai-dev -f job/swe-agent-issue-0001
 ```
 
-SWE-agent will attempt to solve the issue and create a PR.
+SWE-agent will attempt to solve the issue. With the guarded defaults it does **not** open a PR until a human approves.
 
 ## Verification Checklist
 
