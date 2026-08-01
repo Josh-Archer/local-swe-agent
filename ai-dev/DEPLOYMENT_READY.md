@@ -120,17 +120,23 @@ repositories:
 3. Generate token
 4. Save temporarily: `echo "ghp_YourToken" > /tmp/github-token`
 
-### 4. Configure API Auth (Optional)
+### 4. Configure API Auth (Required for ingress)
 
-Default credentials: `user:password` (CHANGE THIS!)
+There are **no default credentials** in-repo. Deploy scripts refuse placeholders
+and known insecure defaults. Create `api-auth-secret` before ingress:
 
-To generate new credentials:
 ```bash
-# Generate password hash
-htpasswd -nb admin yourpassword | base64
+# Generate htpasswd users file (bcrypt)
+htpasswd -nbB admin 'your-strong-password' > /tmp/auth
 
-# Update ai-dev/ingress/ingressroute.yaml
-# Replace data.users with your hash
+# Create secret (Traefik basicAuth expects key "users")
+kubectl create secret generic api-auth-secret \
+  --from-file=users=/tmp/auth \
+  -n ai-dev
+rm -f /tmp/auth
+
+# Template / SealedSecret example (no real credentials):
+#   ai-dev/ingress/example-secret.yaml
 ```
 
 ### 5. Update Domain (Optional)

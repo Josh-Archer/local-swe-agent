@@ -78,6 +78,16 @@ wait_for_pod() {
 echo -e "${BLUE}═══ Pre-Deployment Checks ═══${NC}"
 echo ""
 
+# Refuse deployable manifests that still embed default/placeholder auth
+echo -n "Checking for auth placeholders in manifests... "
+if ! bash "$SCRIPT_DIR/validate-manifests.sh" >/tmp/ai-dev-validate.out 2>&1; then
+    echo -e "${RED}FAILED${NC}"
+    cat /tmp/ai-dev-validate.out
+    echo -e "${RED}Deploy refused: fix placeholder credentials / manifest errors first.${NC}"
+    exit 1
+fi
+echo -e "${GREEN}✓${NC}"
+
 echo -n "Checking GPU node availability... "
 if kubectl get node homelabai &>/dev/null; then
     echo -e "${GREEN}✓${NC}"
@@ -325,15 +335,23 @@ echo ""
 read -p "Deploy SWE-agent? (y/N): " -n 1 -r
 echo
 if [[ $REPLY =~ ^[Yy]$ ]]; then
-    # Check if secret exists
+    # Check if secret exists and is not a placeholder
     if kubectl get secret -n ai-dev swe-agent-secrets &>/dev/null; then
+        token_b64=$(kubectl get secret swe-agent-secrets -n ai-dev -o jsonpath='{.data.github-token}' 2>/dev/null || true)
+        token_plain=$(printf '%s' "$token_b64" | base64 -d 2>/dev/null || printf '%s' "$token_b64" | base64 -D 2>/dev/null || true)
+        if echo "$token_plain" | grep -qE 'REPLACE_WITH_|CHANGE_ME|YourToken|YourGitHubToken|ghp_Your|ghp_YOUR|PLACEHOLDER'; then
+            echo -e "${RED}✗ swe-agent-secrets contains a placeholder token — refusing deploy${NC}"
+            echo "  See: swe-agent/secret-template.yaml"
+            exit 1
+        fi
         echo -e "${GREEN}✓ SWE-agent secret already exists${NC}"
     else
         echo -e "${YELLOW}⚠ SWE-agent secret not found${NC}"
-        echo "Create secret first:"
+        echo "Create secret first (real token, not a placeholder):"
         echo "  kubectl create secret generic swe-agent-secrets \\"
-        echo "    --from-literal=github-token=ghp_YourToken \\"
+        echo "    --from-literal=github-token=\"\$GITHUB_TOKEN\" \\"
         echo "    -n ai-dev"
+        echo "  See: swe-agent/secret-template.yaml"
         echo ""
         read -p "Skip SWE-agent deployment? (Y/n): " -n 1 -r
         echo
@@ -358,18 +376,59 @@ fi
 echo ""
 echo -e "${BLUE}═══ Phase 6: Ingress (External Access) ═══${NC}"
 echo -e "${CYAN}Deploy Traefik IngressRoute for external API access${NC}"
+echo -e "${YELLOW}Requires api-auth-secret with real credentials (no placeholders)${NC}"
 echo ""
+
+# Refuse default/placeholder credentials before exposing the API
+require_api_auth_secret() {
+    local default_b64="dXNlcjokYXByMSRQN0RnOUNuMyRXeUE3QzdyWEF6S1FYVG5xVkxVdTcwCg=="
+    if ! kubectl get secret -n ai-dev api-auth-secret &>/dev/null; then
+        echo -e "${RED}✗ api-auth-secret not found${NC}"
+        echo "Create real credentials first (placeholders are refused):"
+        echo "  htpasswd -nbB admin 'your-strong-password' > /tmp/auth"
+        echo "  kubectl create secret generic api-auth-secret --from-file=users=/tmp/auth -n ai-dev"
+        echo "  rm -f /tmp/auth"
+        echo "See: ingress/example-secret.yaml"
+        return 1
+    fi
+    local key val plain
+    for key in $(kubectl get secret api-auth-secret -n ai-dev -o go-template='{{range $k,$v := .data}}{{printf "%s\n" $k}}{{end}}' 2>/dev/null); do
+        val=$(kubectl get secret api-auth-secret -n ai-dev -o "jsonpath={.data.$key}" 2>/dev/null)
+        plain=$(printf '%s' "$val" | base64 -d 2>/dev/null || printf '%s' "$val" | base64 -D 2>/dev/null || true)
+        if [ "$val" = "$default_b64" ] || echo "$plain" | grep -qF '$apr1$P7Dg9Cn3$WyA7C7rXAzKQXTnqVLUu70'; then
+            echo -e "${RED}✗ api-auth-secret uses the insecure default user/password hash${NC}"
+            return 1
+        fi
+        if echo "$plain" | grep -qE 'REPLACE_WITH_|CHANGE_ME|CHANGE_THIS|yourpassword|PLACEHOLDER|user:password'; then
+            echo -e "${RED}✗ api-auth-secret contains a placeholder value${NC}"
+            return 1
+        fi
+    done
+    echo -e "${GREEN}✓ api-auth-secret present and not a known placeholder/default${NC}"
+    return 0
+}
+
+# Manifest-level placeholder check (same gate as validate-manifests.sh)
+if ! bash "$SCRIPT_DIR/validate-manifests.sh"; then
+    echo -e "${RED}Manifest validation failed (placeholder credentials or syntax). Aborting ingress phase.${NC}"
+    exit 1
+fi
 
 read -p "Deploy ingress? (y/N): " -n 1 -r
 echo
 if [[ $REPLY =~ ^[Yy]$ ]]; then
+    if ! require_api_auth_secret; then
+        echo -e "${RED}Refusing to deploy ingress with missing/placeholder auth — API would be open or broken.${NC}"
+        exit 1
+    fi
+
     kubectl apply -f "$AI_DEV_DIR/ingress/ingressroute.yaml"
 
     echo -e "${GREEN}✓ Ingress deployed${NC}"
     echo ""
     echo "IngressRoute created for: code-llm.archer.casa"
     echo "Update DNS to point to your cluster IP"
-    echo "Test: curl https://code-llm.archer.casa/health"
+    echo "Test: curl -u admin:YOUR_PASSWORD https://code-llm.archer.casa/health"
 else
     echo "Skipping ingress deployment"
     echo "Access vLLM via port-forward:"

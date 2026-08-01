@@ -73,21 +73,31 @@ cd ../..
 
 ### Configure Secrets
 
+Deploy and validate scripts **refuse placeholder/default credentials** so Traefik
+auth cannot ship open or broken. Templates (no real credentials):
+
+- `ai-dev/swe-agent/secret-template.yaml`
+- `ai-dev/ingress/example-secret.yaml` (optional SealedSecret sketch included)
+
 ```bash
 # 1. GitHub token for SWE-agent
 # Generate at: https://github.com/settings/tokens/new
 # Required scopes: repo, workflow
-
-# Store in file (temporarily)
-echo "ghp_YourActualTokenHere" > /tmp/github-token
+kubectl create secret generic swe-agent-secrets \
+  --from-literal=github-token="$GITHUB_TOKEN" \
+  -n ai-dev
 
 # 2. Configure your repositories
 # Edit: ai-dev/code-indexer/configmap.yaml
 # Add your actual Git repositories
 
-# 3. (Optional) Change API authentication
-# Edit: ai-dev/ingress/ingressroute.yaml
-# Generate password: htpasswd -nb admin yourpassword | base64
+# 3. API authentication (required before ingress)
+# Needs: apache2-utils / httpd-tools (htpasswd) or openssl
+htpasswd -nbB admin 'your-strong-password' > /tmp/auth
+kubectl create secret generic api-auth-secret \
+  --from-file=users=/tmp/auth \
+  -n ai-dev
+rm -f /tmp/auth
 ```
 
 ## 🚀 Deployment Strategy: Incremental Rollout
