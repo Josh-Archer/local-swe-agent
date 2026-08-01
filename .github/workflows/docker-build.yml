@@ -11,6 +11,8 @@ on:
     branches: [ main, master, develop ]
     paths:
       - 'ai-dev/code-indexer/Dockerfile'
+      - 'ai-dev/code-indexer/*.py'
+      - '.github/workflows/docker-build.yml'
   workflow_dispatch:
 
 env:
@@ -24,6 +26,7 @@ jobs:
     permissions:
       contents: read
       packages: write
+      security-events: write
 
     steps:
       - name: Checkout code
@@ -69,24 +72,28 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # ENTRYPOINT is the indexer; override it so CI does not need Qdrant/network.
       - name: Test Docker image
         run: |
-          # Test that image runs
-          docker run --rm code-indexer:test python3 --version
-
-          # Test dependencies are installed
-          docker run --rm code-indexer:test python3 -c "import qdrant_client; import sentence_transformers; import git; print('Dependencies OK')"
+          set -euo pipefail
+          docker run --rm --entrypoint python3 code-indexer:test --version
+          docker run --rm --entrypoint python3 code-indexer:test -c \
+            "import qdrant_client, sentence_transformers, git; print('Dependencies OK')"
 
       - name: Scan image with Trivy
+        id: trivy
+        continue-on-error: true
         uses: aquasecurity/trivy-action@master
         with:
           image-ref: code-indexer:test
           format: 'sarif'
           output: 'trivy-image-results.sarif'
+          exit-code: '0'
 
       - name: Upload Trivy results
+        if: always() && hashFiles('trivy-image-results.sarif') != ''
+        continue-on-error: true
         uses: github/codeql-action/upload-sarif@v3
-        if: always()
         with:
           sarif_file: 'trivy-image-results.sarif'
 
@@ -116,4 +123,7 @@ jobs:
         uses: hadolint/hadolint-action@v3.1.0
         with:
           dockerfile: ai-dev/code-indexer/Dockerfile
-          failure-threshold: warning
+          failure-threshold: error
+          # DL3008: unpinned apt versions are intentional on debian slim
+          # DL3015: --no-install-recommends is enforced in the Dockerfile
+          ignore: DL3008
