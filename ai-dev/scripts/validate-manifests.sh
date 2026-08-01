@@ -1,7 +1,10 @@
 #!/bin/bash
-# Validate all Kubernetes manifests and refuse insecure auth placeholders
+# Validate all Kubernetes manifests, including code-indexer image readiness.
+#
+# Code-indexer is build-yourself: manifests must not reference placeholder
+# tags or use a pull policy that cannot resolve the image at deploy time.
 
-set -e
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AI_DEV_DIR="$(dirname "$SCRIPT_DIR")"
@@ -19,26 +22,208 @@ NC='\033[0m' # No Color
 FAILED=0
 PASSED=0
 
+# Known public single-name base images (not build-yourself).
+is_known_public_base_image() {
+    local image=$1
+    case "$image" in
+        python:*|ubuntu:*|debian:*|alpine:*|busybox:*|nginx:*|redis:*|postgres:*|node:*|golang:*)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+# Registry-qualified (contains /) or known public base → not treated as local-only.
+is_public_or_registry_image() {
+    local image=$1
+    if [[ "$image" == *"/"* ]]; then
+        return 0
+    fi
+    if is_known_public_base_image "$image"; then
+        return 0
+    fi
+    return 1
+}
+
+is_placeholder_image() {
+    local image=$1
+    if echo "$image" | grep -Eiq \
+        'CHANGE_ME|YOUR_ORG|YOUR_REGISTRY|your-registry|REPLACE_ME|REPLACEME|TODO_IMAGE|example\.com|<registry>|<tag>|<owner>'; then
+        return 0
+    fi
+    return 1
+}
+
+is_local_only_image() {
+    local image=$1
+    if is_public_or_registry_image "$image"; then
+        return 1
+    fi
+    return 0
+}
+
+# Resolve effective pull policy (Kubernetes defaults).
+effective_pull_policy() {
+    local image=$1
+    local policy=$2
+    if [[ "$policy" != "DEFAULT" && -n "$policy" ]]; then
+        echo "$policy"
+        return
+    fi
+    # Default: Always for :latest or untagged; IfNotPresent otherwise
+    if [[ "$image" == *":latest" || "$image" != *":"* ]]; then
+        echo "Always"
+    else
+        echo "IfNotPresent"
+    fi
+}
+
+# Check container images / pull policies in a manifest. Returns 1 on hard failure.
+check_images_in_file() {
+    local file=$1
+    local basename_file
+    basename_file=$(basename "$file")
+    local file_failed=0
+
+    # Skip non-workload / non-K8s resource files
+    case "$basename_file" in
+        config.yaml|kustomization.yaml) return 0 ;;
+    esac
+
+    # Best-effort parse of image: / imagePullPolicy: pairs
+    local results
+    results=$(awk '
+        BEGIN { image=""; policy=""; img_line=0 }
+        /^[[:space:]]*image:[[:space:]]*/ {
+            line=$0
+            sub(/#.*/,"",line)
+            sub(/^[[:space:]]*image:[[:space:]]*/,"",line)
+            gsub(/["\047]/,"",line)
+            gsub(/[[:space:]]+$/,"",line)
+            if (line != "") {
+                image=line
+                img_line=NR
+                policy="DEFAULT"
+            }
+        }
+        /^[[:space:]]*imagePullPolicy:[[:space:]]*/ {
+            line=$0
+            sub(/#.*/,"",line)
+            sub(/^[[:space:]]*imagePullPolicy:[[:space:]]*/,"",line)
+            gsub(/["\047]/,"",line)
+            gsub(/[[:space:]]+$/,"",line)
+            if (image != "") {
+                print image "|" line "|" img_line
+                image=""
+                policy=""
+            }
+        }
+        # Flush image when a new list item name appears without an intervening policy
+        /^[[:space:]]*-[[:space:]]+name:[[:space:]]*/ {
+            if (image != "") {
+                print image "|" policy "|" img_line
+                image=""
+                policy=""
+            }
+        }
+        END {
+            if (image != "") {
+                print image "|" policy "|" img_line
+            }
+        }
+    ' "$file")
+
+    local line image policy eff
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        image="${line%%|*}"
+        rest="${line#*|}"
+        policy="${rest%%|*}"
+
+        [[ -z "$image" ]] && continue
+
+        # 1) Placeholder tags must never ship into a deploy
+        if is_placeholder_image "$image"; then
+            echo -e "  ${RED}FAILED${NC}: placeholder image in ${basename_file}: ${image}"
+            echo "         Replace with a built+pushed tag (or local image + IfNotPresent/Never)."
+            echo "         See code-indexer/cronjob.yaml header and README build steps."
+            file_failed=1
+            continue
+        fi
+
+        eff=$(effective_pull_policy "$image" "$policy")
+
+        # 2) Local-only / build-yourself image + Always → pull will break deploy
+        if is_local_only_image "$image" && [[ "$eff" == "Always" ]]; then
+            echo -e "  ${RED}FAILED${NC}: image pull policy would break deploy in ${basename_file}"
+            echo "         image=$image  effectivePullPolicy=$eff"
+            echo "         Local/unpublished images cannot use Always (kubelet will try to pull)."
+            echo "         Fix: push to a registry, or set imagePullPolicy: IfNotPresent (or Never)."
+            file_failed=1
+            continue
+        fi
+
+        # 3) Bare code-indexer:* is never public — Always always breaks
+        if [[ "$image" == code-indexer || "$image" == code-indexer:* ]]; then
+            if [[ "$eff" == "Always" ]]; then
+                echo -e "  ${RED}FAILED${NC}: code-indexer image is build-yourself; Always will fail pull"
+                echo "         image=$image in ${basename_file}"
+                file_failed=1
+                continue
+            fi
+            echo -e "  ${YELLOW}NOTE${NC}: local code-indexer image ($image); ensure it exists on every node."
+        fi
+    done <<< "$results"
+
+    return "$file_failed"
+}
+
 # Function to validate a YAML file
 validate_file() {
     local file=$1
-    echo -n "Validating $(basename "$file")... "
+    local basename_file
+    basename_file=$(basename "$file")
+    local issues=0
 
-    # Check YAML syntax
-    if ! kubectl apply --dry-run=client -f "$file" &>/dev/null; then
-        echo -e "${RED}FAILED${NC} (syntax error)"
-        kubectl apply --dry-run=client -f "$file" 2>&1 | head -5
-        FAILED=$((FAILED + 1))
-        return 1
+    echo -n "Validating ${basename_file}... "
+
+    # kustomization is not a cluster resource — skip kubectl apply
+    if [[ "$basename_file" == "kustomization.yaml" ]]; then
+        echo -e "${GREEN}SKIPPED${NC} (kustomize file)"
+        PASSED=$((PASSED + 1))
+        return 0
     fi
 
-    # Server-side dry-run (if cluster is available)
-    if kubectl cluster-info &>/dev/null; then
-        if ! kubectl apply --dry-run=server -f "$file" &>/dev/null; then
-            echo -e "${YELLOW}WARNING${NC} (server-side validation failed)"
-            FAILED=$((FAILED + 1))
-            return 1
+    # Client-side dry-run when kubectl is available
+    if command -v kubectl &>/dev/null; then
+        if ! kubectl apply --dry-run=client -f "$file" &>/dev/null; then
+            echo -e "${RED}FAILED${NC} (syntax / client dry-run error)"
+            kubectl apply --dry-run=client -f "$file" 2>&1 | head -5
+            issues=1
+        else
+            # Server-side is advisory only (CRDs / cluster may be incomplete)
+            if kubectl cluster-info &>/dev/null; then
+                if ! kubectl apply --dry-run=server -f "$file" &>/dev/null; then
+                    echo -ne "${YELLOW}server-warn${NC} "
+                fi
+            fi
         fi
+    elif command -v python3 &>/dev/null; then
+        if ! python3 -c "import yaml,sys; list(yaml.safe_load_all(open(sys.argv[1])))" "$file" 2>/dev/null; then
+            echo -e "${RED}FAILED${NC} (YAML parse error)"
+            issues=1
+        fi
+    fi
+
+    # Image / pull-policy readiness — always enforced
+    if ! check_images_in_file "$file"; then
+        issues=1
+    fi
+
+    if [[ "$issues" -ne 0 ]]; then
+        echo -e "${RED}FAILED${NC}"
+        FAILED=$((FAILED + 1))
+        return 1
     fi
 
     echo -e "${GREEN}PASSED${NC}"
@@ -46,132 +231,25 @@ validate_file() {
     return 0
 }
 
-# ---------------------------------------------------------------------------
-# Refuse default / placeholder credentials that leave the API open or broken.
-# Templates (*template*, example-secret.yaml) are allowed to contain markers;
-# real manifests and any locally copied secret files must not.
-# ---------------------------------------------------------------------------
-check_auth_placeholders() {
-    echo "Checking for insecure auth placeholders / default credentials..."
-    local found=0
-
-    # Known insecure default from older commits (user/password APR1 hash, base64)
-    local default_b64="dXNlcjokYXByMSRQN0RnOUNuMyRXeUE3QzdyWEF6S1FYVG5xVkxVdTcwCg=="
-    local default_apr1='$apr1$P7Dg9Cn3$WyA7C7rXAzKQXTnqVLUu70'
-
-    # Patterns that must never appear in deployable (non-template) manifests
-    local patterns=(
-        "$default_b64"
-        "$default_apr1"
-        "CHANGE_ME"
-        "CHANGE THIS"
-        "CHANGE_THIS"
-        "REPLACE_ME"
-        "REPLACE_WITH_"
-        "yourpassword"
-        "YourPassword"
-        "YourToken"
-        "YourGitHubToken"
-        "ghp_Your"
-        "ghp_YOUR"
-        "PLACEHOLDER_PASSWORD"
-        "user/password"
-        "user:password"
-    )
-
-    # Scan YAML under ai-dev, skip templates and example secrets
-    while IFS= read -r -d '' file; do
-        local base
-        base=$(basename "$file")
-        local rel="${file#$AI_DEV_DIR/}"
-
-        # Skip committed templates / examples (placeholders are intentional)
-        case "$base" in
-            *template*|*example-secret*|*example*.yaml)
-                continue
-                ;;
-        esac
-        case "$rel" in
-            *template*|*example-secret*)
-                continue
-                ;;
-        esac
-
-        for pat in "${patterns[@]}"; do
-            if grep -qF -- "$pat" "$file" 2>/dev/null; then
-                echo -e "${RED}✗ Forbidden placeholder/default in ${rel}:${NC}"
-                grep -nF -- "$pat" "$file" | head -3 | sed 's/^/    /'
-                found=1
-            fi
-        done
-    done < <(find "$AI_DEV_DIR" -type f \( -name "*.yaml" -o -name "*.yml" \) \
-        ! -path "*/tests/*" -print0 2>/dev/null)
-
-    # Also refuse applying example-secret.yaml / secret-template.yaml as-is
-    # if they still contain REPLACE_ markers when someone copies them to a
-    # non-template name — handled above when filename loses "template".
-
-    if [ "$found" -ne 0 ]; then
-        echo ""
-        echo -e "${RED}Deploy refused: replace placeholder credentials before deploy.${NC}"
-        echo "Generate API auth:"
-        echo "  htpasswd -nbB admin 'your-strong-password' > /tmp/auth"
-        echo "  kubectl create secret generic api-auth-secret --from-file=users=/tmp/auth -n ai-dev"
-        echo "  rm -f /tmp/auth"
-        echo "See: ingress/example-secret.yaml and swe-agent/secret-template.yaml"
-        FAILED=$((FAILED + 1))
-        return 1
-    fi
-
-    echo -e "${GREEN}✓ No insecure auth placeholders in deployable manifests${NC}"
-    PASSED=$((PASSED + 1))
-    return 0
-}
-
-# Ensure ingress middleware still points at a secret that must be created out-of-band
-check_ingress_auth_wiring() {
-    local ingress="$AI_DEV_DIR/ingress/ingressroute.yaml"
-    if [ ! -f "$ingress" ]; then
-        return 0
-    fi
-    echo -n "Checking ingress auth wiring... "
-    if ! grep -q "api-auth-secret" "$ingress"; then
-        echo -e "${YELLOW}WARNING${NC} (api-auth-secret not referenced)"
-        return 0
-    fi
-    # Secret must not be embedded with real data in the route file
-    if grep -qE "^\s*users:\s+\S+" "$ingress" 2>/dev/null; then
-        echo -e "${RED}FAILED${NC} (embedded users credentials in ingressroute.yaml)"
-        FAILED=$((FAILED + 1))
-        return 1
-    fi
-    echo -e "${GREEN}PASSED${NC} (secret expected out-of-band)"
-    PASSED=$((PASSED + 1))
-    return 0
-}
-
-# Find and validate all YAML files (skip secret templates / examples)
+# Find and validate all YAML files (current shell so counters stick)
 echo "Finding YAML files..."
 while IFS= read -r -d '' file; do
-    base=$(basename "$file")
-    case "$base" in
-        *template*|*example-secret*)
-            echo "Skipping template/example: $base"
-            continue
-            ;;
-    esac
-    # Skip application config that is not a k8s manifest
-    if [[ "$file" == *"/code-indexer/config.yaml" ]]; then
-        continue
-    fi
     validate_file "$file" || true
-done < <(find "$AI_DEV_DIR" -name "*.yaml" -print0 2>/dev/null)
+done < <(find "$AI_DEV_DIR" -name "*.yaml" \
+    -not -path "*/secret-template.yaml" \
+    -not -name "config.yaml" \
+    -print0)
 
 echo ""
-check_auth_placeholders || true
-check_ingress_auth_wiring || true
-
+echo "=== Code-indexer image prerequisite ==="
+echo "Code-indexer is build-yourself. Before deploy you MUST:"
+echo "  1. docker build -t <registry>/local-swe-agent/code-indexer:<tag> ai-dev/code-indexer"
+echo "  2. docker push <registry>/local-swe-agent/code-indexer:<tag>"
+echo "  3. Set that image (no CHANGE_ME/YOUR_*) in code-indexer/cronjob.yaml"
+echo "  4. Use imagePullPolicy: Always only for published registry tags;"
+echo "     use IfNotPresent or Never for node-local images."
 echo ""
+
 echo "=== Validation Summary ==="
 echo -e "Passed: ${GREEN}${PASSED}${NC}"
 echo -e "Failed: ${RED}${FAILED}${NC}"

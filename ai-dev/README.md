@@ -136,9 +136,32 @@ ai-dev/
 
 ### Local Requirements
 - kubectl configured for cluster access
-- Docker (for building code-indexer image)
+- Docker (required — code-indexer image is build-yourself)
 - Python 3.11+ (for testing scripts)
 - Git
+
+### HARD PREREQUISITE: Code-indexer image
+
+The code-indexer container is **not** a public image. Manifests ship with a
+**placeholder** tag that will not pull. You **must** build and publish (or
+preload) the image before deploy; `scripts/validate-manifests.sh` fails if the
+placeholder remains or if `imagePullPolicy` would break the pull.
+
+```bash
+# From repo root
+cd ai-dev/code-indexer
+docker build -t ghcr.io/<your-org>/local-swe-agent/code-indexer:<tag> .
+docker push ghcr.io/<your-org>/local-swe-agent/code-indexer:<tag>
+```
+
+Then set **both** CronJob and Job images in `code-indexer/cronjob.yaml` to that
+exact reference (replace `YOUR_ORG` / `CHANGE_ME`). Use `imagePullPolicy: Always`
+only for tags you actually pushed; for node-local images use `IfNotPresent` or
+`Never`.
+
+Optional: after CI has published packages, you may use
+`ghcr.io/josh-archer/local-swe-agent/code-indexer:latest` if that package exists
+and is pullable by the cluster.
 
 ## Quick Start
 
@@ -154,15 +177,17 @@ repositories:
     url: "https://github.com/yourusername/my-project.git"
 ```
 
-### 2. Build Code Indexer Image
+### 2. Build and Push Code Indexer Image (required)
 
 ```bash
 cd code-indexer
-docker build -t your-registry/code-indexer:latest .
-docker push your-registry/code-indexer:latest
+docker build -t ghcr.io/<your-org>/local-swe-agent/code-indexer:<tag> .
+docker push ghcr.io/<your-org>/local-swe-agent/code-indexer:<tag>
 ```
 
-Update `code-indexer/cronjob.yaml` with your image name.
+Edit `code-indexer/cronjob.yaml` and replace every
+`ghcr.io/YOUR_ORG/local-swe-agent/code-indexer:CHANGE_ME` with your pushed image.
+Do **not** deploy with the placeholder tag.
 
 ### 3. Configure Secrets
 
