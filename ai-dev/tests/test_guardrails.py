@@ -47,7 +47,11 @@ def _bash_path(path: Path) -> str:
     git_bash = f"/{drive}{rest}"
     try:
         probe = subprocess.run(
-            ["bash", "-c", f'test -e "{wsl}" && echo wsl || (test -e "{git_bash}" && echo git || echo none)'],
+            [
+                "bash",
+                "-c",
+                f'test -e "{wsl}" && echo wsl || (test -e "{git_bash}" && echo git || echo none)',
+            ],
             capture_output=True,
             text=True,
             check=False,
@@ -64,6 +68,7 @@ def _bash_path(path: Path) -> str:
 
 BASH = _bash_available()
 requires_bash = pytest.mark.skipif(not BASH, reason="bash not available")
+
 
 class TestGuardedArtifacts:
     """Static checks that demo workflow files exist and declare acceptance criteria."""
@@ -151,7 +156,9 @@ class TestGuardrailsCheckScript:
         force_exports = []
         for key in ("FORCE_PUSH", "GIT_PUSH_FORCE", "GIT_PUSH_OPTS"):
             if key in env:
-                force_exports.append(f'export {key}={subprocess.list2cmdline([env[key]])}')
+                force_exports.append(
+                    f"export {key}={subprocess.list2cmdline([env[key]])}"
+                )
 
         if force_exports:
             inner = " && ".join(force_exports + [subprocess.list2cmdline(cmd)])
