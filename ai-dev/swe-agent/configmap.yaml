@@ -373,7 +373,7 @@ data:
     rm -f "${CONFIG_FILE}.bak"
 
     # Build command
-    CMD=(sweagent run --config /config/config.yaml)
+    CMD=(sweagent run --config "$CONFIG_FILE")
 
     if [[ -n "$ISSUE_URL" ]]; then
       CMD+=(--issue_url "$ISSUE_URL")
