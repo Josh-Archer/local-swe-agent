@@ -125,7 +125,6 @@ class TestGuardedArtifacts:
         # Must not pass the unread mount path after materializing
         assert "sweagent run --config /config/config.yaml" not in body
 
-
     def test_docs_cover_human_approval_and_walkthrough(self):
         assert DOCS.is_file()
         text = DOCS.read_text(encoding="utf-8")
