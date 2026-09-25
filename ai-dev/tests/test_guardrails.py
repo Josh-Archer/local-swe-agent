@@ -114,6 +114,18 @@ class TestGuardedArtifacts:
         assert "PATH_ALLOWLIST" in text
         assert "ALLOW_FORCE_PUSH" in text
 
+    def test_run_swe_agent_uses_materialized_config(self):
+        """Rewritten /tmp config must be what sweagent --config receives (#18)."""
+        text = CONFIGMAP.read_text(encoding="utf-8")
+        # Extract the embedded run-swe-agent.sh body
+        start = text.index("run-swe-agent.sh: |")
+        body = text[start:]
+        assert 'CONFIG_FILE="/tmp/swe-agent-config.yaml"' in body
+        assert 'CMD=(sweagent run --config "$CONFIG_FILE")' in body
+        # Must not pass the unread mount path after materializing
+        assert "sweagent run --config /config/config.yaml" not in body
+
+
     def test_docs_cover_human_approval_and_walkthrough(self):
         assert DOCS.is_file()
         text = DOCS.read_text(encoding="utf-8")
