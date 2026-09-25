@@ -9,13 +9,22 @@ import sys
 import logging
 import yaml
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Set, Union, Optional, cast
 from datetime import datetime
 import hashlib
+import uuid
 
 import git
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct
+from qdrant_client.models import (
+    Distance,
+    VectorParams,
+    PointStruct,
+    Filter,
+    FieldCondition,
+    MatchValue,
+    PointIdsList,
+)
 from sentence_transformers import SentenceTransformer
 
 # Configure logging
@@ -25,81 +34,143 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def generate_point_id(repo_name: str, file_path: str, chunk_index: int = 0) -> str:
+    """Generate a deterministic point ID (UUID5) for a chunk within a repository file."""
+    normalized_path = file_path.replace("\\", "/")
+    key = f"{repo_name}:{normalized_path}:{chunk_index}"
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, key))
+
+
 class CodeIndexer:
     """Indexes code repositories into Qdrant vector database."""
 
-    def __init__(self, config_path: str = "/app/config.yaml"):
+    def __init__(
+        self,
+        config_path: Union[str, Path, Dict[str, Any]] = "/app/config.yaml",
+        qdrant_client: Optional[Any] = None,
+        embedding_model: Optional[Any] = None,
+    ):
         """Initialize the code indexer."""
         logger.info("Initializing Code Indexer...")
 
         # Load configuration
-        with open(config_path, "r") as f:
-            self.config = yaml.safe_load(f)
-
-        # Initialize Qdrant client
-        qdrant_url = os.getenv(
-            "QDRANT_URL", self.config.get("qdrant_url", "http://qdrant:6333")
-        )
-        self.qdrant = QdrantClient(url=qdrant_url)
-        logger.info(f"Connected to Qdrant at {qdrant_url}")
-
-        # Initialize embedding model
-        model_name = self.config.get(
-            "embedding_model", "sentence-transformers/all-MiniLM-L6-v2"
-        )
-        logger.info(f"Loading embedding model: {model_name}")
-        self.embedding_model = SentenceTransformer(model_name)
-        self.embedding_dim = self.embedding_model.get_sentence_embedding_dimension()
+        if isinstance(config_path, dict):
+            self.config: Dict[str, Any] = config_path
+        else:
+            with open(config_path, "r", encoding="utf-8") as f:
+                loaded = yaml.safe_load(f)
+                self.config = loaded if isinstance(loaded, dict) else {}
 
         # Collection name
-        self.collection_name = self.config.get("collection_name", "code_embeddings")
-
-        # Code file extensions to index
-        self.code_extensions = set(
-            self.config.get(
-                "code_extensions",
-                [
-                    ".py",
-                    ".js",
-                    ".ts",
-                    ".tsx",
-                    ".jsx",
-                    ".java",
-                    ".go",
-                    ".rs",
-                    ".cpp",
-                    ".c",
-                    ".h",
-                    ".hpp",
-                    ".cs",
-                    ".rb",
-                    ".php",
-                    ".swift",
-                    ".kt",
-                    ".scala",
-                    ".sh",
-                    ".bash",
-                    ".yaml",
-                    ".yml",
-                    ".json",
-                    ".md",
-                    ".sql",
-                    ".html",
-                    ".css",
-                    ".vue",
-                    ".dockerfile",
-                ],
-            )
+        qdrant_cfg = self.config.get("qdrant")
+        qdrant_dict: Dict[str, Any] = qdrant_cfg if isinstance(qdrant_cfg, dict) else {}
+        self.collection_name: str = (
+            self.config.get("collection_name")
+            or qdrant_dict.get("collection_name")
+            or "code_embeddings"
         )
 
+        # Initialize Qdrant client
+        if qdrant_client is not None:
+            self.qdrant = qdrant_client
+        else:
+            qdrant_url = os.getenv(
+                "QDRANT_URL",
+                self.config.get("qdrant_url")
+                or qdrant_dict.get("url")
+                or "http://qdrant:6333",
+            )
+            if qdrant_url == ":memory:":
+                self.qdrant = QdrantClient(":memory:")
+            else:
+                self.qdrant = QdrantClient(url=qdrant_url)
+            logger.info(f"Connected to Qdrant at {qdrant_url}")
+
+        # Initialize embedding model
+        embedding_cfg = self.config.get("embedding")
+        embedding_dict: Dict[str, Any] = (
+            embedding_cfg if isinstance(embedding_cfg, dict) else {}
+        )
+        model_name: str = (
+            self.config.get("embedding_model")
+            or embedding_dict.get("model")
+            or "sentence-transformers/all-MiniLM-L6-v2"
+        )
+        if embedding_model is not None:
+            self.embedding_model = embedding_model
+        else:
+            logger.info(f"Loading embedding model: {model_name}")
+            self.embedding_model = SentenceTransformer(model_name)
+
+        if hasattr(self.embedding_model, "get_sentence_embedding_dimension"):
+            self.embedding_dim: int = (
+                self.embedding_model.get_sentence_embedding_dimension()
+            )
+        else:
+            self.embedding_dim = int(qdrant_dict.get("vector_size", 384))
+
         # Chunking parameters
-        self.chunk_size = self.config.get("chunk_size", 500)
-        self.chunk_overlap = self.config.get("chunk_overlap", 50)
+        indexing_cfg = self.config.get("indexing")
+        indexing_dict: Dict[str, Any] = (
+            indexing_cfg if isinstance(indexing_cfg, dict) else {}
+        )
+        chunk_size_val = (
+            self.config.get("chunk_size") or indexing_dict.get("chunk_size") or 500
+        )
+        self.chunk_size: int = int(chunk_size_val)
+        chunk_overlap_val = (
+            self.config.get("chunk_overlap") or indexing_dict.get("chunk_overlap") or 50
+        )
+        self.chunk_overlap: int = int(chunk_overlap_val)
+
+        # Code file extensions to index
+        code_exts = self.config.get("code_extensions") or indexing_dict.get(
+            "file_extensions"
+        )
+        if code_exts:
+            self.code_extensions: Set[str] = set(code_exts)
+        else:
+            self.code_extensions = {
+                ".py",
+                ".js",
+                ".ts",
+                ".tsx",
+                ".jsx",
+                ".java",
+                ".go",
+                ".rs",
+                ".cpp",
+                ".c",
+                ".h",
+                ".hpp",
+                ".cs",
+                ".rb",
+                ".php",
+                ".swift",
+                ".kt",
+                ".scala",
+                ".sh",
+                ".bash",
+                ".yaml",
+                ".yml",
+                ".json",
+                ".md",
+                ".sql",
+                ".html",
+                ".css",
+                ".vue",
+                ".dockerfile",
+            }
 
         # Work directory
-        # nosec B108 - /tmp is appropriate in containerized environment
+        # nosec B108
         self.work_dir = Path(self.config.get("work_dir", "/tmp/indexer"))  # nosec
         self.work_dir.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def generate_point_id(repo_name: str, file_path: str, chunk_index: int = 0) -> str:
+        """Generate a deterministic point ID for a chunk within a repository file."""
+        return generate_point_id(repo_name, file_path, chunk_index)
 
     def ensure_collection(self):
         """Create Qdrant collection if it doesn't exist."""
@@ -116,6 +187,81 @@ class CodeIndexer:
             )
         else:
             logger.info(f"Collection {self.collection_name} already exists")
+
+    def get_repository_point_ids(self, repo_name: str) -> Set[str]:
+        """Retrieve all existing point IDs for a specific repository."""
+        scroll_filter = Filter(
+            must=[
+                FieldCondition(
+                    key="repository",
+                    match=MatchValue(value=repo_name),
+                )
+            ]
+        )
+        existing_ids: Set[str] = set()
+        offset = None
+
+        try:
+            while True:
+                scroll_result = self.qdrant.scroll(
+                    collection_name=self.collection_name,
+                    scroll_filter=scroll_filter,
+                    limit=100,
+                    offset=offset,
+                    with_payload=False,
+                    with_vectors=False,
+                )
+                if not scroll_result:
+                    break
+                records, next_page = scroll_result
+                if records:
+                    for record in records:
+                        rec_id = (
+                            record.id if hasattr(record, "id") else record.get("id")
+                        )
+                        if rec_id is not None:
+                            existing_ids.add(rec_id)
+
+                if next_page is None or not records:
+                    break
+                offset = next_page
+        except Exception as e:
+            logger.warning(f"Failed to scroll points for repository {repo_name}: {e}")
+
+        return existing_ids
+
+    def delete_stale_points(self, repo_name: str, current_point_ids: Set[str]) -> int:
+        """Delete points for a repository that are no longer present."""
+        existing_ids = self.get_repository_point_ids(repo_name)
+        stale_ids = existing_ids - current_point_ids
+
+        if not stale_ids:
+            logger.info(f"No stale points found for repository {repo_name}")
+            return 0
+
+        logger.info(f"Found {len(stale_ids)} stale points to delete for {repo_name}")
+        stale_id_list = list(stale_ids)
+        batch_size = 100
+
+        for i in range(0, len(stale_id_list), batch_size):
+            batch = stale_id_list[i : i + batch_size]
+            points_selector = PointIdsList(
+                points=cast(List[Union[int, str, uuid.UUID]], batch)
+            )
+            try:
+                self.qdrant.delete(
+                    collection_name=self.collection_name,
+                    points_selector=points_selector,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to delete batch of stale points for {repo_name}: {e}"
+                )
+
+        logger.info(
+            f"Completed stale point cleanup for {repo_name}: deleted {len(stale_ids)} points"
+        )
+        return len(stale_ids)
 
     def clone_or_pull_repo(self, repo_url: str, repo_name: str) -> Path:
         """Clone repository or pull if it already exists."""
@@ -145,7 +291,8 @@ class CodeIndexer:
         chunk_lines = self.chunk_size
         overlap_lines = self.chunk_overlap
 
-        for i in range(0, len(lines), chunk_lines - overlap_lines):
+        step = max(1, chunk_lines - overlap_lines)
+        for i in range(0, len(lines), step):
             chunk_content = "\n".join(lines[i : i + chunk_lines])
             if chunk_content.strip():
                 chunks.append(
@@ -187,6 +334,9 @@ class CodeIndexer:
         """Index all code files in a repository."""
         logger.info(f"Starting indexing for repository: {repo_name}")
 
+        # Ensure collection exists before indexing
+        self.ensure_collection()
+
         # Clone or pull repository
         repo_path = self.clone_or_pull_repo(repo_url, repo_name)
 
@@ -200,7 +350,7 @@ class CodeIndexer:
 
         # Process files and create embeddings
         points = []
-        point_id = 0
+        current_point_ids: Set[str] = set()
 
         for file_path in code_files:
             try:
@@ -214,11 +364,18 @@ class CodeIndexer:
 
                 # Get relative path from repo root
                 rel_path = file_path.relative_to(repo_path)
+                file_path_str = rel_path.as_posix()
 
                 # Chunk the file
-                chunks = self.chunk_code(content, str(rel_path))
+                chunks = self.chunk_code(content, file_path_str)
 
-                for chunk in chunks:
+                for chunk_idx, chunk in enumerate(chunks):
+                    # Generate deterministic point ID per repo, path, and chunk
+                    point_id = self.generate_point_id(
+                        repo_name, file_path_str, chunk_idx
+                    )
+                    current_point_ids.add(point_id)
+
                     # Generate embedding
                     embedding = self.embedding_model.encode(chunk["content"]).tolist()
 
@@ -233,8 +390,12 @@ class CodeIndexer:
                         vector=embedding,
                         payload={
                             "repository": repo_name,
-                            "file_path": str(rel_path),
-                            "language": file_path.suffix[1:],  # Remove leading dot
+                            "file_path": file_path_str,
+                            "language": (
+                                file_path.suffix[1:]
+                                if file_path.suffix.startswith(".")
+                                else file_path.suffix
+                            ),
                             "content": chunk["content"],
                             "start_line": chunk["start_line"],
                             "end_line": chunk["end_line"],
@@ -243,7 +404,6 @@ class CodeIndexer:
                         },
                     )
                     points.append(point)
-                    point_id += 1
 
                     # Upload in batches
                     if len(points) >= 100:
@@ -262,7 +422,12 @@ class CodeIndexer:
             logger.info(f"Uploading final batch of {len(points)} embeddings...")
             self.qdrant.upsert(collection_name=self.collection_name, points=points)
 
-        logger.info(f"Completed indexing {repo_name}: {point_id} chunks indexed")
+        # Delete stale points for this repository
+        self.delete_stale_points(repo_name, current_point_ids)
+
+        logger.info(
+            f"Completed indexing {repo_name}: {len(current_point_ids)} chunks indexed"
+        )
 
     def run(self):
         """Run the indexer on all configured repositories."""
