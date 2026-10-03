@@ -28,7 +28,9 @@ kubectl apply -f ai-dev/swe-agent/configmap.yaml
 
 ## Human approval gate
 
-The demo **never** opens a PR unless a human opts in after review.
+The demo **never** opens a PR unless a human opts in after review, and guardrails have passed.
+
+PR creation is strictly decoupled from the SWE-agent run: `run-swe-agent.sh` never passes `--open_pr` to the agent. Guardrails always run first against workspace changes; only when guardrails pass AND `OPEN_PR=true` (with `HUMAN_APPROVED=true`), a PR is opened post-guardrails (e.g. via `gh pr create`).
 
 1. **First run** — agent works the issue, may push a feature branch, **does not** open a PR:
    - `OPEN_PR=false` (default)
@@ -36,9 +38,9 @@ The demo **never** opens a PR unless a human opts in after review.
 2. **Review** — inspect logs, diff, and guardrail output (`GUARDRAILS PASSED`).
 3. **Approve** — either:
    - Open the PR yourself (`gh pr create ...`), or
-   - Re-run the job with `--open-pr --approved` (sets `OPEN_PR=true` and `HUMAN_APPROVED=true`).
+   - Re-run the job with `--open-pr --approved` (sets `OPEN_PR=true` and `HUMAN_APPROVED=true`). The PR is opened post-guardrails only after all checks pass.
 
-If `OPEN_PR=true` without `HUMAN_APPROVED=true`, the wrapper **forces** `OPEN_PR=false` and prints a warning.
+If `OPEN_PR=true` without `HUMAN_APPROVED=true`, the wrapper **forces** `OPEN_PR=false` and prints a warning. If guardrails fail, PR creation is blocked even when `OPEN_PR=true`.
 
 ## Quick start (recommended)
 

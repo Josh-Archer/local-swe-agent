@@ -3,6 +3,7 @@ Tests for guarded issue-to-PR demo workflow artifacts and guardrails-check.sh.
 """
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -124,6 +125,27 @@ class TestGuardedArtifacts:
         assert 'CMD=(sweagent run --config "$CONFIG_FILE")' in body
         # Must not pass the unread mount path after materializing
         assert "sweagent run --config /config/config.yaml" not in body
+
+    def test_run_swe_agent_does_not_pass_open_pr_to_sweagent(self):
+        """sweagent must not receive --open_pr; guardrails must run first (#20)."""
+        text = CONFIGMAP.read_text(encoding="utf-8")
+        start = text.index("run-swe-agent.sh: |")
+        body = text[start:]
+        # CMD should not append --open_pr
+        assert "CMD+=(--open_pr)" not in body
+        # sweagent invocation should not have --open_pr in command arguments
+        cmd_section = body.split("CMD=(")[1].split('"${CMD[@]}"')[0]
+        code_lines = [
+            line.strip()
+            for line in cmd_section.splitlines()
+            if not line.strip().startswith("#")
+        ]
+        assert not any("--open_pr" in line for line in code_lines)
+        # Opening PR must be decoupled and located post-guardrails
+        assert "Opening pull request (post-guardrails)" in body
+        assert body.index("guardrails-check.sh") < body.index(
+            "Opening pull request (post-guardrails)"
+        )
 
     def test_docs_cover_human_approval_and_walkthrough(self):
         assert DOCS.is_file()
@@ -319,3 +341,476 @@ class TestGuardrailsCheckScript:
         assert "swe-agent-issue-42" in result.stdout
         # OPEN_PR stays false without --approved
         assert "name: OPEN_PR" in result.stdout
+
+
+@requires_bash
+class TestRunSweAgentScript:
+    """Behavioral tests for embedded run-swe-agent.sh execution."""
+
+    @pytest.fixture
+    def runner_env(self, temp_dir):
+        """Set up an isolated workspace, script dir, and mocked binaries."""
+        script_dir = temp_dir / "scripts"
+        script_dir.mkdir()
+        cm = yaml.safe_load(CONFIGMAP.read_text(encoding="utf-8"))
+        runner_content = cm["data"]["run-swe-agent.sh"]
+        guardrails_content = cm["data"]["guardrails-check.sh"]
+
+        runner_script = script_dir / "run-swe-agent.sh"
+        guardrails_script = script_dir / "guardrails-check.sh"
+        runner_script.write_text(runner_content, encoding="utf-8")
+        guardrails_script.write_text(guardrails_content, encoding="utf-8")
+        runner_script.chmod(0o755)
+        guardrails_script.chmod(0o755)
+
+        config_content = cm["data"]["config.yaml"]
+        config_file = script_dir / "config.yaml"
+        config_file.write_text(config_content, encoding="utf-8")
+
+        bin_dir = temp_dir / "bin"
+        bin_dir.mkdir()
+
+        sweagent_log = temp_dir / "sweagent.log"
+        gh_log = temp_dir / "gh.log"
+        git_log = temp_dir / "git.log"
+
+        # Mock sweagent
+        mock_sweagent = bin_dir / "sweagent"
+        mock_sweagent.write_text(
+            f'#!/bin/bash\necho "$@" >> "{_bash_path(sweagent_log)}"\nexit 0\n',
+            encoding="utf-8",
+        )
+        mock_sweagent.chmod(0o755)
+
+        # Mock gh
+        mock_gh = bin_dir / "gh"
+        mock_gh.write_text(
+            f'#!/bin/bash\necho "$@" >> "{_bash_path(gh_log)}"\nexit 0\n',
+            encoding="utf-8",
+        )
+        mock_gh.chmod(0o755)
+
+        # Mock git (intercept push, pass through other commands to real git)
+        real_git = shutil.which("git") or "/usr/bin/git"
+        mock_git = bin_dir / "git"
+        mock_git.write_text(
+            f"""#!/bin/bash
+echo "$@" >> "{_bash_path(git_log)}"
+subcmd=""
+skip_next=false
+for arg in "$@"; do
+    if [ "$skip_next" = "true" ]; then
+        skip_next=false
+        continue
+    fi
+    case "$arg" in
+        -C|-c|--git-dir|--work-tree)
+            skip_next=true
+            ;;
+        --git-dir=*|--work-tree=*)
+            ;;
+        -*)
+            ;;
+        *)
+            subcmd="$arg"
+            break
+            ;;
+    esac
+done
+if [ "$subcmd" = "push" ]; then
+    if [ "${{MOCK_GIT_PUSH_FAIL:-false}}" = "true" ]; then
+        echo "fatal: mock git push failed" >&2
+        exit 1
+    fi
+    exit 0
+fi
+exec "{_bash_path(Path(real_git))}" "$@"
+""",
+            encoding="utf-8",
+        )
+        mock_git.chmod(0o755)
+
+        workspace = temp_dir / "workspace"
+        workspace.mkdir()
+
+        repo = workspace / "test-repo"
+        repo.mkdir()
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.com"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+        )
+        (repo / "README.md").write_text("initial\n", encoding="utf-8")
+        (repo / "ai-dev").mkdir()
+        (repo / "ai-dev" / "test.txt").write_text("initial\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "init"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "branch", "origin/master"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+        )
+
+        return {
+            "runner_script": runner_script,
+            "guardrails_script": guardrails_script,
+            "config_file": config_file,
+            "script_dir": script_dir,
+            "bin_dir": bin_dir,
+            "workspace": workspace,
+            "repo": repo,
+            "sweagent_log": sweagent_log,
+            "gh_log": gh_log,
+            "git_log": git_log,
+        }
+
+    def _run_runner(self, runner_env, env_overrides=None):
+        base_env = {
+            "PATH": f"{runner_env['bin_dir']}:{os.environ.get('PATH', '')}",
+            "WORKSPACE": str(runner_env["workspace"]),
+            "GITHUB_OWNER": "test-owner",
+            "GITHUB_REPO": "test-repo",
+            "ISSUE_NUMBER": "42",
+            "PATH_ALLOWLIST": "ai-dev/,*.md",
+            "MAX_CHANGED_FILES": "10",
+            "ALLOW_FORCE_PUSH": "false",
+            "ENFORCE_GUARDRAILS": "true",
+            "REQUIRE_HUMAN_APPROVAL": "true",
+            "HUMAN_APPROVED": "false",
+            "OPEN_PR": "false",
+        }
+        if env_overrides:
+            base_env.update(env_overrides)
+
+        cmd = ["bash", _bash_path(runner_env["runner_script"])]
+        return subprocess.run(
+            cmd,
+            cwd=runner_env["script_dir"],
+            env=base_env,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_run_swe_agent_syntax(self, runner_env):
+        result = subprocess.run(
+            ["bash", "-n", _bash_path(runner_env["runner_script"])],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+
+    def test_guardrails_failure_blocks_pr_even_if_approved(self, runner_env):
+        # Create a file outside allowlist
+        leak = runner_env["repo"] / "leak.py"
+        leak.write_text("disallowed\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "add", "."],
+            cwd=runner_env["repo"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "disallowed"],
+            cwd=runner_env["repo"],
+            check=True,
+            capture_output=True,
+        )
+
+        result = self._run_runner(
+            runner_env,
+            env_overrides={
+                "OPEN_PR": "true",
+                "HUMAN_APPROVED": "true",
+            },
+        )
+        assert result.returncode != 0
+        assert (
+            "GUARDRAILS FAILED" in result.stdout or "Guardrails failed" in result.stderr
+        )
+        # Verify sweagent was NOT invoked with --open_pr
+        swe_log = (
+            runner_env["sweagent_log"].read_text()
+            if runner_env["sweagent_log"].exists()
+            else ""
+        )
+        assert "--open_pr" not in swe_log
+        # Verify gh pr create was NEVER called
+        assert not runner_env["gh_log"].exists()
+
+    def test_guardrails_pass_and_approved_opens_pr_post_guardrails(self, runner_env):
+        # Create an allowlisted file change
+        ok = runner_env["repo"] / "ai-dev" / "test.txt"
+        ok.write_text("updated\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "add", "."],
+            cwd=runner_env["repo"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "update"],
+            cwd=runner_env["repo"],
+            check=True,
+            capture_output=True,
+        )
+
+        result = self._run_runner(
+            runner_env,
+            env_overrides={
+                "OPEN_PR": "true",
+                "HUMAN_APPROVED": "true",
+            },
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "GUARDRAILS PASSED" in result.stdout
+        assert "Opening pull request (post-guardrails)" in result.stdout
+        # Verify sweagent was NOT invoked with --open_pr
+        swe_log = runner_env["sweagent_log"].read_text()
+        assert "--open_pr" not in swe_log
+        # Verify dedicated branch was pushed
+        git_log = runner_env["git_log"].read_text()
+        assert "push -u origin swe-agent/issue-42-" in git_log
+        assert "origin HEAD" not in git_log
+        # Verify gh pr create WAS called with the dedicated branch as head
+        assert runner_env["gh_log"].exists()
+        gh_log = runner_env["gh_log"].read_text()
+        assert "pr create" in gh_log
+        assert "--head swe-agent/issue-42-" in gh_log
+        assert "Fixes #42" in gh_log
+
+    def test_missing_guardrails_script_blocks_pr(self, runner_env):
+        """Missing guardrails script must prevent PR creation (fail-closed)."""
+        ok = runner_env["repo"] / "ai-dev" / "test.txt"
+        ok.write_text("updated\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "add", "."],
+            cwd=runner_env["repo"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "update"],
+            cwd=runner_env["repo"],
+            check=True,
+            capture_output=True,
+        )
+
+        runner_env["guardrails_script"].unlink()
+
+        result = self._run_runner(
+            runner_env,
+            env_overrides={
+                "OPEN_PR": "true",
+                "HUMAN_APPROVED": "true",
+            },
+        )
+        assert result.returncode != 0
+        assert (
+            "Refusing to open pull request" in (result.stdout + result.stderr)
+            or "guardrails" in (result.stdout + result.stderr).lower()
+        )
+        assert not runner_env["gh_log"].exists()
+        git_log = (
+            runner_env["git_log"].read_text() if runner_env["git_log"].exists() else ""
+        )
+        assert "push" not in git_log
+
+    def test_head_on_default_branch_pushes_dedicated_branch_never_default(
+        self, runner_env
+    ):
+        """Commits on default branch must be pushed on a dedicated branch, never to default."""
+        current_branch = subprocess.check_output(
+            ["git", "branch", "--show-current"], cwd=runner_env["repo"], text=True
+        ).strip()
+        assert current_branch in ("master", "main")
+
+        ok = runner_env["repo"] / "ai-dev" / "test.txt"
+        ok.write_text("updated\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "add", "."],
+            cwd=runner_env["repo"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "update"],
+            cwd=runner_env["repo"],
+            check=True,
+            capture_output=True,
+        )
+
+        result = self._run_runner(
+            runner_env,
+            env_overrides={
+                "OPEN_PR": "true",
+                "HUMAN_APPROVED": "true",
+                "ISSUE_NUMBER": "42",
+            },
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        git_log = runner_env["git_log"].read_text()
+        assert "push -u origin swe-agent/issue-42-" in git_log
+        assert "origin HEAD" not in git_log
+        assert "origin HEAD:main" not in git_log
+        assert "origin HEAD:master" not in git_log
+        assert "origin main" not in git_log
+        assert "origin master" not in git_log
+
+        assert runner_env["gh_log"].exists()
+        gh_log = runner_env["gh_log"].read_text()
+        assert "pr create" in gh_log
+        assert "--head swe-agent/issue-42-" in gh_log
+
+    def test_detached_head_pushes_dedicated_branch_never_detached_head(
+        self, runner_env
+    ):
+        """When HEAD is detached, it must push on a dedicated branch."""
+        ok = runner_env["repo"] / "ai-dev" / "test.txt"
+        ok.write_text("updated\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "add", "."],
+            cwd=runner_env["repo"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "update"],
+            cwd=runner_env["repo"],
+            check=True,
+            capture_output=True,
+        )
+        head_commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=runner_env["repo"], text=True
+        ).strip()
+        subprocess.run(
+            ["git", "checkout", head_commit],
+            cwd=runner_env["repo"],
+            check=True,
+            capture_output=True,
+        )
+
+        result = self._run_runner(
+            runner_env,
+            env_overrides={
+                "OPEN_PR": "true",
+                "HUMAN_APPROVED": "true",
+                "ISSUE_NUMBER": "77",
+            },
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        git_log = runner_env["git_log"].read_text()
+        assert "push -u origin swe-agent/issue-77-" in git_log
+        assert "origin HEAD" not in git_log
+        assert runner_env["gh_log"].exists()
+        gh_log = runner_env["gh_log"].read_text()
+        assert "--head swe-agent/issue-77-" in gh_log
+
+    def test_push_failure_prevents_pr_creation(self, runner_env):
+        """Failed git push must abort PR creation and not call gh pr create."""
+        ok = runner_env["repo"] / "ai-dev" / "test.txt"
+        ok.write_text("updated\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "add", "."],
+            cwd=runner_env["repo"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "update"],
+            cwd=runner_env["repo"],
+            check=True,
+            capture_output=True,
+        )
+
+        result = self._run_runner(
+            runner_env,
+            env_overrides={
+                "OPEN_PR": "true",
+                "HUMAN_APPROVED": "true",
+                "MOCK_GIT_PUSH_FAIL": "true",
+            },
+        )
+        assert result.returncode != 0
+        assert "Failed to push branch" in (
+            result.stdout + result.stderr
+        ) or "ERROR:" in (result.stdout + result.stderr)
+        assert not runner_env["gh_log"].exists()
+
+    def test_missing_config_fails_loudly_without_empty_fallback(self, runner_env):
+        """Missing /config/config.yaml and local fallback must fail loudly."""
+        runner_env["config_file"].unlink()
+        result = self._run_runner(runner_env)
+        assert result.returncode != 0
+        assert "Configuration file not found" in (result.stdout + result.stderr)
+
+    def test_guardrails_pass_but_unapproved_blocks_pr(self, runner_env):
+        # Allowlisted change
+        ok = runner_env["repo"] / "ai-dev" / "test.txt"
+        ok.write_text("updated\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "add", "."],
+            cwd=runner_env["repo"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "update"],
+            cwd=runner_env["repo"],
+            check=True,
+            capture_output=True,
+        )
+
+        result = self._run_runner(
+            runner_env,
+            env_overrides={
+                "OPEN_PR": "true",
+                "HUMAN_APPROVED": "false",
+            },
+        )
+        assert result.returncode == 0
+        assert "GUARDRAILS PASSED" in result.stdout
+        assert "Human approval gate" in result.stdout
+        assert not runner_env["gh_log"].exists()
+
+    def test_guardrails_pass_and_open_pr_false_skips_pr(self, runner_env):
+        # Allowlisted change
+        ok = runner_env["repo"] / "ai-dev" / "test.txt"
+        ok.write_text("updated\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "add", "."],
+            cwd=runner_env["repo"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "update"],
+            cwd=runner_env["repo"],
+            check=True,
+            capture_output=True,
+        )
+
+        result = self._run_runner(
+            runner_env,
+            env_overrides={
+                "OPEN_PR": "false",
+                "HUMAN_APPROVED": "true",
+            },
+        )
+        assert result.returncode == 0
+        assert "GUARDRAILS PASSED" in result.stdout
+        assert "Human approval gate" in result.stdout
+        assert not runner_env["gh_log"].exists()
