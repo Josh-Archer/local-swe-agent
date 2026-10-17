@@ -2083,11 +2083,11 @@ class TestSecretDenylistAndRedaction:
         gh_tok = gh_prefix + ("1234567890" * 3) + "123456"
         pushover_tok = "".join(["xyz", "789"])
         hunter_pwd = "".join(["h", "un", "ter", "2", pwd_word])
-        my_sec_val = "".join(["super", sec_word, "val"])
-        app_key_val = "".join([sec_word, "_app_", key_word])
-        api_tok_val = "".join([sec_word, "_api_", tok_word])
+        my_sec_val = "".join(["super", sec_word, "-", "val", "7"])
+        app_key_val = "".join([sec_word, "-app-", key_word, "7"])
+        api_tok_val = "".join([sec_word, "-api-", tok_word, "7"])
         tok_val_simple = "".join([tok_word, "val"])
-        sec_val_simple = "".join(["some_", sec_word, "_value"])
+        sec_val_simple = "".join(["some-", sec_word, "-value", "7"])
         aws_sec_val = "".join(
             [
                 "wJalr",
@@ -2235,6 +2235,95 @@ class TestSecretDenylistAndRedaction:
         assert "[REDACTED_TOKEN]" in redacted
         assert "[REDACTED_SECRET]" in redacted
         assert "[REDACTED_API_KEY]" in redacted
+
+    def test_redaction_preserves_code_and_handles_literal_authorization(self):
+        password = "pass" + "word"
+        secret = "sec" + "ret"
+        token = "to" + "ken"
+        key = "k" + "ey"
+        credential = "runtime-" + "credential-value"
+        cases = [
+            "sorted(items, key=len)",
+            "max(d, key=lambda k: d[k])",
+            "tokenizer = AutoTokenizer.from_pretrained(m)",
+            "max_tokens = self.chunk_size",
+            "keyboard = Keyboard()",
+            "passed = run_tests()",
+            "bypass = False",
+            f"{password}_{'hash'} = bcrypt.hash(raw)",
+            f"{token} = os.environ.get('{('GITHUB_' + token.upper())}')",
+            "self.set(key=key, value=value)",
+            '{"keywords": ["a"]}',
+            "keys:\n  - a",
+            f"{key}: True",
+            f"primary_{key}=True",
+            f"{key}=len",
+            f"{key}=lambda k: k",
+            f"{password}: False",
+            f'{{"Authorization": "Basic {credential}"}}',
+            f"{{'Authorization': 'token {credential}'}}",
+            f"headers['Authorization']='Basic {credential}'",
+        ]
+        output = redact_secrets("\n".join(cases))
+        for source in cases[:17]:
+            assert source in output
+        assert credential not in output
+        assert output.count("[REDACTED_TOKEN]") >= 3
+
+    def test_redaction_url_forms_case_and_yaml_siblings(self):
+        credential = "runtime-" + "credential-value"
+        short_password = "p" + "w"
+        lower_pem = "-" * 5 + "begin private key" + "-" * 5
+        upper_end = "-" * 5 + "end private key" + "-" * 5
+        url_empty_user = f"https://:{credential}@host/path"
+        url_empty_user_short_password = f"https://:{short_password}@host/path"
+        url_user_only = f"https://{credential}@github.com/repo"
+        yaml = f"{('api_' + 'token')}: |\n  {credential}\n  extra\nordinary: keep\n"
+        text = "\n".join(
+            [
+                url_empty_user,
+                url_empty_user_short_password,
+                url_user_only,
+                f"{lower_pem}\nvalue\n{upper_end}",
+                yaml,
+            ]
+        )
+        output = redact_secrets(text)
+        assert credential not in output
+        assert short_password not in output
+        assert "ordinary: keep" in output
+        assert "extra" not in output
+        assert "[REDACTED_PRIVATE_KEY]" in output
+
+    def test_truncation_notes_respect_tiny_budgets(self):
+        from inject_context import enforce_context_budget
+
+        for max_bytes in range(0, 60):
+            output = enforce_context_budget(
+                "some long context value", max_bytes=max_bytes
+            )
+            assert len(output.encode("utf-8")) <= max_bytes
+        assert enforce_context_budget("context", max_bytes=0) == ""
+        chunk = [
+            {
+                "repository": "repo",
+                "file_path": "x.py",
+                "content": "value = 123456789\n",
+            }
+        ]
+        for max_bytes in range(0, 180):
+            for max_tokens in range(0, 18):
+                output = CodeIndexer.format_retrieved_context(
+                    chunk, max_bytes=max_bytes, max_tokens=max_tokens
+                )
+                assert len(output.encode("utf-8")) <= max_bytes
+                assert len(output.split()) <= max_tokens
+        for max_bytes in range(0, 45):
+            output, truncated = CodeIndexer.truncate_snippet_content(
+                "long content value", max_bytes=max_bytes, max_tokens=10
+            )
+            assert len(output.encode("utf-8")) <= max_bytes
+        assert CodeIndexer.truncate_snippet_content("content", 0, 0) == ("", True)
 
     def test_cli_requires_repo_and_json_output_is_redacted(self, capsys):
         with pytest.raises(SystemExit) as exc:

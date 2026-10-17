@@ -1334,6 +1334,8 @@ class CodeIndexer:
 
         marker_bytes = len(truncation_marker.encode("utf-8"))
         marker_words = len(truncation_marker.split())
+        if max_bytes < marker_bytes or max_tokens < marker_words:
+            return "", True
         target_bytes = max(0, max_bytes - marker_bytes)
         target_words = max(0, max_tokens - marker_words)
 

@@ -27,18 +27,21 @@ def redact_secrets(text: str) -> str:
         r"[\s\S]*?-----END\s+(?:[A-Z0-9_]+\s+)*PRIVATE KEY(?:\s+BLOCK)?-----",
         "[REDACTED_PRIVATE_KEY]",
         text,
+        flags=re.IGNORECASE,
     )
     # Private key blocks split across chunks: BEGIN onward if no END in chunk
     text = re.sub(
         r"-----BEGIN\s+(?:[A-Z0-9_]+\s+)*PRIVATE KEY(?:\s+BLOCK)?-----[\s\S]*$",
         "[REDACTED_PRIVATE_KEY]",
         text,
+        flags=re.IGNORECASE,
     )
     # Private key blocks split across chunks: END tail without BEGIN in chunk
     text = re.sub(
         r"^[\s\S]*?-----END\s+(?:[A-Z0-9_]+\s+)*PRIVATE KEY(?:\s+BLOCK)?-----",
         "[REDACTED_PRIVATE_KEY]",
         text,
+        flags=re.IGNORECASE,
     )
 
     # 2. Certificate blocks (full, or split)
@@ -73,8 +76,13 @@ def redact_secrets(text: str) -> str:
 
     # 6. Credentials embedded in URLs and authorization headers.
     text = re.sub(
-        r"(?i)\b([a-z][a-z0-9+.-]*://[^:/\s@]+:)[^@/\s]+(@)",
-        r"\g<1>[REDACTED_SECRET]\g<2>",
+        r"(?i)\b([a-z][a-z0-9+.-]*://)([^:/\s@]*:)[^@/\s]+(@)",
+        r"\g<1>\g<2>[REDACTED_SECRET]\g<3>",
+        text,
+    )
+    text = re.sub(
+        r"(?i)\b([a-z][a-z0-9+.-]*://)([^:/\s@]{16,})(@)",
+        r"\g<1>[REDACTED_SECRET]\g<3>",
         text,
     )
     text = re.sub(
@@ -99,10 +107,13 @@ def redact_secrets(text: str) -> str:
     # - prefixed KEY-style names (*_TOKEN=, *_PASSWORD=, *_SECRET, *_KEY, etc.)
     # - JSON keys with quotes ("password":, 'api_token':)
     key_names = (
-        r"[a-zA-Z0-9_-]*(?:token|secret|password|passwd|passphrase|pwd|pass|apikey|api_key|api-key|key)[a-zA-Z0-9_-]*|"
-        r"auth_token|private_key|"
-        r"aws_secret_access_key|aws_access_key_id|"
-        r"x-api-key"
+        r"(?:password|passwd|passphrase|pwd|pass|key|token|secret|api[-_]?key|"
+        r"[a-z0-9]+(?:[_-](?:token|secret|key|password|passwd|passphrase|pwd))|"
+        r"[a-z0-9]+(?:Token|Secret|Key)|token_[a-z0-9]+|"
+        r"aws_secret_access_key|aws_access_key_id|x-api-key|x_api_key)"
+    )
+    credential_value = re.compile(
+        r"(?i)^(?:[a-z0-9]{24,}|(?=.{5,}$)(?=.*\d).+|(?=.{6,}$)(?=.*[^a-z0-9_]).+)$"
     )
 
     def _replace_kv(m: re.Match) -> str:
@@ -115,21 +126,52 @@ def redact_secrets(text: str) -> str:
             return m.group(0)
         if quote:
             return f"{prefix}{key}{sep}{quote}[REDACTED_SECRET]{quote}"
+        if val in {"True", "False", "None"} or not credential_value.match(val or ""):
+            return m.group(0)
         return f"{prefix}{key}{sep}[REDACTED_SECRET]"
 
-    text = re.sub(
-        r"(?im)(^\s*['\"]?[a-zA-Z0-9_-]*(?:token|secret|password|passwd|passphrase|"
-        r"pwd|pass|apikey|api_key|api-key|key)['\"]?\s*:\s*[|>][-+]?\s*\n)"
-        r"([ \t]+[^\n]*(?:\n[ \t]+[^\n]*)*)",
-        r"\g<1>  [REDACTED_SECRET]",
-        text,
-    )
+    lines = text.splitlines(keepends=True)
+    index = 0
+    while index < len(lines):
+        match = re.match(
+            rf"^([ \t]*)(['\"]?(?:{key_names})['\"]?)\s*:\s*[|>][-+]?\s*(?:#.*)?\r?\n$",
+            lines[index],
+            re.IGNORECASE,
+        )
+        if not match:
+            index += 1
+            continue
+        base_indent = len(match.group(1).expandtabs(8))
+        end = index + 1
+        content_indent = None
+        while end < len(lines):
+            line = lines[end]
+            indent = len(line) - len(line.lstrip(" \t"))
+            if line.strip() and len(line[:indent].expandtabs(8)) <= base_indent:
+                break
+            if line.strip() and content_indent is None:
+                content_indent = indent
+            end += 1
+        if content_indent is None:
+            index += 1
+            continue
+        newline = "\n" if lines[index + 1].endswith("\n") else ""
+        lines[index + 1 : end] = [" " * content_indent + "[REDACTED_SECRET]" + newline]
+        index += 2
+    text = "".join(lines)
 
     kv_pattern = (
         rf"""(?i)(^|[^a-zA-Z0-9_-])(['"]?(?:{key_names})['"]?)(\s*\]?\s*[:=]\s*)"""
-        r"""(?:(['"])(.*?)\4|([^\s"',;\r\n]+))"""
+        r"""(?:(['"])(.*?)\4|([A-Za-z0-9_:+/=-]+))"""
     )
     text = re.sub(kv_pattern, _replace_kv, text)
+
+    # Authorization values in mappings and header subscript assignments.
+    text = re.sub(
+        r"(?i)(authorization['\"]?\s*(?:\]\s*)?[:=]\s*['\"]?)([a-z][a-z0-9_-]*\s+)([^'\"\s,}]+)",
+        r"\g<1>\g<2>[REDACTED_TOKEN]",
+        text,
+    )
 
     # CLI password options have no equals sign; YAML block scalars have no inline value.
     text = re.sub(
@@ -180,6 +222,9 @@ def enforce_context_budget(
             if env_tokens and env_tokens.isdigit()
             else DEFAULT_MAX_INJECT_TOKENS
         )
+
+    if max_bytes <= 0 or max_tokens <= 0:
+        return ""
 
     # Fast path if within limits and fences are closed
     encoded = context.encode("utf-8")
@@ -242,7 +287,10 @@ def enforce_context_budget(
             return trimmed
         kept_lines.pop()
 
-    return trunc_comment.strip()
+    note = trunc_comment.strip()
+    if len(note.encode("utf-8")) > max_bytes or len(note.split()) > max_tokens:
+        return ""
+    return note
 
 
 def _context_already_present(block_text: str, context: str) -> bool:
