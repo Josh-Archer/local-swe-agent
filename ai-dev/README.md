@@ -71,13 +71,15 @@ A complete coding assistant system running on Kubernetes with:
 - **Type**: Kubernetes CronJob (daily at 2 AM)
 - **Function**: Clone repos → Chunk code → Generate embeddings → Upload to Qdrant
 - **Storage**: 10GB cache for Git clones
-- **Configuration**: ConfigMap with repository list
+- **Configuration**: ConfigMap with repository list and retrieval `top_k`
+- **Query API**: `index_code.py --query "..."` reads the `code_embeddings` collection (the indexer is the only writer)
 
 ### 4. SWE-agent
 - **Purpose**: Autonomous GitHub issue resolution
 - **LLM**: Uses vLLM API (no external calls)
 - **Features**: Multi-step reasoning, tool use, PR creation
 - **Deployment**: On-demand Jobs + optional server
+- **Pre-run retrieval**: before `sweagent run`, the job queries `code_embeddings` and appends the top snippets to `agent.system_template` and `agent.templates.system_template`. Set `ENABLE_RAG=false` to skip. Pass `--indexer-image` to `scripts/run-guarded-issue-job.sh` (or set the code-indexer image in `cronjob.yaml`) so an init container runs the query inside the indexer image.
 
 ### 5. Traefik Ingress
 - **Domain**: code-llm.archer.casa
@@ -373,8 +375,8 @@ MAX_NUM_SEQS: "256"              # Batch size
 Edit `code-indexer/config.yaml`:
 
 ```yaml
-chunk_size: 500       # Lines per chunk
-chunk_overlap: 50     # Overlap between chunks
+chunk_size: 256       # Tokens per chunk (fits embedding model context window)
+chunk_overlap: 32     # Token overlap between chunks
 embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
 ```
 

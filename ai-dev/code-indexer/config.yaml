@@ -7,9 +7,14 @@ collection_name: "code_embeddings"
 # Embedding model
 embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
 
-# Chunking parameters
-chunk_size: 500  # Number of lines per chunk
-chunk_overlap: 50  # Overlap between chunks
+# Chunking parameters (tokens)
+chunk_size: 256  # Tokens per chunk (fits embedding model context window)
+chunk_overlap: 32  # Token overlap between chunks
+
+# Retrieval parameters
+retrieval:
+  top_k: 5  # Default number of code chunks to retrieve
+  score_threshold: 0.0  # Minimum similarity score threshold
 
 # Working directory
 work_dir: "/workspace"
