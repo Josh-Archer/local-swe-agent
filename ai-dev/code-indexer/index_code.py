@@ -58,8 +58,17 @@ SECRET_FILE_PATTERNS = [
     r"(^|/)\.?htpasswd.*$",
     r"(^|/)(\.docker|docker)/config\.json$",
     r"(^|/)service[-_]account.*\.json$",
-    r"(^|/)(\.?aws/)?credentials.*$",
     r"(^|/)aws_credentials(\..+)?$",
+    r"(^|/)\.git-credentials$",
+    r"(^|/)\.pgpass$",
+    r"(^|/)\.dockercfg$",
+    r"(^|/)[^/]*\.tfstate[^/]*$",
+    r"(^|/)gcp-credentials\.json$",
+    r"(^|/)serviceaccount\.json$",
+    r"(^|/)\.s3cfg$",
+    r"(^|/)\.vault-token$",
+    r"(^|/)secrets\.toml$",
+    r"(^|/)[^/]*\.ppk$",
 ]
 
 
@@ -76,10 +85,7 @@ def is_secret_path(file_path: Union[str, Path]) -> bool:
             return True
 
     parts = [part.lower() for part in p.parts]
-    if any(
-        part in ("secrets", "credentials", ".ssh", ".gnupg", "private")
-        for part in parts
-    ):
+    if any(part in ("secrets", "credentials", ".ssh", ".gnupg") for part in parts):
         return True
     if any(part in (".kube", "kube") for part in parts) and (
         name == "config" or name.startswith("config.") or name.startswith("kubeconfig")
@@ -122,8 +128,6 @@ def is_secret_path(file_path: Union[str, Path]) -> bool:
         ".ini",
     ):
         return True
-    if re.search(r"(\b|_)credential(\b|_)", name, re.IGNORECASE):
-        return True
     if name in ("env.sh", ".env", "keys", "id_rsa") or name.startswith(".env"):
         return True
 
@@ -136,7 +140,11 @@ def is_secret_content(content: str) -> bool:
         return False
     if re.search(r"^\s*kind:\s*Secret\b", content, re.MULTILINE):
         return True
-    if re.search(r"-----(BEGIN|END)\s+([A-Z0-9_\s]*PRIVATE KEY)-----", content):
+    if re.search(
+        r"-----(?:BEGIN|END)\s+(?:[A-Z0-9_]+\s+)*PRIVATE KEY(?:\s+BLOCK)?-----",
+        content,
+        re.IGNORECASE,
+    ):
         return True
     return False
 
@@ -1589,6 +1597,11 @@ def main(args: Optional[List[str]] = None):
 
     parsed_args = parser.parse_args(args)
 
+    if parsed_args.query and not parsed_args.repo:
+        parser.error(
+            "--query requires --repo to prevent unscoped cross-repository retrieval"
+        )
+
     if parsed_args.qdrant_url:
         os.environ["QDRANT_URL"] = parsed_args.qdrant_url
 
@@ -1614,7 +1627,16 @@ def main(args: Optional[List[str]] = None):
             if parsed_args.format == "json":
                 import json
 
-                output_str = json.dumps(chunks, indent=2)
+                safe_chunks = []
+                for chunk in chunks:
+                    file_path = chunk.get("file_path", "")
+                    content = chunk.get("content", "")
+                    if is_secret_path(file_path) or is_secret_content(content):
+                        continue
+                    safe_chunk = dict(chunk)
+                    safe_chunk["content"] = redact_secrets(content)
+                    safe_chunks.append(safe_chunk)
+                output_str = json.dumps(safe_chunks, indent=2)
             else:
                 output_str = markdown
 

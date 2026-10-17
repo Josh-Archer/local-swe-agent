@@ -266,19 +266,20 @@ data:
 
         # 1. Private key blocks (full block: PKCS#1, PKCS#8, etc.)
         text = re.sub(
-            r"-----BEGIN\s+(?:[A-Z0-9_\s]*PRIVATE KEY)-----[\s\S]*?-----END\s+(?:[A-Z0-9_\s]*PRIVATE KEY)-----",
+            r"-----BEGIN\s+(?:[A-Z0-9_]+\s+)*PRIVATE KEY(?:\s+BLOCK)?-----"
+            r"[\s\S]*?-----END\s+(?:[A-Z0-9_]+\s+)*PRIVATE KEY(?:\s+BLOCK)?-----",
             "[REDACTED_PRIVATE_KEY]",
             text,
         )
         # Private key blocks split across chunks: BEGIN onward if no END in chunk
         text = re.sub(
-            r"-----BEGIN\s+(?:[A-Z0-9_\s]*PRIVATE KEY)-----[\s\S]*$",
+            r"-----BEGIN\s+(?:[A-Z0-9_]+\s+)*PRIVATE KEY(?:\s+BLOCK)?-----[\s\S]*$",
             "[REDACTED_PRIVATE_KEY]",
             text,
         )
         # Private key blocks split across chunks: END tail without BEGIN in chunk
         text = re.sub(
-            r"^[\s\S]*?-----END\s+(?:[A-Z0-9_\s]*PRIVATE KEY)-----",
+            r"^[\s\S]*?-----END\s+(?:[A-Z0-9_]+\s+)*PRIVATE KEY(?:\s+BLOCK)?-----",
             "[REDACTED_PRIVATE_KEY]",
             text,
         )
@@ -313,9 +314,14 @@ data:
         # 5. Slack tokens
         text = re.sub(r"\bxox[baprs]-[0-9A-Za-z\-]{10,}\b", "[REDACTED_SLACK_TOKEN]", text)
 
-        # 6. Authorization headers (token or Bearer)
+        # 6. Credentials embedded in URLs and authorization headers.
         text = re.sub(
-            r"(?i)\b(authorization\s*:\s*(?:bearer|token)\s+)[^\s\r\n]+",
+            r"(?i)\b([a-z][a-z0-9+.-]*://[^:/\s@]+:)[^@/\s]+(@)",
+            r"\g<1>[REDACTED_SECRET]\g<2>",
+            text,
+        )
+        text = re.sub(
+            r"(?i)\b(authorization\s*:\s*[a-z][a-z0-9_-]*\s+)[^\s\r\n]+",
             r"\g<1>[REDACTED_TOKEN]",
             text,
         )
@@ -326,6 +332,9 @@ data:
             text,
         )
 
+        # OpenAI-style secret keys can occur outside key/value assignments.
+        text = re.sub(r"\bsk-[A-Za-z0-9_-]{16,}\b", "[REDACTED_API_KEY]", text)
+
         # 7. Key-value secrets
         # Catches:
         # - bare token, secret, password, passwd, apikey, api_key, api_token
@@ -333,10 +342,10 @@ data:
         # - prefixed KEY-style names (*_TOKEN=, *_PASSWORD=, *_SECRET, *_KEY, etc.)
         # - JSON keys with quotes ("password":, 'api_token':)
         key_names = (
-            r"token|secret|password|passwd|apikey|api_key|api_token|"
-            r"secret_key|client_secret|access_token|auth_token|private_key|"
+            r"[a-zA-Z0-9_-]*(?:token|secret|password|passwd|passphrase|pwd|pass|apikey|api_key|api-key|key)[a-zA-Z0-9_-]*|"
+            r"auth_token|private_key|"
             r"aws_secret_access_key|aws_access_key_id|"
-            r"[a-zA-Z0-9_]+_(?:token|secret|password|passwd|key|apikey|keys)"
+            r"x-api-key"
         )
 
         def _replace_kv(m: re.Match) -> str:
@@ -351,12 +360,26 @@ data:
                 return f"{prefix}{key}{sep}{quote}[REDACTED_SECRET]{quote}"
             return f"{prefix}{key}{sep}[REDACTED_SECRET]"
 
+        text = re.sub(
+            r"(?im)(^\s*['\"]?[a-zA-Z0-9_-]*(?:token|secret|password|passwd|passphrase|"
+            r"pwd|pass|apikey|api_key|api-key|key)['\"]?\s*:\s*[|>][-+]?\s*\n)"
+            r"([ \t]+[^\n]*(?:\n[ \t]+[^\n]*)*)",
+            r"\g<1>  [REDACTED_SECRET]",
+            text,
+        )
+
         kv_pattern = (
-            rf"""(?i)(^|[^a-zA-Z0-9_])(['"]?(?:{key_names})['"]?)(\s*[:=]\s*)"""
+            rf"""(?i)(^|[^a-zA-Z0-9_-])(['"]?(?:{key_names})['"]?)(\s*\]?\s*[:=]\s*)"""
             r"""(?:(['"])(.*?)\4|([^\s"',;\r\n]+))"""
         )
         text = re.sub(kv_pattern, _replace_kv, text)
 
+        # CLI password options have no equals sign; YAML block scalars have no inline value.
+        text = re.sub(
+            r"(?i)(--(?:password|passwd|passphrase|pwd|pass|token|secret|api[-_]?key)\s+)([^\s\r\n]+)",
+            r"\g<1>[REDACTED_SECRET]",
+            text,
+        )
         return text
 
 

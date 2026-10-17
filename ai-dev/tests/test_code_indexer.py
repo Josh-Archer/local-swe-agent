@@ -1592,7 +1592,16 @@ class TestCodeRetrieval:
             mock_inst.format_retrieved_context.return_value = "## Formatted"
             mock_cls.return_value = mock_inst
 
-            rc = main(["--query", "sample query", "--output", str(out_file)])
+            rc = main(
+                [
+                    "--query",
+                    "sample query",
+                    "--repo",
+                    "alpha",
+                    "--output",
+                    str(out_file),
+                ]
+            )
             assert rc == 0
             assert out_file.read_text(encoding="utf-8") == "## Formatted"
 
@@ -1943,6 +1952,17 @@ class TestSecretDenylistAndRedaction:
             "service-account.json",
             "service-account-prod.json",
             "aws_credentials",
+            ".git-credentials",
+            ".pgpass",
+            ".dockercfg",
+            "terraform.tfstate",
+            "terraform.tfstate.backup",
+            "gcp-credentials.json",
+            "serviceaccount.json",
+            ".s3cfg",
+            ".vault-token",
+            "secrets.toml",
+            "signing.ppk",
         ],
     )
     def test_is_secret_path_denylist(self, secret_path):
@@ -1961,6 +1981,9 @@ class TestSecretDenylistAndRedaction:
             "src/hotkeys.py",
             "monkey.py",
             "hotkeys.py",
+            "auth/credentials_manager.py",
+            "credential_helpers.go",
+            "src/private/crypto.py",
         ],
     )
     def test_is_secret_path_safe_files(self, safe_path):
@@ -1969,15 +1992,20 @@ class TestSecretDenylistAndRedaction:
     def test_is_secret_content(self):
         dashes = "-----"
         priv_label = "".join(["PRI", "VATE ", "K", "EY"])
+        pgp_suffix = "".join(["B", "LOCK"])
         begin_rsa = f"{dashes}BEGIN RSA {priv_label}{dashes}\n"
         begin_pk = f"{dashes}BEGIN {priv_label}{dashes}\n"
         end_pk = f"{dashes}END {priv_label}{dashes}\n"
         end_rsa = f"{dashes}END RSA {priv_label}{dashes}\n"
+        pgp_begin = f"{dashes}BEGIN PGP {priv_label} {pgp_suffix}{dashes}\n"
+        pgp_end = f"{dashes}END PGP {priv_label} {pgp_suffix}{dashes}\n"
         assert is_secret_content("apiVersion: v1\nkind: Secret\n") is True
         assert is_secret_content(begin_rsa) is True
         assert is_secret_content(begin_pk) is True
         assert is_secret_content(end_pk) is True
         assert is_secret_content(end_rsa) is True
+        assert is_secret_content(pgp_begin) is True
+        assert is_secret_content(pgp_end) is True
         assert is_secret_content("def run(): pass") is False
 
     def test_should_index_file_blocks_secret_paths(
@@ -2086,8 +2114,11 @@ class TestSecretDenylistAndRedaction:
         )
         dashes = "-----"
         priv_label = "".join(["PRI", "VATE ", "K", "EY"])
+        pgp_suffix = "".join(["B", "LOCK"])
         priv_header = f"{dashes}BEGIN {priv_label}{dashes}"
         priv_footer = f"{dashes}END {priv_label}{dashes}"
+        pgp_header = f"{dashes}BEGIN PGP {priv_label} {pgp_suffix}{dashes}"
+        pgp_footer = f"{dashes}END PGP {priv_label} {pgp_suffix}{dashes}"
         b64_sample = "".join(["MII", "Eog", "IBA", "AKCA", "QEA..."])
 
         lines = [
@@ -2134,8 +2165,11 @@ class TestSecretDenylistAndRedaction:
     def test_redact_secrets_split_private_keys(self):
         dashes = "-----"
         priv_label = "".join(["PRI", "VATE ", "K", "EY"])
+        pgp_suffix = "".join(["B", "LOCK"])
         priv_header = f"{dashes}BEGIN {priv_label}{dashes}"
         priv_footer = f"{dashes}END {priv_label}{dashes}"
+        pgp_header = f"{dashes}BEGIN PGP {priv_label} {pgp_suffix}{dashes}"
+        pgp_footer = f"{dashes}END PGP {priv_label} {pgp_suffix}{dashes}"
         b64_chunk = "".join(["MII", "Evg", "IBAD", "ANB", "gkq..."])
 
         # BEGIN without END in chunk (redact from BEGIN onward)
@@ -2156,10 +2190,83 @@ class TestSecretDenylistAndRedaction:
         assert "[REDACTED_PRIVATE_KEY]" in redacted_end
         assert "return key" in redacted_end
 
+        pgp_block = f"{pgp_header}\n{b64_chunk}\n{pgp_footer}"
+        redacted_pgp = redact_secrets(pgp_block)
+        assert pgp_header not in redacted_pgp
+        assert pgp_footer not in redacted_pgp
+        assert b64_chunk[:8] not in redacted_pgp
+        assert "[REDACTED_PRIVATE_KEY]" in redacted_pgp
+
+        redacted_pgp_begin = redact_secrets(f"{pgp_header}\n{b64_chunk}")
+        assert pgp_header not in redacted_pgp_begin
+        assert b64_chunk[:8] not in redacted_pgp_begin
+
+    def test_redact_auth_variants_and_secret_assignments(self):
+        password = "".join(["pass", "word"])
+        token = "".join(["access", "Token"])
+        api_key = "".join(["api", "Key"])
+        client_secret = "".join(["client", "Secret"])
+        passphrase = "".join(["pass", "phrase"])
+        pwd = "p" + "wd"
+        passwd_value = "never-" + "commit-this"
+        api_value = "runtime-" + "credential-value"
+        basic_value = "Y" + ("Q" * 28)
+        sk_value = "sk-" + ("a" * 28)
+        lines = [
+            f"Authorization: Basic {basic_value}",
+            f"Authorization: Digest {api_value}",
+            f"cfg[{password!r}] = {passwd_value!r}",
+            f"postgres://user:{passwd_value}@db.example/path",
+            f"{token}={api_value}",
+            f"{client_secret}: {api_value}",
+            f"{passphrase}={api_value}",
+            f"{pwd}={api_value}",
+            f"--{password} {api_value}",
+            f"x-api-key: {api_value}",
+            f"api-key={api_value}",
+            f"TOKEN_VALUE={api_value}",
+            f"MYTOKEN={api_value}",
+            f"{password}: |\n  {api_value}\n  continued-value",
+            sk_value,
+        ]
+        redacted = redact_secrets("\n".join(lines))
+        for value in (basic_value, api_value, passwd_value, sk_value):
+            assert value not in redacted
+        assert "[REDACTED_TOKEN]" in redacted
+        assert "[REDACTED_SECRET]" in redacted
+        assert "[REDACTED_API_KEY]" in redacted
+
+    def test_cli_requires_repo_and_json_output_is_redacted(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            main(["--query", "query"])
+        assert exc.value.code == 2
+
+        api_key = "".join(["api", "Key"])
+        value = "json-" + "credential-value"
+        with patch("index_code.CodeIndexer") as mock_cls:
+            mock_inst = MagicMock()
+            mock_inst.retrieve_code.return_value = [
+                {"file_path": "src/client.py", "content": f"{api_key}={value}"}
+            ]
+            mock_inst.format_retrieved_context.return_value = ""
+            mock_cls.return_value = mock_inst
+            assert (
+                main(["--query", "query", "--repo", "alpha", "--format", "json"]) == 0
+            )
+        output = capsys.readouterr().out
+        assert value not in output
+        assert "[REDACTED_SECRET]" in output
+
     def test_format_retrieved_context_redacts_secrets(self):
         pwd_var = "".join(["DB_", "PASS", "WORD"])
         api_var = "".join(["api_", "k", "ey"])
         top_sec = "".join(["top", "sec", "ret", "key123"])
+        dashes = "-----"
+        priv_label = "".join(["PRI", "VATE ", "K", "EY"])
+        pgp_suffix = "".join(["B", "LOCK"])
+        pgp_header = f"{dashes}BEGIN PGP {priv_label} {pgp_suffix}{dashes}"
+        pgp_footer = f"{dashes}END PGP {priv_label} {pgp_suffix}{dashes}"
+        pgp_body = "".join(["runtime", "-private", "-key", "-body"])
         chunks = [
             {
                 "repository": "alpha",
@@ -2167,11 +2274,20 @@ class TestSecretDenylistAndRedaction:
                 "start_line": 1,
                 "end_line": 5,
                 "content": f"{pwd_var} = 'xyz'\n{api_var}: '{top_sec}'\n",
-            }
+            },
+            {
+                "repository": "alpha",
+                "file_path": "src/key_data.py",
+                "start_line": 1,
+                "end_line": 3,
+                "content": f"{pgp_header}\n{pgp_body}\n{pgp_footer}",
+            },
         ]
         formatted = CodeIndexer.format_retrieved_context(chunks)
         assert "xyz" not in formatted
         assert top_sec not in formatted
+        assert pgp_body not in formatted
+        assert pgp_header not in formatted
         assert "[REDACTED_SECRET]" in formatted
 
 
