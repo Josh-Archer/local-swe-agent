@@ -266,7 +266,8 @@ data:
         Needles are lowercase literals every match of ``pattern`` must contain
         (patterns using them are case-insensitive), so skipping is exact.
         """
-        lowered = text.casefold()
+        # re.IGNORECASE also matches dotless U+0131 against "i"; casefold keeps it.
+        lowered = text.casefold().replace("\u0131", "i")
         if isinstance(needles, str):
             needles = (needles,)
         if not any(needle in lowered for needle in needles):
@@ -416,6 +417,9 @@ data:
                     item = stack.pop()
                     if isinstance(item, dict):
                         for key, value in list(item.items()):
+                            secret_key = isinstance(key, str) and bool(
+                                secret_name_re.fullmatch(key)
+                            )
                             if (
                                 isinstance(key, str)
                                 and key.lower() == "authorization"
@@ -432,6 +436,22 @@ data:
                             ):
                                 item[key] = "[REDACTED_SECRET]"
                                 changed = True
+                            elif secret_key and isinstance(value, (dict, list)):
+                                # Keep the structure valid; redact string leaves only.
+                                leaves = [value]
+                                while leaves:
+                                    node = leaves.pop()
+                                    pairs = (
+                                        node.items()
+                                        if isinstance(node, dict)
+                                        else enumerate(node)
+                                    )
+                                    for sub_key, sub_value in list(pairs):
+                                        if isinstance(sub_value, str) and sub_value:
+                                            node[sub_key] = "[REDACTED_SECRET]"
+                                            changed = True
+                                        elif isinstance(sub_value, (dict, list)):
+                                            leaves.append(sub_value)
                             elif isinstance(value, (dict, list)):
                                 stack.append(value)
                     elif isinstance(item, list):
@@ -454,10 +474,15 @@ data:
                 try:
                     import yaml
 
-                    # libyaml's C loader is an order of magnitude faster; marks and
-                    # node trees match the pure-Python loader.
-                    loader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
-                    root = yaml.compose(text, Loader=loader)
+                    # libyaml's C loader is an order of magnitude faster.
+                    # libyaml ignores U+FEFF in mark offsets, so strip a leading
+                    # BOM and use the pure-Python loader for any mid-text BOM.
+                    bom = "\ufeff" if text.startswith("\ufeff") else ""
+                    ytext = text[len(bom) :]
+                    loader = yaml.SafeLoader
+                    if "\ufeff" not in ytext:
+                        loader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+                    root = yaml.compose(ytext, Loader=loader)
                     edits = []
                     seen = set()
 
@@ -468,7 +493,7 @@ data:
                             or not node.value
                         ):
                             return
-                        raw = text[node.start_mark.index : node.end_mark.index]
+                        raw = ytext[node.start_mark.index : node.end_mark.index]
                         if raw.lstrip().startswith(("*", "&", "${", "!ENV")):
                             return
                         if node.value.lower() in {
@@ -560,11 +585,11 @@ data:
                         pieces = []
                         cursor = 0
                         for start, end, replacement in sorted(set(edits)):
-                            pieces.append(text[cursor:start])
+                            pieces.append(ytext[cursor:start])
                             pieces.append(replacement)
                             cursor = end
-                        pieces.append(text[cursor:])
-                        text = "".join(pieces)
+                        pieces.append(ytext[cursor:])
+                        text = bom + "".join(pieces)
                 except Exception:
                     pass
 
@@ -592,15 +617,18 @@ data:
 
         identifier_re = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*")
         json_scalar_re = re.compile(
-            r"(?:-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?|true|false|null)",
-            re.IGNORECASE,
+            r"(?:-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?|true|false|null)"
         )
+        # PyYAML's YAML 1.1 bool/null/int/float implicit resolvers (case-sensitive).
         yaml_scalar_re = re.compile(
-            r"(?:~|null|true|false|\.nan|[+-]?\.inf|"
-            r"[-+]?(?:0x[0-9a-f]+|0o[0-7]+|0b[01]+|"
-            r"[0-9]+(?:_[0-9]+)*(?:\.[0-9]+(?:_[0-9]+)*)?"
-            r"(?:[eE][+-]?[0-9]+)?))",
-            re.IGNORECASE,
+            r"(?:yes|Yes|YES|no|No|NO|true|True|TRUE|false|False|FALSE|"
+            r"on|On|ON|off|Off|OFF|~|null|Null|NULL|"
+            r"[-+]?(?:[0-9][0-9_]*)\.[0-9_]*(?:[eE][-+][0-9]+)?|"
+            r"\.[0-9][0-9_]*(?:[eE][-+][0-9]+)?|"
+            r"[-+]?[0-9][0-9_]*(?::[0-5]?[0-9])+\.[0-9_]*|"
+            r"[-+]?\.(?:inf|Inf|INF)|\.(?:nan|NaN|NAN)|"
+            r"[-+]?0b[0-1_]+|[-+]?0[0-7_]+|[-+]?(?:0|[1-9][0-9_]*)|"
+            r"[-+]?0x[0-9a-fA-F_]+|[-+]?[1-9][0-9_]*(?::[0-5]?[0-9])+)"
         )
 
         def replace_literal(match):
@@ -655,12 +683,11 @@ data:
             }:
                 return match.group(0)
             if value[0] not in "'\"`":
-                # Keep YAML/JSON scalar types intact. Structural redaction only
-                # targets strings; this also protects their unquoted spellings
-                # from the mixed-code fallback below.
-                json_scalar = json_scalar_re.fullmatch(value)
-                yaml_scalar = yaml_scalar_re.fullmatch(value)
-                if json_scalar or (":" in match.group("prefix") and yaml_scalar):
+                # Keep JSON/YAML scalar types intact, but only for ":" mappings.
+                # "=" assignments in code, shell, env and compose text are strings.
+                if ":" in match.group("prefix") and (
+                    json_scalar_re.fullmatch(value) or yaml_scalar_re.fullmatch(value)
+                ):
                     return match.group(0)
             if expression_call.match(text, match.end()):
                 return match.group(0)
@@ -681,7 +708,7 @@ data:
         # their literal value independently of whether the surrounding chunk parses.
         quoted_key = re.compile(
             rf"(?i)(?P<prefix>(?P<keyquote>['\"])(?:{credential_names})(?P=keyquote)[ \t]*:[ \t]*)(?P<value>"
-            rf"(?:'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"|`(?:\\.|[^`\\])*`|[^\s,;}}\]]+))"
+            rf"(?:'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"|`(?:\\.|[^`\\])*`|(?![{{\[])[^\s,;}}\]]+))"
         )
         text = quoted_key.sub(replace_literal, text)
 
@@ -1048,7 +1075,6 @@ data:
 
     if __name__ == "__main__":
         sys.exit(main())
-
   retrieve-init.sh: |
     #!/bin/sh
     # Best-effort retrieval of indexed code into /rag/retrieved_code_context.md.

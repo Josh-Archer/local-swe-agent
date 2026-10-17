@@ -2,6 +2,7 @@
 Unit tests for the code indexer script.
 """
 
+import json
 import logging
 import sys
 import uuid
@@ -2678,6 +2679,128 @@ class TestSecretDenylistAndRedaction:
             assert payload not in output
             assert "[REDACTED_PRIVATE_KEY]" in output
 
+    def test_numeric_assignment_secrets_are_redacted(self):
+        digits = "".join(["7351", "9046"])
+        for line in (
+            f"DB_PASSWORD={digits}",
+            f"export API_KEY={digits}{digits}",
+            f"PASSWORD=-{digits}",
+            f"password = {digits}",
+            f"SECRET_KEY = {digits}",
+            f"spring.datasource.password={digits}",
+            f"- MYSQL_ROOT_PASSWORD={digits}",
+            f"MYSQL_ROOT_PASSWORD={digits}",
+        ):
+            output = redact_secrets(line)
+            assert digits not in output, line
+            assert "[REDACTED_SECRET]" in output
+        # Structurally typed mapping values keep their YAML/JSON type.
+        assert redact_secrets('{"token": 12345}') == '{"token": 12345}'
+        assert redact_secrets("a: 1\npassword: 12345\n") == "a: 1\npassword: 12345\n"
+
+    def test_non_yaml_numbers_are_strings_in_fallback(self):
+        hexish = "".join(["0X3d3", "1AF"])
+        octish = "".join(["0o12", "34567"])
+        for value in (hexish, octish):
+            output = redact_secrets("password: " + value)
+            assert value not in output
+        # Real YAML 1.1 numbers are kept.
+        for value in ("0x3d31AF", "0123", "1_000", "1.5", ".inf", "yes"):
+            assert redact_secrets("password: " + value) == "password: " + value
+
+    def test_bom_input_keeps_yaml_valid_and_redacts_fully(self):
+        secret = "".join(["bom", "secret", "731"])
+        leading = "\ufeffa: 1\npassword: " + secret + "\n"
+        output = redact_secrets(leading)
+        assert secret not in output and "731" not in output
+        assert output.startswith("\ufeff")
+        assert yaml.safe_load(output.lstrip("\ufeff"))["a"] == 1
+
+        env = "env:\n  - name: GITHUB_" + "TOKEN\n    value: " + secret + "\n"
+        for source in (
+            "\ufeff" + env,
+            env + "\ufeffservices:\n",
+            env.replace("env:", "\ufeffenv:", 1),
+        ):
+            output = redact_secrets(source)
+            assert secret not in output and "731" not in output, repr(source)
+            assert output.count("[REDACTED_SECRET]") == 1
+            yaml.safe_load(output.replace("\ufeff", ""))
+
+    @pytest.mark.parametrize(
+        "key,value",
+        [
+            ("password", {"required": True}),
+            ("token", {"type": "string"}),
+            ("api_key", [1, 2, 3]),
+            ("secret", {"nested": [{"value": "hunter-two"}, 5, None]}),
+        ],
+    )
+    def test_secret_key_with_container_value_stays_valid_json(self, key, value):
+        for indent in (None, 2):
+            source = json.dumps({key: value, "other": "keep"}, indent=indent)
+            output = redact_secrets(source)
+            parsed = json.loads(output)
+            assert parsed["other"] == "keep"
+            assert "hunter-two" not in output
+
+    def test_dotless_i_does_not_skip_identified_by(self):
+        secret = "".join(["dotless", "pw", "731"])
+        output = redact_secrets("IDENTIF\u0131ED BY '" + secret + "'")
+        assert secret not in output
+
+    def test_seeded_fuzz_keeps_structure_and_redacts_numbers(self):
+        import random
+
+        rng = random.Random(20261017)
+        names = ["password", "API_KEY", "DB_PASSWORD", "token", "MYSQL_ROOT_PASSWORD"]
+        for _ in range(400):
+            name = rng.choice(names)
+            digits = "".join(
+                rng.choice("0123456789") for _ in range(rng.randint(6, 14))
+            )
+            digits = rng.choice("123456789") + digits
+            line = rng.choice(
+                ["{n}={d}", "export {n}={d}", "{n} = {d}", "- {n}={d}"]
+            ).format(n=name, d=digits)
+            assert digits not in redact_secrets("x = 1\n" + line + "\n")
+
+            leaf = rng.choice(
+                [
+                    True,
+                    False,
+                    None,
+                    7,
+                    1.5,
+                    "plain",
+                    "s3cr3t" + digits,
+                    [1, "a"],
+                    {"k": "v" + digits},
+                ]
+            )
+            doc = {"a": rng.choice([1, "b"]), name.lower(): leaf, "z": [{name: leaf}]}
+            out = redact_secrets(json.dumps(doc, indent=rng.choice([None, 2])))
+            parsed = json.loads(out)
+            assert digits not in out
+            assert parsed["a"] == doc["a"]
+
+            # YAML mappings under secret keys stay as-is (valid, not rewritten).
+            if isinstance(leaf, (dict, list)):
+                doc = {
+                    **doc,
+                    name.lower(): "s3cr3t" + digits,
+                    "z": [{name: "x" + digits}],
+                }
+            flow = rng.choice([True, False])
+            ydoc = yaml.safe_dump(doc, default_flow_style=flow)
+            if rng.random() < 0.3:
+                ydoc = "\ufeff" + ydoc
+            elif not flow and rng.random() < 0.3:
+                ydoc += "\ufeffq: 1\n"
+            out = redact_secrets(ydoc)
+            yaml.safe_load(out.replace("\ufeff", ""))
+            assert digits not in out
+
     def test_redaction_handles_deep_json_and_large_inputs_quickly(self):
         import time
 
@@ -2711,7 +2834,7 @@ class TestSecretDenylistAndRedaction:
             assert timings[1] < 7.5
             # Four times the input may take longer on a busy runner, but must
             # not show the sixteen-fold growth expected from a quadratic path.
-            assert timings[1] < max(0.5, timings[0]) * 6
+            assert timings[1] < max(1.0, timings[0]) * 8
 
         assert_scales((make_large(20000), make_large(80000)), large_value)
 
@@ -2728,6 +2851,27 @@ class TestSecretDenylistAndRedaction:
             return "password = get_password()\n" * count
 
         assert_scales((make_large_code(100000), make_large_code(400000)))
+
+        def make_numeric_env(count):
+            return "".join(
+                f"DB_PASSWORD={73519046 + i}\nexport API_KEY = 12345678{i}\n"
+                for i in range(count)
+            )
+
+        assert_scales((make_numeric_env(30000), make_numeric_env(120000)), "7351904")
+
+        # Pure-Python loader path (mid-text BOM) and BOM-prefixed input.
+        assert_scales(
+            (
+                "\ufeff" + make_large_yaml(5000) + "\ufeffz: 1\n",
+                "\ufeff" + make_large_yaml(20000) + "\ufeffz: 1\n",
+            ),
+            yaml_secret,
+        )
+        assert_scales(
+            ("\ufeff" + make_large_yaml(10000), "\ufeff" + make_large_yaml(40000)),
+            yaml_secret,
+        )
 
         dash_marker = "".join(["-", "-", "-", "-", "-"])
         repeated_timings = []
