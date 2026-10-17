@@ -2358,6 +2358,122 @@ class TestSecretDenylistAndRedaction:
         assert "extra" not in output
         assert "[REDACTED_PRIVATE_KEY]" in output
 
+    @pytest.mark.parametrize(
+        "template",
+        [
+            "mysql -u root -p{value}",
+            "mysqldump -p'{value}'",
+            "PGPASSWORD={value} psql",
+            "- name: DB_PASSWORD\n  value: {value}",
+            "SECRET_KEY = '{value}'",
+            "secret_key_base: '{value}'",
+            "sshpass -p {value} ssh host",
+            "docker login -u user -p {value}",
+            "curl -u user:{value} https://example.invalid",
+            "machine example.invalid login user password {value}",
+            "CREATE USER app IDENTIFIED BY '{value}';",
+        ],
+    )
+    def test_round_four_secret_leak_regressions(self, template):
+        value = "".join(["qa", "round", "four", "731"])
+        output = redact_secrets(template.format(value=value))
+        assert value not in output
+        assert "[REDACTED_SECRET]" in output
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "password=password",
+            "self.password = password",
+            "client.login(user, password=password)",
+            "password=self.password",
+            "password=args.password",
+            "if password == confirm_password:",
+            'password = os.environ["DB_PASSWORD"]',
+            "def login(user: str, password: str) -> bool:",
+            "token: Optional[str] = None",
+            "interface User { password: string }",
+            '"""password: The user password is required."""',
+            "password: *alias",
+            "password: ${DB_PASSWORD}",
+        ],
+    )
+    def test_round_four_expression_and_structure_false_positives(self, source):
+        assert redact_secrets(source) == source
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "Authorization: Bearer VALUE",
+            'curl -H "Authorization: Bearer VALUE" https://example.invalid',
+        ],
+    )
+    def test_round_four_authorization_preserves_scheme_and_quotes(self, source):
+        value = "".join(["runtime", "authorization", "secret", "731"])
+        output = redact_secrets(source.replace("VALUE", value))
+        assert "Bearer [REDACTED_TOKEN]" in output
+        assert value not in output
+        if source.startswith("curl"):
+            assert output.endswith('" https://example.invalid')
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            '{"password":"VALUE", "nothing":null, "count":7, "enabled":true}',
+            '{"outer": {"password": "VALUE", "text": "escaped \\" quote"}}',
+            '{"flow": [{"DB_PASSWORD":"VALUE"}, {"token": false}]}',
+        ],
+    )
+    def test_round_four_json_redaction_keeps_valid_types_and_escaping(self, source):
+        import json
+
+        value = "".join(["json", "secret", "731"])
+        parsed = json.loads(source.replace("VALUE", value))
+        output = redact_secrets(source.replace("VALUE", value))
+        result = json.loads(output)
+
+        def assert_walk(before, after):
+            if isinstance(before, dict):
+                for key, item in before.items():
+                    if key.lower() in {"password", "db_password"}:
+                        assert after[key] == "[REDACTED_SECRET]"
+                    else:
+                        assert_walk(item, after[key])
+            elif isinstance(before, list):
+                for left, right in zip(before, after):
+                    assert_walk(left, right)
+            else:
+                assert type(after) is type(before)
+                assert after == before
+
+        assert_walk(parsed, result)
+        assert value not in output
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "auth:\n  password: |\n    VALUE\n    still-secret\n  sibling: keep\n",
+            'flow: {user: app, password: "VALUE", count: 4}\n',
+            "password: null\ncount: 4\nenabled: true\n",
+            "base: &alias keep\npassword: *alias\n",
+        ],
+    )
+    def test_round_four_yaml_redaction_preserves_structure(self, source):
+        import yaml
+
+        value = "".join(["yaml", "secret", "731"])
+        source = source.replace("VALUE", value)
+        output = redact_secrets(source)
+        before = yaml.safe_load(source)
+        after = yaml.safe_load(output)
+        assert after is not None or before is None
+        assert value not in output
+        if "sibling" in str(before):
+            assert "sibling: keep" in output
+            assert "still-secret" not in output
+        if "flow:" in source:
+            assert after["flow"]["count"] == 4
+
     def test_truncation_notes_respect_tiny_budgets(self):
         from inject_context import enforce_context_budget
 

@@ -9,6 +9,7 @@ dependencies. The same file is mounted from the swe-agent ConfigMap at
 import os
 import re
 import sys
+import json
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -86,7 +87,7 @@ def redact_secrets(text: str) -> str:
         text,
     )
     text = re.sub(
-        r"(?i)\b(authorization\s*:\s*[a-z][a-z0-9_-]*\s+)[^\s\r\n]+",
+        r"(?i)\b(authorization\s*:\s*[a-z][a-z0-9_-]*\s+)[^\s\r\n,\"'`;}]+",
         r"\g<1>[REDACTED_TOKEN]",
         text,
     )
@@ -100,116 +101,335 @@ def redact_secrets(text: str) -> str:
     # OpenAI-style secret keys can occur outside key/value assignments.
     text = re.sub(r"\bsk-[A-Za-z0-9_-]{16,}\b", "[REDACTED_API_KEY]", text)
 
-    # 7. Key-value secrets
-    # Catches:
-    # - bare token, secret, password, passwd, apikey, api_key, api_token
-    # - aws_secret_access_key, aws_access_key_id
-    # - prefixed KEY-style names (*_TOKEN=, *_PASSWORD=, *_SECRET, *_KEY, etc.)
-    # - JSON keys with quotes ("password":, 'api_token':)
-    # Strict names are unambiguous credentials: redact even short, human chosen
-    # values. Generic key names retain a shape heuristic to avoid mangling code.
-    strict_names = (
-        r"(?:password|passwd|passphrase|pwd|pass|secret|token|api[-_]?key|"
-        r"[a-z0-9]+(?:[_-](?:token|secret|password|passwd|passphrase|pwd))|"
-        r"[a-z0-9]+(?:Token|Secret)|token_[a-z0-9]+|aws_secret_access_key|aws_access_key_id|"
+    # Structured documents are edited through YAML node source marks. This
+    # preserves comments, quoting, flow style, block scalars, and whitespace.
+    # JSON is YAML too, so the same node walk handles both while safe_load
+    # confirms that aliases and scalar types have normal safe semantics.
+    candidate = text.lstrip()
+    looks_structured = candidate.startswith(("{", "[", "---")) or re.search(
+        r"(?m)^\s*(?:-\s+)?(?:['\"][^'\"\n]+['\"]|[A-Za-z_][\w.-]*)\s*:",
+        text,
+    )
+    try:
+        if not looks_structured:
+            raise ValueError("not a structured document")
+        import yaml
+
+        root = yaml.compose(text, Loader=yaml.SafeLoader)
+        yaml.safe_load(text)
+    except Exception:
+        root = None
+    if root is not None:
+        secret_name = re.compile(
+            r"(?i)(?:password|passwd|passphrase|pwd|secret|token|"
+            r"api[-_]?key|[a-z0-9]+[_-](?:password|passwd|passphrase|pwd|secret|token)|"
+            r"[a-z0-9]+_token|"
+            r"[a-z0-9]+(?:Secret|Token)|secret_key_base|secret_key|aws_secret_access_key|"
+            r"x-api-key|x_api_key)"
+        )
+        edits = []
+
+        def add_scalar(value_node, marker="[REDACTED_SECRET]"):
+            if (
+                not isinstance(value_node, yaml.ScalarNode)
+                or value_node.tag != "tag:yaml.org,2002:str"
+                or not value_node.value
+            ):
+                return
+            start, end = value_node.start_mark.index, value_node.end_mark.index
+            raw = text[start:end]
+            if raw.lstrip().startswith(("*", "&", "${")):
+                return
+            if re.match(
+                r"(?i)^(?:[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*\s*[\[(]|"
+                r"Optional\[|Union\[|list\[|dict\[)",
+                raw.strip(),
+            ):
+                return
+            style = value_node.style
+            if style == '"':
+                replacement = json.dumps(marker)
+            elif style == "'":
+                replacement = "'" + marker + "'"
+            elif style in ("|", ">"):
+                header, _, body = raw.partition("\n")
+                indent = re.match(r"[ \t]*", body).group(0)
+                replacement = (
+                    header
+                    + "\n"
+                    + indent
+                    + marker
+                    + ("\n" if raw.endswith("\n") else "")
+                )
+            else:
+                replacement = marker
+            edits.append((start, end, replacement))
+
+        def visit(node):
+            if isinstance(node, yaml.MappingNode):
+                names = {
+                    key.value.lower(): value
+                    for key, value in node.value
+                    if isinstance(key, yaml.ScalarNode)
+                }
+                name_node = names.get("name")
+                value_node = names.get("value")
+                if (
+                    name_node is not None
+                    and value_node is not None
+                    and isinstance(name_node, yaml.ScalarNode)
+                    and secret_name.fullmatch(name_node.value)
+                ):
+                    add_scalar(value_node)
+                for key_node, value_node in node.value:
+                    if (
+                        isinstance(key_node, yaml.ScalarNode)
+                        and key_node.tag == "tag:yaml.org,2002:str"
+                        and secret_name.fullmatch(key_node.value)
+                        and isinstance(value_node, yaml.ScalarNode)
+                        and value_node.tag == "tag:yaml.org,2002:str"
+                        and value_node.value
+                    ):
+                        add_scalar(value_node)
+                    elif (
+                        isinstance(key_node, yaml.ScalarNode)
+                        and key_node.tag == "tag:yaml.org,2002:str"
+                        and key_node.value.lower() == "authorization"
+                        and isinstance(value_node, yaml.ScalarNode)
+                        and value_node.tag == "tag:yaml.org,2002:str"
+                        and value_node.value
+                    ):
+                        auth_value = value_node.value
+                        scheme = re.match(r"^([A-Za-z][A-Za-z0-9_-]*)\s+", auth_value)
+                        marker = (
+                            scheme.group(1) + " " if scheme else ""
+                        ) + "[REDACTED_TOKEN]"
+                        add_scalar(value_node, marker)
+                    visit(key_node)
+                    visit(value_node)
+            elif isinstance(node, yaml.SequenceNode):
+                for child in node.value:
+                    visit(child)
+
+        visit(root)
+        for start, end, replacement in sorted(edits, reverse=True):
+            text = text[:start] + replacement + text[end:]
+        if isinstance(root, (yaml.MappingNode, yaml.SequenceNode)):
+            return text
+
+    # A source file can mix shell/code with a complete JSON object on one line.
+    # Parse those lines independently so valid JSON islands get the same
+    # structural treatment without applying JSON rules to surrounding code.
+    json_key = re.compile(
+        r"(?i)(?:password|passwd|passphrase|pwd|secret|token|api[-_]?key|"
+        r"[a-z0-9]+[_-](?:password|passwd|passphrase|pwd|secret|token)|"
+        r"[a-z0-9]+(?:Secret|Token)|[a-z0-9]+_(?:KEY|TOKEN)|TOKEN_VALUE|"
+        r"secret_key_base|secret_key|aws_secret_access_key|"
         r"x-api-key|x_api_key)"
     )
-    heuristic_names = r"(?:key|[a-z0-9]+[_-]key|[a-z0-9]+Key)"
-    key_names = rf"(?:{strict_names}|{heuristic_names})"
-    credential_value = re.compile(
-        r"(?i)^(?:[a-z0-9]{24,}|(?=.{8,}$)(?=.*[^a-z0-9_]).+)$"
+
+    def scrub_json(value):
+        if isinstance(value, dict):
+            return {
+                key: (
+                    "[REDACTED_SECRET]"
+                    if isinstance(key, str)
+                    and json_key.fullmatch(key)
+                    and isinstance(child, str)
+                    and child
+                    else (
+                        (
+                            re.sub(
+                                r"^([A-Za-z][A-Za-z0-9_-]*)\s+.*$",
+                                r"\1 [REDACTED_TOKEN]",
+                                child,
+                            )
+                            if re.match(r"^[A-Za-z][A-Za-z0-9_-]*\s+", child)
+                            else "[REDACTED_TOKEN]"
+                        )
+                        if isinstance(key, str)
+                        and key.lower() == "authorization"
+                        and isinstance(child, str)
+                        and child
+                        else scrub_json(child)
+                    )
+                )
+                for key, child in value.items()
+            }
+        if isinstance(value, list):
+            return [scrub_json(child) for child in value]
+        return value
+
+    changed_lines = []
+    for line in text.splitlines(keepends=True):
+        candidate = line.strip()
+        if not candidate.startswith(("{", "[")):
+            changed_lines.append(line)
+            continue
+        try:
+            parsed_line = json.loads(candidate)
+        except (ValueError, TypeError):
+            changed_lines.append(line)
+            continue
+        scrubbed = scrub_json(parsed_line)
+        if scrubbed != parsed_line:
+            leading = line[: len(line) - len(line.lstrip())]
+            ending = "\n" if line.endswith("\n") else ""
+            changed_lines.append(
+                leading + json.dumps(scrubbed, separators=(",", ":")) + ending
+            )
+        else:
+            changed_lines.append(line)
+    text = "".join(changed_lines)
+
+    # Targeted code and shell forms. Quoted literals may contain escaped quotes;
+    # bare values are redacted only when they look like literals, not names or
+    # expressions. Separators and closing syntax stay outside the match.
+    credential_names = (
+        r"(?:password|passwd|passphrase|pwd|secret|token|SECRET_KEY|"
+        r"secret_key_base|aws_secret_access_key|aws_access_key_id|"
+        r"[A-Za-z0-9]+[_-](?:PASSWORD|SECRET|TOKEN|KEY)|"
+        r"[A-Za-z0-9]+_(?:TOKEN|KEY)|TOKEN_VALUE|[A-Za-z0-9]+Secret|[A-Za-z0-9]+Token|"
+        r"api[-_]?key|x-api-key)"
+    )
+    quoted_value = r"""(?P<q>['"`])(?:\\.|(?!\1)[^\\])*?\1"""
+
+    def replace_literal(match):
+        value = match.group("value")
+        if value.startswith(("*", "&", "${")):
+            return match.group(0)
+        if value[0] in "'\"`":
+            if len(value) == 2:
+                return match.group(0)
+            quote = value[0]
+            return match.group("prefix") + quote + "[REDACTED_SECRET]" + quote
+        # Expressions and identifiers are source code, not literal credentials.
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*", value):
+            key = (
+                match.group("prefix").split("=", 1)[0].split(":", 1)[0].strip().lower()
+            )
+            if value.lower() == key or "." in value:
+                return match.group(0)
+            if ":" in match.group("prefix") and value.lower() in {
+                "the",
+                "str",
+                "string",
+                "optional",
+                "none",
+                "true",
+                "false",
+            }:
+                return match.group(0)  # common prose and type annotation values
+        if value in {"|", ">", "True", "False", "None", "null", "true", "false"}:
+            return match.group(0)
+        return match.group("prefix") + "[REDACTED_SECRET]"
+
+    kv = re.compile(
+        rf"(?i)(?P<prefix>(?:\b{credential_names})\b[ \t]*(?:=(?!=)|:[ \t]*))[ \t]*(?P<value>"
+        rf"(?:'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"|`(?:\\.|[^`\\])*`|[^\s,;,)}}\[{{(]+))"
+    )
+    text = kv.sub(replace_literal, text)
+
+    # Preserve block scalar headers while replacing only their indented bodies
+    # in mixed snippets that are not a complete YAML document.
+    block_pattern = re.compile(
+        r"(?im)^(?P<indent>[ \t]*)(?P<key>password|passwd|passphrase|pwd|secret|token|"
+        r"[A-Za-z0-9]+[_-](?:password|passwd|passphrase|pwd|secret|token))"
+        r"[ \t]*:[ \t]*(?P<indicator>[|>][-+]?(?:[1-9])?)[ \t]*(?:#.*)?\r?\n"
+        r"(?P<body>(?:(?:[ \t]+[^\r\n]*|[ \t]*)\r?\n)*)"
     )
 
-    def _replace_kv(m: re.Match) -> str:
-        prefix = m.group(1)
-        key = m.group(2)
-        sep = m.group(3)
-        quote = m.group(4)
-        val = m.group(5) if quote else m.group(6)
-        if val and val.startswith("[REDACTED_"):
-            return m.group(0)
-        normalized_key = key.strip("'\"`").lower()
-        strict_match = (
-            re.fullmatch(strict_names, normalized_key, re.IGNORECASE) is not None
+    def replace_block(match):
+        lines = match.group("body").splitlines(keepends=True)
+        nonblank = [line for line in lines if line.strip()]
+        if not nonblank:
+            return match.group(0)
+        indent = re.match(r"[ \t]*", nonblank[0]).group(0)
+        return (
+            match.group("indent")
+            + match.group("key")
+            + ": "
+            + match.group("indicator")
+            + "\n"
+            + indent
+            + "[REDACTED_SECRET]\n"
         )
-        quoted_is_generic = normalized_key.startswith("token_")
-        # Empty strings are commonly defaults (passwd='', token=''); leave them
-        # intact. Quoted ordinary values are redacted only when they look random.
-        if not val:
-            return m.group(0)
-        if not quote and val in {"True", "False", "None"}:
-            return m.group(0)
-        if not quote and re.match(
-            r"^(?:[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*\s*\(|lambda\b|[\[{])", val or ""
-        ):
-            return m.group(0)
-        if quote:
-            if (not strict_match or quoted_is_generic) and not credential_value.match(
-                val
-            ):
-                return m.group(0)
-            return f"{prefix}{key}{sep}{quote}[REDACTED_SECRET]{quote}"
-        if strict_match:
-            return f"{prefix}{key}{sep}[REDACTED_SECRET]"
-        if not credential_value.match(val):
-            return m.group(0)
-        return f"{prefix}{key}{sep}[REDACTED_SECRET]"
 
-    lines = text.splitlines(keepends=True)
-    index = 0
-    while index < len(lines):
-        match = re.match(
-            rf"^([ \t]*)(['\"]?(?:{key_names})['\"]?)[ \t]*:[ \t]*[|>][-+]?[ \t]*(?:#.*)?\r?\n$",
-            lines[index],
-            re.IGNORECASE,
-        )
-        if not match:
-            index += 1
-            continue
-        base_indent = len(match.group(1).expandtabs(8))
-        end = index + 1
-        content_indent = None
-        while end < len(lines):
-            line = lines[end]
-            indent = len(line) - len(line.lstrip(" \t"))
-            if line.strip() and len(line[:indent].expandtabs(8)) <= base_indent:
-                break
-            if line.strip() and content_indent is None:
-                content_indent = indent
-            end += 1
-        if content_indent is None:
-            index += 1
-            continue
-        newline = "\n" if lines[index + 1].endswith("\n") else ""
-        lines[index + 1 : end] = [" " * content_indent + "[REDACTED_SECRET]" + newline]
-        index += 2
-    text = "".join(lines)
+    text = block_pattern.sub(replace_block, text)
 
-    kv_pattern = (
-        rf"""(?i)(^|[^a-zA-Z0-9_'"`])"""
-        rf"""((?:"(?:{key_names})"|'(?:{key_names})'|(?:{key_names})))"""
-        r"([ \t]*\]?[ \t]*[:=][ \t]*)"
-        r"""(?:(['"`])(.*?)\4|([^\s'"`,;]+))"""
-    )
-    text = re.sub(kv_pattern, _replace_kv, text)
-
-    # Authorization values in mappings, header subscripts, and JS literals.
-    # Support an optional scheme so scheme-less values are protected too.
+    # Quoted dictionary/subscript keys and long CLI options.
     text = re.sub(
-        r"""(?i)(authorization['"]?\s*(?:\]\s*)?[:=][ \t]*)(['"`])([^'"`\r\n]*?)\2""",
+        r"(?i)(\[['\"](?:password|passwd|passphrase|pwd|secret|token|api[-_]?key)['\"]\]\s*=\s*)"
+        r"(['\"`])(?:\\.|(?!\2)[^\\])*?\2",
+        lambda m: m.group(1) + m.group(2) + "[REDACTED_SECRET]" + m.group(2),
+        text,
+    )
+    text = re.sub(
+        r"(?i)(--(?:password|passwd|passphrase|pwd|secret|token|api[-_]?key)\s+)([^\s]+)",
+        r"\1[REDACTED_SECRET]",
+        text,
+    )
+
+    text = re.sub(
+        r"(?i)\bPGPASSWORD[ \t]*=[ \t]*([^\s;]+)",
+        r"PGPASSWORD=[REDACTED_SECRET]",
+        text,
+    )
+
+    # Short -p forms and common client-specific password switches.
+    text = re.sub(
+        r"(?i)(?<![\w-])-p(?P<value>'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"|[^\s]+)",
+        lambda m: "-p"
+        + (
+            m.group("value")[0] + "[REDACTED_SECRET]" + m.group("value")[0]
+            if m.group("value")[0] in "'\""
+            else "[REDACTED_SECRET]"
+        ),
+        text,
+    )
+    text = re.sub(
+        r"(?i)(sshpass\s+-p\s+|docker\s+login\b[^\n]*?\s-p\s+)([^\s]+)",
+        r"\1[REDACTED_SECRET]",
+        text,
+    )
+    text = re.sub(
+        r"(?i)(curl\s+[^\n]*?-u\s+[^:\s]+:)([^\s'\"`]+)", r"\1[REDACTED_SECRET]", text
+    )
+    text = re.sub(
+        r"(?im)(^\s*(?:machine\s+\S+\s+)?(?:login\s+\S+\s+)?password[ \t]+)(?![=])([^\s#]+)",
+        r"\1[REDACTED_SECRET]",
+        text,
+    )
+    text = re.sub(
+        r"(?i)(IDENTIFIED\s+BY\s+)(['\"])(?:\\.|(?!\2)[^\\])*\2",
+        lambda m: m.group(1) + m.group(2) + "[REDACTED_SECRET]" + m.group(2),
+        text,
+    )
+
+    # Authorization header literals retain the scheme and surrounding syntax.
+    text = re.sub(
+        r"""(?i)(authorization\s*:\s*)([A-Za-z][A-Za-z0-9_-]*\s+)([^\s\r\n,"'`;}]+)""",
+        r"\1\2[REDACTED_TOKEN]",
+        text,
+    )
+    text = re.sub(
+        r"""(?i)(authorization\s*:\s*)(?!\[REDACTED_TOKEN\])(?![A-Za-z][A-Za-z0-9_-]*\s+)([^\s\r\n,"'`;}]+)""",
+        r"\1[REDACTED_TOKEN]",
+        text,
+    )
+    text = re.sub(
+        r"""(?i)(authorization['"`]?\s*(?:\]\s*)?[:=][ \t]*)(['"`])(?:\\.|(?!\2)[^\\])*?\2""",
         lambda m: m.group(1) + m.group(2) + "[REDACTED_TOKEN]" + m.group(2),
         text,
     )
     text = re.sub(
-        r"""(?i)(authorization['"]?\s*(?:\]\s*)?[:=][ \t]*)(?:[a-z][a-z0-9_-]*[ \t]+)?(?![\["'`])[^\s,;}]+""",
-        r"\g<1>[REDACTED_TOKEN]",
+        r"(?i)(authorization\s*=\s*)([A-Za-z][A-Za-z0-9_-]*\s+)?([^\s,;]+)",
+        lambda m: m.group(1) + (m.group(2) or "") + "[REDACTED_TOKEN]",
         text,
     )
-
-    # CLI password options have no equals sign; YAML block scalars have no inline value.
     text = re.sub(
-        r"(?i)(--(?:password|passwd|passphrase|pwd|pass|token|secret|api[-_]?key)\s+)([^\s\r\n]+)",
-        r"\g<1>[REDACTED_SECRET]",
+        r"(?i)(curl\s+[^\n]*?-H\s+['\"]Authorization:\s*[A-Za-z]+\s+)[^'\"]+",
+        r"\1[REDACTED_TOKEN]",
         text,
     )
     return text
