@@ -2727,6 +2727,36 @@ class TestSecretDenylistAndRedaction:
             assert output.count("[REDACTED_SECRET]") == 1
             yaml.safe_load(output.replace("\ufeff", ""))
 
+    def test_all_bom_positions_keep_kubernetes_env_secret_redacted(self):
+        from inject_context import redact_secrets
+
+        secret = "".join(["fake", "runtime", "secret", "731"])
+        env = "env:\n- name: DB_PASSWORD\n  value: " + secret + "\nfoo: bar\n"
+        cases = (
+            "\ufeff" + env,
+            env.replace("foo: bar", "\ufeff# next\nfoo: bar"),
+            env.replace(secret, secret[:4] + "\ufeff" + secret[4:]),
+            env.rstrip("\n") + "\ufeff\n",
+            "\ufeff"
+            + env.replace("foo: bar", "\ufeff# next\n\ufefffoo: bar")
+            + "\ufeff",
+        )
+        for source in cases:
+            output = redact_secrets(source)
+            assert secret not in output, repr(output)
+            assert output.count("[REDACTED_SECRET]") == 1
+            assert output.count("\ufeff") == source.count("\ufeff")
+            yaml.safe_load(output.replace("\ufeff", ""))
+
+    def test_yaml_parse_failure_still_runs_regex_secret_redaction(self):
+        from inject_context import redact_secrets
+
+        secret = "".join(["fake", "runtime", "secret", "731"])
+        source = "password: " + secret + "\n  broken: [\n"
+        output = redact_secrets(source)
+        assert secret not in output
+        assert "[REDACTED_SECRET]" in output
+
     @pytest.mark.parametrize(
         "key,value",
         [

@@ -231,14 +231,27 @@ def redact_secrets(text: str) -> str:
             try:
                 import yaml
 
-                # libyaml's C loader is an order of magnitude faster.
-                # libyaml ignores U+FEFF in mark offsets, so strip a leading
-                # BOM and use the pure-Python loader for any mid-text BOM.
-                bom = "\ufeff" if text.startswith("\ufeff") else ""
-                ytext = text[len(bom) :]
-                loader = yaml.SafeLoader
-                if "\ufeff" not in ytext:
-                    loader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+                # libyaml ignores U+FEFF in mark offsets. Strip every one for
+                # parsing and retain a boundary map so edits still target the
+                # original text. Keep the C loader's linear-time performance.
+                offset_map = None
+                bom_prefix = None
+                if "\ufeff" in text:
+                    clean_chars = []
+                    offset_map = []
+                    bom_prefix = []
+                    bom_count = 0
+                    for index, char in enumerate(text):
+                        if char == "\ufeff":
+                            bom_count += 1
+                        else:
+                            clean_chars.append(char)
+                            offset_map.append(index)
+                            bom_prefix.append(bom_count)
+                    ytext = "".join(clean_chars)
+                else:
+                    ytext = text
+                loader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
                 root = yaml.compose(ytext, Loader=loader)
                 edits = []
                 seen = set()
@@ -250,7 +263,9 @@ def redact_secrets(text: str) -> str:
                         or not node.value
                     ):
                         return
-                    raw = ytext[node.start_mark.index : node.end_mark.index]
+                    clean_start = node.start_mark.index
+                    clean_end = node.end_mark.index
+                    raw = ytext[clean_start:clean_end]
                     if raw.lstrip().startswith(("*", "&", "${", "!ENV")):
                         return
                     if node.value.lower() in {
@@ -268,9 +283,22 @@ def redact_secrets(text: str) -> str:
                         r"(?i)^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*\s*(?:\(|\[)", raw.strip()
                     ):
                         return
+                    # Preserve BOM characters that fell inside the replaced
+                    # scalar. Their placement within a redacted value has no
+                    # meaning, so retain them inside the replacement scalar.
+                    if offset_map is None:
+                        start, end = clean_start, clean_end
+                        retained_boms = ""
+                    else:
+                        start = offset_map[clean_start]
+                        end = offset_map[clean_end - 1] + 1
+                        retained_boms = "\ufeff" * (
+                            bom_prefix[clean_end - 1] - bom_prefix[clean_start]
+                        )
+                    marker += retained_boms
                     style = node.style
                     if style == '"':
-                        replacement = json.dumps(marker)
+                        replacement = json.dumps(marker, ensure_ascii=False)
                     elif style == "'":
                         replacement = "'" + marker + "'"
                     elif style in ("|", ">"):
@@ -284,10 +312,8 @@ def redact_secrets(text: str) -> str:
                             + ("\n" if raw.endswith("\n") else "")
                         )
                     else:
-                        replacement = json.dumps(marker)
-                    edits.append(
-                        (node.start_mark.index, node.end_mark.index, replacement)
-                    )
+                        replacement = json.dumps(marker, ensure_ascii=False)
+                    edits.append((start, end, replacement))
 
                 def visit(node):
                     ident = id(node)
@@ -342,11 +368,11 @@ def redact_secrets(text: str) -> str:
                     pieces = []
                     cursor = 0
                     for start, end, replacement in sorted(set(edits)):
-                        pieces.append(ytext[cursor:start])
+                        pieces.append(text[cursor:start])
                         pieces.append(replacement)
                         cursor = end
-                    pieces.append(ytext[cursor:])
-                    text = bom + "".join(pieces)
+                    pieces.append(text[cursor:])
+                    text = "".join(pieces)
             except Exception:
                 pass
 
