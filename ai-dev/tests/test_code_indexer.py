@@ -2480,6 +2480,40 @@ class TestSecretDenylistAndRedaction:
         if "flow:" in source:
             assert after["flow"]["count"] == 4
 
+    def test_redaction_preserves_non_string_scalar_types(self):
+        import json
+        import yaml
+
+        secret = "".join(["scalar", "secret", "731"])
+        json_source = (
+            '{"password":"' + secret + '","count":12345,"ratio":1.25,'
+            '"enabled":true,"disabled":false,"nothing":null}'
+        )
+        json_output = redact_secrets(json_source)
+        assert json.loads(json_output) == {
+            "password": "[REDACTED_SECRET]",
+            "count": 12345,
+            "ratio": 1.25,
+            "enabled": True,
+            "disabled": False,
+            "nothing": None,
+        }
+
+        yaml_source = (
+            f"password: {secret}\ncount: 12345\nratio: 1.25\n"
+            "enabled: true\ndisabled: false\nnothing: null\ntilde: ~\n"
+        )
+        yaml_output = redact_secrets(yaml_source)
+        assert yaml.safe_load(yaml_output) == {
+            "password": "[REDACTED_SECRET]",
+            "count": 12345,
+            "ratio": 1.25,
+            "enabled": True,
+            "disabled": False,
+            "nothing": None,
+            "tilde": None,
+        }
+
     @pytest.mark.parametrize(
         "template",
         [
@@ -2666,16 +2700,34 @@ class TestSecretDenylistAndRedaction:
                 + "]}"
             )
 
-        timings = []
-        for sample in (make_large(20000), make_large(80000)):
-            start = time.perf_counter()
-            output = redact_secrets(sample)
-            timings.append(time.perf_counter() - start)
-            assert large_value not in output
-        assert timings[1] < 8.0
-        # Four times the input may take longer on a busy runner, but must not
-        # show the sixteen-fold growth expected from a quadratic path.
-        assert timings[1] < max(0.25, timings[0]) * 6
+        def assert_scales(linear_samples, expected_secret=None):
+            timings = []
+            for sample in linear_samples:
+                start = time.perf_counter()
+                output = redact_secrets(sample)
+                timings.append(time.perf_counter() - start)
+                if expected_secret:
+                    assert expected_secret not in output
+            assert timings[1] < 6.0
+            # Four times the input may take longer on a busy runner, but must
+            # not show the sixteen-fold growth expected from a quadratic path.
+            assert timings[1] < max(0.25, timings[0]) * 6
+
+        assert_scales((make_large(20000), make_large(80000)), large_value)
+
+        yaml_secret = "".join(["yaml", "large", "secret", "731"])
+
+        def make_large_yaml(count):
+            return "items:\n" + "".join(
+                f"  - password: {yaml_secret}\n" for _ in range(count)
+            )
+
+        assert_scales((make_large_yaml(10000), make_large_yaml(40000)), yaml_secret)
+
+        def make_large_code(count):
+            return "password = get_password()\n" * count
+
+        assert_scales((make_large_code(100000), make_large_code(400000)))
 
         dash_marker = "".join(["-", "-", "-", "-", "-"])
         repeated_timings = []
@@ -2690,7 +2742,7 @@ class TestSecretDenylistAndRedaction:
                 f"{dash_marker}{_TEST_BEGIN} {_TEST_PRIVATE_KEY}{dash_marker}"
                 not in output
             )
-        assert repeated_timings[1] < 8.0
+        assert repeated_timings[1] < 6.0
         assert repeated_timings[1] < max(0.25, repeated_timings[0]) * 6
 
     def test_truncation_notes_respect_tiny_budgets(self):

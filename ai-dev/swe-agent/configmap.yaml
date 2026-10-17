@@ -535,8 +535,15 @@ data:
                                 visit(child)
 
                     visit(root)
-                    for start, end, replacement in sorted(set(edits), reverse=True):
-                        text = text[:start] + replacement + text[end:]
+                    if edits:
+                        pieces = []
+                        cursor = 0
+                        for start, end, replacement in sorted(set(edits)):
+                            pieces.append(text[cursor:start])
+                            pieces.append(replacement)
+                            cursor = end
+                        pieces.append(text[cursor:])
+                        text = "".join(pieces)
                 except Exception:
                     pass
 
@@ -553,6 +560,7 @@ data:
             r"(?:[A-Za-z0-9]+[_-])*[A-Za-z0-9]+_(?:TOKEN|KEY)|TOKEN_VALUE|[A-Za-z0-9]+Secret|[A-Za-z0-9]+Token|"
             r"api[-_]?key|x-api-key)"
         )
+        expression_call = re.compile(r"\s*\(")
         text = re.sub(
             rf"(?i)(?P<prefix>(?:\b{credential_names})\b[ \t]*:[ \t]*)!!binary[ \t]+[^\s,;}}]+",
             lambda match: match.group("prefix") + json.dumps("[REDACTED_SECRET]"),
@@ -562,7 +570,7 @@ data:
 
         def replace_literal(match):
             value = match.group("value")
-            if value == "$" and text[match.end() :].startswith("{"):
+            if value == "$" and text.startswith("{", match.end()):
                 return match.group(0)
             if value.startswith(("*", "&", "${", "!")):
                 return match.group(0)
@@ -611,7 +619,26 @@ data:
                 "required",
             }:
                 return match.group(0)
-            if re.match(r"\s*\(", text[match.end() :]):
+            if value[0] not in "'\"`":
+                # Keep YAML/JSON scalar types intact. Structural redaction only
+                # targets strings; this also protects their unquoted spellings
+                # from the mixed-code fallback below.
+                json_scalar = re.fullmatch(
+                    r"(?:-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?|true|false|null)",
+                    value,
+                    re.IGNORECASE,
+                )
+                yaml_scalar = re.fullmatch(
+                    r"(?:~|null|true|false|\.nan|[+-]?\.inf|"
+                    r"[-+]?(?:0x[0-9a-f]+|0o[0-7]+|0b[01]+|"
+                    r"[0-9]+(?:_[0-9]+)*(?:\.[0-9]+(?:_[0-9]+)*)?"
+                    r"(?:[eE][+-]?[0-9]+)?))",
+                    value,
+                    re.IGNORECASE,
+                )
+                if json_scalar or (":" in match.group("prefix") and yaml_scalar):
+                    return match.group(0)
+            if expression_call.match(text, match.end()):
                 return match.group(0)
             marker = (
                 json.dumps("[REDACTED_SECRET]")
