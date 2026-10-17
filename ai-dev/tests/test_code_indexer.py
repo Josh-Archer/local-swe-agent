@@ -2,6 +2,7 @@
 Unit tests for the code indexer script.
 """
 
+import logging
 import sys
 import uuid
 import tempfile
@@ -71,7 +72,122 @@ def mock_embedding_model():
     model = MagicMock()
     model.encode.return_value = MagicMock(tolist=lambda: [0.1] * 384)
     model.get_sentence_embedding_dimension.return_value = 384
+    # Leave tokenizer unset so production code does not treat a mock as one.
+    model.tokenizer = None
     return model
+
+
+class WordCountTokenizer:
+    """One token per whitespace word. Used to make chunk tests deterministic."""
+
+    def encode(self, text, add_special_tokens=False):
+        if not text or not str(text).strip():
+            return []
+        return [1] * len(str(text).split())
+
+
+class InflatingOffsetTokenizer:
+    """Offsets point at original words; re-encoding can exceed the window.
+
+    Words containing '_' count as two tokens, so a window of N offset spans
+    re-encodes above N and must be shrunk. ``decode`` lowercases and is not a
+    substring of the source; a splitter that decodes token ids fails both the
+    exact-substring and the token-limit checks.
+    """
+
+    def encode(self, text, add_special_tokens=False):
+        if text is None:
+            return []
+        raw = str(text)
+        if "⟦decoded⟧" in raw:
+            return [0] * (len(raw.split()) + 30)
+        count = 0
+        for word in raw.split():
+            count += 2 if "_" in word else 1
+        return [1] * count
+
+    def decode(self, token_ids, skip_special_tokens=True):
+        return "⟦decoded⟧ " + " ".join("tok" for _ in list(token_ids))
+
+    def __call__(
+        self, text, add_special_tokens=False, return_offsets_mapping=False, **kwargs
+    ):
+        raw = str(text)
+        spans = []
+        index = 0
+        length = len(raw)
+        while index < length:
+            while index < length and raw[index].isspace():
+                index += 1
+            if index >= length:
+                break
+            end = index + 1
+            while end < length and not raw[end].isspace():
+                end += 1
+            spans.append((index, end))
+            index = end
+        encoded = {"input_ids": [1] * len(spans)}
+        if return_offsets_mapping:
+            encoded["offset_mapping"] = spans
+        return encoded
+
+
+def _load_local_minilm_tokenizer():
+    """Return the cached MiniLM tokenizer, or None when it is not on disk."""
+    try:
+        from transformers import AutoTokenizer
+
+        return AutoTokenizer.from_pretrained(
+            "sentence-transformers/all-MiniLM-L6-v2",
+            local_files_only=True,
+        )
+    except Exception:
+        return None
+
+
+def _assert_no_contained_line_ranges(chunks):
+    """Fail when a chunk's line range sits entirely inside an earlier chunk.
+
+    Several pieces of one over-long line share that line number; those are
+    checked separately by requiring each piece to extend source coverage.
+    """
+    for index, chunk in enumerate(chunks):
+        for prev in chunks[:index]:
+            same_line = (
+                chunk["start_line"] == chunk["end_line"]
+                and prev["start_line"] == prev["end_line"]
+                and chunk["start_line"] == prev["start_line"]
+            )
+            if same_line:
+                continue
+            contained = (
+                chunk["start_line"] >= prev["start_line"]
+                and chunk["end_line"] <= prev["end_line"]
+            )
+            assert not contained, (
+                f"chunk lines {chunk['start_line']}-{chunk['end_line']} "
+                f"are inside {prev['start_line']}-{prev['end_line']}"
+            )
+
+
+def _assert_exact_advancing_slices(chunks, original):
+    """Each piece is an exact slice and ends further along than the previous."""
+    prev_start = -1
+    prev_end = 0
+    for chunk in chunks:
+        content = chunk["content"]
+        idx = original.find(content, prev_start + 1)
+        assert idx >= 0, f"piece is not an exact substring: {content[:80]!r}"
+        end = idx + len(content)
+        assert original[idx:end] == content
+        assert end > prev_end
+        prev_start = idx
+        prev_end = end
+    assert chunks, "expected at least one piece"
+    assert prev_end >= len(original.rstrip())
+    body_start = len(original) - len(original.lstrip())
+    first = original.find(chunks[0]["content"])
+    assert first <= body_start
 
 
 @pytest.fixture
@@ -348,6 +464,316 @@ class TestCodeChunking:
                 tokenizer.encode(chunk["content"], add_special_tokens=True)
             )
             assert full_encoded <= 256
+
+    def test_long_line_pieces_stay_within_limit_and_are_exact_substrings(
+        self, in_memory_qdrant, mock_embedding_model
+    ):
+        """Over-long lines shrink to the token limit and keep original text.
+
+        Re-encoding an offset window of ``Value_N`` words is longer than the
+        window, so the splitter must shrink. Decoding token ids would lowercase
+        the text, drop ``🙂`` / ``é`` / ``字``, and blow past the limit.
+        """
+        tokenizer = InflatingOffsetTokenizer()
+        indexer = CodeIndexer(
+            config_path={},
+            qdrant_client=in_memory_qdrant,
+            embedding_model=mock_embedding_model,
+            tokenizer=tokenizer,
+        )
+        indexer.max_seq_length = 256
+        indexer.chunk_size = 8
+        indexer.chunk_overlap = 2
+        content_limit = min(indexer.chunk_size, indexer.max_seq_length - 2)
+
+        line = "Value_0 🙂 café 字 " + " ".join(f"Value_{i}" for i in range(30))
+        chunks = indexer.chunk_code(line, "long.py")
+
+        assert len(chunks) > 1
+        _assert_exact_advancing_slices(chunks, line)
+        _assert_no_contained_line_ranges(chunks)
+        for chunk in chunks:
+            assert chunk["start_line"] == 1 and chunk["end_line"] == 1
+            assert indexer.count_tokens(chunk["content"]) <= content_limit
+            assert "⟦decoded⟧" not in chunk["content"]
+        joined = "\n".join(chunk["content"] for chunk in chunks)
+        assert "Value_0" in joined
+        assert "🙂" in joined
+        assert "é" in joined
+        assert "字" in joined
+        assert "value _ 0" not in joined
+        for index in range(30):
+            assert f"Value_{index}" in joined
+
+    def test_single_span_over_limit_is_sliced_without_dropping_characters(
+        self, in_memory_qdrant, mock_embedding_model
+    ):
+        """A span whose text re-encodes over the limit is cut on the original string."""
+
+        class CharTokenizer:
+            def encode(self, text, add_special_tokens=False):
+                return [1] * len(str(text))
+
+            def decode(self, token_ids, skip_special_tokens=True):
+                return "decoded"
+
+            def __call__(
+                self,
+                text,
+                add_special_tokens=False,
+                return_offsets_mapping=False,
+                **kwargs,
+            ):
+                raw = str(text)
+                encoded = {"input_ids": [1]}
+                if return_offsets_mapping:
+                    encoded["offset_mapping"] = [(0, len(raw))]
+                return encoded
+
+        indexer = CodeIndexer(
+            config_path={},
+            qdrant_client=in_memory_qdrant,
+            embedding_model=mock_embedding_model,
+            tokenizer=CharTokenizer(),
+        )
+        indexer.max_seq_length = 256
+        indexer.chunk_size = 5
+        indexer.chunk_overlap = 1
+        line = "ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"
+        chunks = indexer.chunk_code(line, "span.py")
+        content_limit = min(indexer.chunk_size, indexer.max_seq_length - 2)
+        assert len(chunks) > 1
+        _assert_exact_advancing_slices(chunks, line)
+        pos = 0
+        for chunk in chunks:
+            content = chunk["content"]
+            assert indexer.count_tokens(content) <= content_limit
+            assert content != "decoded"
+            found = line.find(content, pos)
+            assert found >= 0
+            pos = found + len(content)
+        assert pos == len(line)
+
+    def test_no_duplicate_tail_chunks_before_long_line(
+        self, in_memory_qdrant, mock_embedding_model
+    ):
+        """Drop overlap that cannot extend past the previous chunk.
+
+        Eighty short lines fit in one chunk. The following ~240-token line
+        fits alone but not with the 32-token overlap, which used to emit
+        contained tails (75-80, 76-80, 77-80, ...).
+        """
+        indexer = CodeIndexer(
+            config_path={},
+            qdrant_client=in_memory_qdrant,
+            embedding_model=mock_embedding_model,
+            tokenizer=WordCountTokenizer(),
+        )
+        indexer.max_seq_length = 256
+        indexer.chunk_size = 256
+        indexer.chunk_overlap = 32
+
+        small_lines = [f"s{i}" for i in range(80)]
+        long_line = " ".join(f"w{i}" for i in range(240))
+        content = "\n".join(small_lines + [long_line])
+        chunks = indexer.chunk_code(content, "tails.py")
+
+        _assert_no_contained_line_ranges(chunks)
+        tails = [
+            chunk
+            for chunk in chunks
+            if chunk["start_line"] > 1 and chunk["end_line"] <= 80
+        ]
+        assert tails == []
+        long_chunks = [chunk for chunk in chunks if chunk["start_line"] == 81]
+        assert len(long_chunks) == 1
+        assert long_chunks[0]["end_line"] == 81
+        assert long_chunks[0]["content"] == long_line
+        assert indexer.count_tokens(long_chunks[0]["content"]) <= 254
+
+    def test_no_duplicate_tails_when_next_line_is_split(
+        self, in_memory_qdrant, mock_embedding_model
+    ):
+        """A following line that itself exceeds the window is not preceded by tails."""
+        indexer = CodeIndexer(
+            config_path={},
+            qdrant_client=in_memory_qdrant,
+            embedding_model=mock_embedding_model,
+            tokenizer=WordCountTokenizer(),
+        )
+        indexer.max_seq_length = 256
+        indexer.chunk_size = 256
+        indexer.chunk_overlap = 32
+
+        small_lines = [f"s{i}" for i in range(80)]
+        long_line = " ".join(f"w{i}" for i in range(400))
+        content = "\n".join(small_lines + [long_line])
+        chunks = indexer.chunk_code(content, "split_tails.py")
+
+        _assert_no_contained_line_ranges(chunks)
+        tails = [
+            chunk
+            for chunk in chunks
+            if chunk["start_line"] > 1 and chunk["end_line"] <= 80
+        ]
+        assert tails == []
+        pieces = [chunk for chunk in chunks if chunk["start_line"] == 81]
+        assert len(pieces) >= 2
+        _assert_exact_advancing_slices(pieces, long_line)
+        for piece in pieces:
+            assert indexer.count_tokens(piece["content"]) <= 254
+
+    def test_real_tokenizer_long_line_limit_and_original_text(
+        self, in_memory_qdrant, mock_embedding_model
+    ):
+        """MiniLM chunks of a long line stay <= 256 tokens and keep source text."""
+        tokenizer = _load_local_minilm_tokenizer()
+        if tokenizer is None:
+            pytest.skip("Local HuggingFace model cache not available")
+
+        model = mock_embedding_model
+        model.max_seq_length = 256
+        indexer = CodeIndexer(
+            config_path={},
+            qdrant_client=in_memory_qdrant,
+            embedding_model=model,
+            tokenizer=tokenizer,
+        )
+        assert indexer.chunk_size == 256
+
+        values = ",".join(f"Value_{i}" for i in range(3000))
+        line = "[" + values + "] " + ("🙂" * 40) + " café " + ("字" * 20)
+        chunks = indexer.chunk_code(line, "values.py")
+
+        assert len(chunks) > 1
+        _assert_exact_advancing_slices(chunks, line)
+        _assert_no_contained_line_ranges(chunks)
+        for chunk in chunks:
+            content_tokens = len(
+                tokenizer.encode(chunk["content"], add_special_tokens=False)
+            )
+            full_tokens = len(
+                tokenizer.encode(chunk["content"], add_special_tokens=True)
+            )
+            assert content_tokens <= 254
+            assert full_tokens <= 256
+            assert chunk["content"] in line
+        joined = "".join(chunk["content"] for chunk in chunks)
+        assert "Value_0" in joined
+        assert "🙂" in joined
+        assert "é" in joined
+        assert "字" in joined
+        assert "value _ 0" not in joined
+        assert joined.count("🙂") >= 40
+        assert joined.count("字") >= 20
+
+    def test_real_tokenizer_no_duplicate_tails(
+        self, in_memory_qdrant, mock_embedding_model
+    ):
+        """With MiniLM, a ~240-token line after short lines does not repeat tails."""
+        tokenizer = _load_local_minilm_tokenizer()
+        if tokenizer is None:
+            pytest.skip("Local HuggingFace model cache not available")
+
+        mock_embedding_model.max_seq_length = 256
+        indexer = CodeIndexer(
+            config_path={},
+            qdrant_client=in_memory_qdrant,
+            embedding_model=mock_embedding_model,
+            tokenizer=tokenizer,
+        )
+        words = []
+        while len(tokenizer.encode(" ".join(words), add_special_tokens=False)) < 240:
+            words.append(f"w{len(words)}")
+        long_line = " ".join(words)
+        small_lines = [f"s{i}" for i in range(80)]
+        content = "\n".join(small_lines + [long_line])
+        chunks = indexer.chunk_code(content, "real_tails.py")
+
+        _assert_no_contained_line_ranges(chunks)
+        covered = 0
+        for chunk in chunks:
+            if chunk["end_line"] <= len(small_lines):
+                assert chunk["end_line"] > covered
+                covered = chunk["end_line"]
+        for chunk in chunks:
+            full_tokens = len(
+                tokenizer.encode(chunk["content"], add_special_tokens=True)
+            )
+            assert full_tokens <= 256
+
+    def test_count_tokens_warns_on_word_count_fallback(
+        self, in_memory_qdrant, mock_embedding_model, caplog
+    ):
+        """A tokenizer failure is logged; counts fall back to whitespace words."""
+
+        class ExplodingTokenizer:
+            def encode(self, text, add_special_tokens=False):
+                raise RuntimeError("tokenizer exploded")
+
+        indexer = CodeIndexer(
+            config_path={},
+            qdrant_client=in_memory_qdrant,
+            embedding_model=mock_embedding_model,
+            tokenizer=ExplodingTokenizer(),
+        )
+        with caplog.at_level(logging.WARNING, logger="index_code"):
+            assert indexer.count_tokens("alpha beta gamma") == 3
+            assert indexer.count_tokens("alpha beta gamma") == 3
+        warnings = [
+            record.message
+            for record in caplog.records
+            if record.levelno >= logging.WARNING
+        ]
+        assert any(
+            "falling back to whitespace word count" in message for message in warnings
+        )
+        assert any("tokenizer exploded" in message for message in warnings)
+        assert len(warnings) == 1
+
+    def test_init_does_not_fetch_tokenizer(
+        self, in_memory_qdrant, mock_embedding_model, monkeypatch, caplog
+    ):
+        """Tokenizer download is not attempted while constructing an indexer."""
+        import index_code as index_module
+
+        def fail_fetch(*args, **kwargs):
+            raise AssertionError(f"tokenizer fetched at startup: {args} {kwargs}")
+
+        monkeypatch.setattr(index_module.AutoTokenizer, "from_pretrained", fail_fetch)
+        CodeIndexer(
+            config_path={
+                "embedding": {"model": "sentence-transformers/all-MiniLM-L6-v2"}
+            },
+            qdrant_client=in_memory_qdrant,
+            embedding_model=mock_embedding_model,
+        )
+
+        calls = {}
+
+        def local_only_fetch(name, *args, **kwargs):
+            calls["name"] = name
+            calls["kwargs"] = kwargs
+            raise OSError("cache miss")
+
+        monkeypatch.setattr(
+            index_module.AutoTokenizer, "from_pretrained", local_only_fetch
+        )
+        indexer = CodeIndexer(
+            config_path={"embedding": {"model": "missing-model"}},
+            qdrant_client=in_memory_qdrant,
+            embedding_model=mock_embedding_model,
+        )
+        assert calls == {}
+        with caplog.at_level(logging.WARNING, logger="index_code"):
+            assert indexer.count_tokens("alpha beta") == 2
+        assert calls["name"] == "missing-model"
+        assert calls["kwargs"].get("local_files_only") is True
+
+    def test_indexer_source_has_no_mock_branches(self):
+        """Mock-only branches stay in the tests, not in the indexer."""
+        source = (INDEXER_DIR / "index_code.py").read_text(encoding="utf-8")
+        assert "MagicMock" not in source
 
 
 class TestFileFiltering:
