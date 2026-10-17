@@ -1630,14 +1630,35 @@ def main(args: Optional[List[str]] = None):
                 import json
 
                 safe_chunks = []
+
+                def redact_json_value(value):
+                    if isinstance(value, str):
+                        return redact_secrets(value)
+                    if isinstance(value, list):
+                        return [redact_json_value(item) for item in value]
+                    if isinstance(value, dict):
+                        result = {}
+                        for key, item in value.items():
+                            safe_key = redact_secrets(str(key))
+                            if isinstance(item, str):
+                                marker_probe = redact_secrets(f"{key}={item}")
+                                if "[REDACTED_" in marker_probe:
+                                    safe_value = marker_probe.split("=", 1)[-1]
+                                    safe_value = safe_value.strip("'\"` ")
+                                else:
+                                    safe_value = redact_secrets(item)
+                            else:
+                                safe_value = redact_json_value(item)
+                            result[safe_key] = safe_value
+                        return result
+                    return value
+
                 for chunk in chunks:
                     file_path = chunk.get("file_path", "")
                     content = chunk.get("content", "")
                     if is_secret_path(file_path) or is_secret_content(content):
                         continue
-                    safe_chunk = dict(chunk)
-                    safe_chunk["content"] = redact_secrets(content)
-                    safe_chunks.append(safe_chunk)
+                    safe_chunks.append(redact_json_value(chunk))
                 output_str = json.dumps(safe_chunks, indent=2)
             else:
                 output_str = markdown

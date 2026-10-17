@@ -2270,6 +2270,69 @@ class TestSecretDenylistAndRedaction:
         assert credential not in output
         assert output.count("[REDACTED_TOKEN]") >= 3
 
+    def test_redacts_all_unquoted_known_secret_values(self):
+        from inject_context import redact_secrets
+
+        value = "".join(["ordinary", "letters"])
+        unusual = "".join(["p", "@", "s", "$", "s", "&", "!", ".", "~", "#", "tail"])
+        keys = [
+            "password",
+            "passwd",
+            "passphrase",
+            "pwd",
+            "secret",
+            "token",
+            "DB_PASSWORD",
+            "API_TOKEN",
+            "aws_secret",
+            "clientSecret",
+            "api_key",
+        ]
+        cases = []
+        for key in keys:
+            for separator in ("=", ":", " = ", ": "):
+                for candidate in (value, unusual, "xy7"):
+                    cases.append(f"{key}{separator}{candidate}")
+        cases.extend([f"mysql --password={value}", f"--password {value}"])
+        output = redact_secrets("\n".join(cases))
+        assert value not in output
+        assert unusual not in output
+        assert "xy7" not in output
+        assert output.count("[REDACTED_SECRET]") >= len(cases)
+
+    def test_redaction_preserves_yaml_json_and_ordinary_quoted_values(self):
+        import json
+        from inject_context import redact_secrets
+
+        source = '{"Password:":"x", "key":"repository", "token_type":"phrase"}'
+        output = redact_secrets(source)
+        assert json.loads(output) == {
+            "Password:": "x",
+            "key": "repository",
+            "token_type": "phrase",
+        }
+        yaml = "password:\n  required: true\n  description: keep this\nnext: value\n"
+        assert redact_secrets(yaml) == yaml
+        assert redact_secrets("key=\"repository\"\ntoken_type='phrase'\npasswd=''") == (
+            "key=\"repository\"\ntoken_type='phrase'\npasswd=''"
+        )
+
+    def test_authorization_templates_and_scheme_less_values(self):
+        import json
+        from inject_context import redact_secrets
+
+        value = "runtime-" + "authorization-value"
+        samples = [
+            f"{{headers: {{Authorization: `Basic {value}`}}}}",
+            f'{{"Authorization": "{value}"}}',
+            f"Authorization: {value}",
+        ]
+        output = redact_secrets("\n".join(samples))
+        assert value not in output
+        assert output.count("[REDACTED_TOKEN]") == len(samples)
+        json_output = redact_secrets(f'{{"Authorization": "{value}"}}')
+        assert json.loads(json_output)["Authorization"] == "[REDACTED_TOKEN]"
+
     def test_redaction_url_forms_case_and_yaml_siblings(self):
         credential = "runtime-" + "credential-value"
         short_password = "p" + "w"
@@ -2304,6 +2367,9 @@ class TestSecretDenylistAndRedaction:
             )
             assert len(output.encode("utf-8")) <= max_bytes
         assert enforce_context_budget("context", max_bytes=0) == ""
+        for max_bytes in range(100, 110):
+            output = enforce_context_budget("~~~~\n" + "y\n" * 50, max_bytes=max_bytes)
+            assert len(output.encode("utf-8")) <= max_bytes
         chunk = [
             {
                 "repository": "repo",
@@ -2335,7 +2401,12 @@ class TestSecretDenylistAndRedaction:
         with patch("index_code.CodeIndexer") as mock_cls:
             mock_inst = MagicMock()
             mock_inst.retrieve_code.return_value = [
-                {"file_path": "src/client.py", "content": f"{api_key}={value}"}
+                {
+                    "file_path": "src/client.py",
+                    "content": f"{api_key}={value}",
+                    "metadata": {"authorization": value},
+                    "description": f"token={value}",
+                }
             ]
             mock_inst.format_retrieved_context.return_value = ""
             mock_cls.return_value = mock_inst
@@ -2345,6 +2416,7 @@ class TestSecretDenylistAndRedaction:
         output = capsys.readouterr().out
         assert value not in output
         assert "[REDACTED_SECRET]" in output
+        assert "[REDACTED_TOKEN]" in output
 
     def test_format_retrieved_context_redacts_secrets(self):
         pwd_var = "".join(["DB_", "PASS", "WORD"])

@@ -106,14 +106,18 @@ def redact_secrets(text: str) -> str:
     # - aws_secret_access_key, aws_access_key_id
     # - prefixed KEY-style names (*_TOKEN=, *_PASSWORD=, *_SECRET, *_KEY, etc.)
     # - JSON keys with quotes ("password":, 'api_token':)
-    key_names = (
-        r"(?:password|passwd|passphrase|pwd|pass|key|token|secret|api[-_]?key|"
-        r"[a-z0-9]+(?:[_-](?:token|secret|key|password|passwd|passphrase|pwd))|"
-        r"[a-z0-9]+(?:Token|Secret|Key)|token_[a-z0-9]+|"
-        r"aws_secret_access_key|aws_access_key_id|x-api-key|x_api_key)"
+    # Strict names are unambiguous credentials: redact even short, human chosen
+    # values. Generic key names retain a shape heuristic to avoid mangling code.
+    strict_names = (
+        r"(?:password|passwd|passphrase|pwd|pass|secret|token|api[-_]?key|"
+        r"[a-z0-9]+(?:[_-](?:token|secret|password|passwd|passphrase|pwd))|"
+        r"[a-z0-9]+(?:Token|Secret)|token_[a-z0-9]+|aws_secret_access_key|aws_access_key_id|"
+        r"x-api-key|x_api_key)"
     )
+    heuristic_names = r"(?:key|[a-z0-9]+[_-]key|[a-z0-9]+Key)"
+    key_names = rf"(?:{strict_names}|{heuristic_names})"
     credential_value = re.compile(
-        r"(?i)^(?:[a-z0-9]{24,}|(?=.{5,}$)(?=.*\d).+|(?=.{6,}$)(?=.*[^a-z0-9_]).+)$"
+        r"(?i)^(?:[a-z0-9]{24,}|(?=.{8,}$)(?=.*[^a-z0-9_]).+)$"
     )
 
     def _replace_kv(m: re.Match) -> str:
@@ -124,9 +128,30 @@ def redact_secrets(text: str) -> str:
         val = m.group(5) if quote else m.group(6)
         if val and val.startswith("[REDACTED_"):
             return m.group(0)
+        normalized_key = key.strip("'\"`").lower()
+        strict_match = (
+            re.fullmatch(strict_names, normalized_key, re.IGNORECASE) is not None
+        )
+        quoted_is_generic = normalized_key.startswith("token_")
+        # Empty strings are commonly defaults (passwd='', token=''); leave them
+        # intact. Quoted ordinary values are redacted only when they look random.
+        if not val:
+            return m.group(0)
+        if not quote and val in {"True", "False", "None"}:
+            return m.group(0)
+        if not quote and re.match(
+            r"^(?:[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*\s*\(|lambda\b|[\[{])", val or ""
+        ):
+            return m.group(0)
         if quote:
+            if (not strict_match or quoted_is_generic) and not credential_value.match(
+                val
+            ):
+                return m.group(0)
             return f"{prefix}{key}{sep}{quote}[REDACTED_SECRET]{quote}"
-        if val in {"True", "False", "None"} or not credential_value.match(val or ""):
+        if strict_match:
+            return f"{prefix}{key}{sep}[REDACTED_SECRET]"
+        if not credential_value.match(val):
             return m.group(0)
         return f"{prefix}{key}{sep}[REDACTED_SECRET]"
 
@@ -134,7 +159,7 @@ def redact_secrets(text: str) -> str:
     index = 0
     while index < len(lines):
         match = re.match(
-            rf"^([ \t]*)(['\"]?(?:{key_names})['\"]?)\s*:\s*[|>][-+]?\s*(?:#.*)?\r?\n$",
+            rf"^([ \t]*)(['\"]?(?:{key_names})['\"]?)[ \t]*:[ \t]*[|>][-+]?[ \t]*(?:#.*)?\r?\n$",
             lines[index],
             re.IGNORECASE,
         )
@@ -161,15 +186,23 @@ def redact_secrets(text: str) -> str:
     text = "".join(lines)
 
     kv_pattern = (
-        rf"""(?i)(^|[^a-zA-Z0-9_-])(['"]?(?:{key_names})['"]?)(\s*\]?\s*[:=]\s*)"""
-        r"""(?:(['"])(.*?)\4|([A-Za-z0-9_:+/=-]+))"""
+        rf"""(?i)(^|[^a-zA-Z0-9_'"`])"""
+        rf"""((?:"(?:{key_names})"|'(?:{key_names})'|(?:{key_names})))"""
+        r"([ \t]*\]?[ \t]*[:=][ \t]*)"
+        r"""(?:(['"`])(.*?)\4|([^\s'"`,;]+))"""
     )
     text = re.sub(kv_pattern, _replace_kv, text)
 
-    # Authorization values in mappings and header subscript assignments.
+    # Authorization values in mappings, header subscripts, and JS literals.
+    # Support an optional scheme so scheme-less values are protected too.
     text = re.sub(
-        r"(?i)(authorization['\"]?\s*(?:\]\s*)?[:=]\s*['\"]?)([a-z][a-z0-9_-]*\s+)([^'\"\s,}]+)",
-        r"\g<1>\g<2>[REDACTED_TOKEN]",
+        r"""(?i)(authorization['"]?\s*(?:\]\s*)?[:=][ \t]*)(['"`])([^'"`\r\n]*?)\2""",
+        lambda m: m.group(1) + m.group(2) + "[REDACTED_TOKEN]" + m.group(2),
+        text,
+    )
+    text = re.sub(
+        r"""(?i)(authorization['"]?\s*(?:\]\s*)?[:=][ \t]*)(?:[a-z][a-z0-9_-]*[ \t]+)?(?![\["'`])[^\s,;}]+""",
+        r"\g<1>[REDACTED_TOKEN]",
         text,
     )
 
@@ -266,8 +299,17 @@ def enforce_context_budget(
         open_fence = _find_unclosed_fence(kept_lines)
         if open_fence:
             close_str = f"\n{open_fence[0]}{open_fence[1]}\n"
-            return ("".join(kept_lines).rstrip() + close_str).strip()
-        return context
+            closed = ("".join(kept_lines).rstrip() + close_str).strip()
+            if (
+                len(closed.encode("utf-8")) <= max_bytes
+                and len(closed.split()) <= max_tokens
+            ):
+                return closed
+            # Closing the fence can exceed a tight budget. Fall through to the
+            # trimming path, which budgets both the fence and truncation note.
+            truncated = True
+        else:
+            return context
 
     # Truncated: ensure any open code fence is closed and budget is respected
     while kept_lines:
