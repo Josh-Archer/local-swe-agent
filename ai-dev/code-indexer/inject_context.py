@@ -193,7 +193,10 @@ def redact_secrets(text: str) -> str:
             try:
                 import yaml
 
-                root = yaml.compose(text, Loader=yaml.SafeLoader)
+                # libyaml's C loader is an order of magnitude faster; marks and
+                # node trees match the pure-Python loader.
+                loader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+                root = yaml.compose(text, Loader=loader)
                 edits = []
                 seen = set()
 
