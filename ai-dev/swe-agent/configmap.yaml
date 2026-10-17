@@ -263,45 +263,118 @@ data:
         """Redact secret keys, tokens, credentials, and private keys from text."""
         if not text:
             return ""
-        # Private key blocks
+
+        # 1. Private key blocks (full block: PKCS#1, PKCS#8, etc.)
         text = re.sub(
-            r"-----BEGIN [A-Z0-9_\s]+PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9_\s]+PRIVATE KEY-----",
+            r"-----BEGIN\s+(?:[A-Z0-9_\s]*PRIVATE KEY)-----[\s\S]*?-----END\s+(?:[A-Z0-9_\s]*PRIVATE KEY)-----",
             "[REDACTED_PRIVATE_KEY]",
             text,
         )
+        # Private key blocks split across chunks: BEGIN onward if no END in chunk
         text = re.sub(
-            r"-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----",
+            r"-----BEGIN\s+(?:[A-Z0-9_\s]*PRIVATE KEY)-----[\s\S]*$",
+            "[REDACTED_PRIVATE_KEY]",
+            text,
+        )
+        # Private key blocks split across chunks: END tail without BEGIN in chunk
+        text = re.sub(
+            r"^[\s\S]*?-----END\s+(?:[A-Z0-9_\s]*PRIVATE KEY)-----",
+            "[REDACTED_PRIVATE_KEY]",
+            text,
+        )
+
+        # 2. Certificate blocks (full, or split)
+        text = re.sub(
+            r"-----BEGIN\s+(?:[A-Z0-9_\s]*CERTIFICATE)-----[\s\S]*?-----END\s+(?:[A-Z0-9_\s]*CERTIFICATE)-----",
             "[REDACTED_CERTIFICATE]",
             text,
         )
-        # Synthetic QA fake keys
-        text = re.sub(r"\bQAFAKE[A-Za-z0-9_\-]*\b", "[REDACTED_SECRET]", text)
-        # AWS access keys
+        text = re.sub(
+            r"-----BEGIN\s+(?:[A-Z0-9_\s]*CERTIFICATE)-----[\s\S]*$",
+            "[REDACTED_CERTIFICATE]",
+            text,
+        )
+        text = re.sub(
+            r"^[\s\S]*?-----END\s+(?:[A-Z0-9_\s]*CERTIFICATE)-----",
+            "[REDACTED_CERTIFICATE]",
+            text,
+        )
+
+        # 3. AWS access keys
         text = re.sub(r"\b(AKIA|ABIA|ACCA|ASIA)[0-9A-Z]{16}\b", "[REDACTED_AWS_KEY]", text)
-        # GitHub tokens
+
+        # 4. GitHub tokens
         text = re.sub(
             r"\b(gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b",
             "[REDACTED_GITHUB_TOKEN]",
             text,
         )
-        # Slack tokens
+
+        # 5. Slack tokens
         text = re.sub(r"\bxox[baprs]-[0-9A-Za-z\-]{10,}\b", "[REDACTED_SLACK_TOKEN]", text)
-        # Bearer tokens
+
+        # 6. Authorization headers (token or Bearer)
         text = re.sub(
-            r"(?i)\b(bearer\s+)[A-Za-z0-9_\-\.]{16,}\b",
+            r"(?i)\b(authorization\s*:\s*(?:bearer|token)\s+)[^\s\r\n]+",
             r"\g<1>[REDACTED_TOKEN]",
             text,
         )
-        secret_keys = (
-            r"api[_-]?key|apikey|secret[_-]?key|client[_-]?secret|"
-            r"access[_-]?token|auth[_-]?token|password|passwd|private[_-]?key"
-        )
+        # Standalone Bearer tokens
         text = re.sub(
-            rf"""(?i)\b({secret_keys})\b(\s*[:=]\s*['"]?)([^'"\s\n\r]{{6,}})(['"]?)""",
-            r"\g<1>\g<2>[REDACTED_SECRET]\g<4>",
+            r"(?i)\b(bearer\s+)[A-Za-z0-9_\-\.]{8,}\b",
+            r"\g<1>[REDACTED_TOKEN]",
             text,
         )
+
+        # 7. Key-value secrets
+        # Catches:
+        # - bare token, secret, password, passwd, apikey, api_key, api_token
+        # - aws_secret_access_key, aws_access_key_id
+        # - prefixed KEY-style names (GITHUB_TOKEN=, DB_PASSWORD=, *_SECRET, *_KEY, etc.)
+        # - JSON keys with quotes ("password":, 'api_token':)
+        key_names = (
+            r"token|secret|password|passwd|apikey|api_key|api_token|"
+            r"secret_key|client_secret|access_token|auth_token|private_key|"
+            r"aws_secret_access_key|aws_access_key_id|"
+            r"[a-zA-Z0-9_]+_(?:token|secret|password|passwd|key|apikey|keys)"
+        )
+
+        def _replace_kv(m: re.Match) -> str:
+            prefix = m.group(1)
+            key = m.group(2)
+            sep = m.group(3)
+            quote = m.group(4)
+            val = m.group(5) if quote else m.group(6)
+            if val and val.startswith("[REDACTED_"):
+                return m.group(0)
+            if quote:
+                return f"{prefix}{key}{sep}{quote}[REDACTED_SECRET]{quote}"
+            return f"{prefix}{key}{sep}[REDACTED_SECRET]"
+
+        kv_pattern = (
+            rf"""(?i)(^|[^a-zA-Z0-9_])(['"]?(?:{key_names})['"]?)(\s*[:=]\s*)"""
+            r"""(?:(['"])(.*?)\4|([^\s"',;\r\n]+))"""
+        )
+        text = re.sub(kv_pattern, _replace_kv, text)
+
         return text
+
+
+    def _find_unclosed_fence(lines: List[str]) -> Optional[Tuple[str, str]]:
+        """Return (indent, fence_marker) if lines end inside an unclosed markdown fence."""
+        open_fence: Optional[Tuple[str, str]] = None
+        for line in lines:
+            stripped = line.strip()
+            m = re.match(r"^(\s*)(`{3,}|~{3,})", line)
+            if m:
+                indent = m.group(1)
+                marker = m.group(2)
+                is_closing_fence = stripped == marker
+                if open_fence is None:
+                    open_fence = (indent, marker)
+                elif is_closing_fence and marker.startswith(open_fence[1]):
+                    open_fence = None
+        return open_fence
 
 
     def enforce_context_budget(
@@ -309,7 +382,7 @@ data:
         max_bytes: Optional[int] = None,
         max_tokens: Optional[int] = None,
     ) -> str:
-        """Trim context to satisfy byte and token budgets."""
+        """Trim context to satisfy byte and token budgets while preserving newlines and closing fences."""
         if not context or not context.strip():
             return ""
 
@@ -328,18 +401,23 @@ data:
                 else DEFAULT_MAX_INJECT_TOKENS
             )
 
-        # Fast path if within limits
+        # Fast path if within limits and fences are closed
         encoded = context.encode("utf-8")
         words = context.split()
-        if len(encoded) <= max_bytes and len(words) <= max_tokens:
+        lines = context.splitlines(keepends=True)
+        if (
+            len(encoded) <= max_bytes
+            and len(words) <= max_tokens
+            and _find_unclosed_fence(lines) is None
+        ):
             return context
 
-        # If exceeding budgets, trim line by line
-        lines = context.splitlines(keepends=True)
         kept_lines: List[str] = []
         current_bytes = 0
         current_words = 0
         truncated = False
+
+        trunc_comment = "\n\n<!-- Context truncated to stay within budget -->"
 
         for line in lines:
             line_bytes = len(line.encode("utf-8"))
@@ -348,15 +426,43 @@ data:
                 current_words + line_words > max_tokens
             ):
                 truncated = True
+                if not kept_lines:
+                    # Truncate oversized single line to fit
+                    max_slice = max(0, max_bytes - len(trunc_comment.encode("utf-8")) - 10)
+                    raw = line.encode("utf-8")[:max_slice].decode("utf-8", errors="ignore")
+                    if raw:
+                        kept_lines.append(raw)
                 break
             kept_lines.append(line)
             current_bytes += line_bytes
             current_words += line_words
 
-        trimmed = "".join(kept_lines).rstrip()
-        if truncated:
-            trimmed += "\n\n<!-- Context truncated to stay within budget -->"
-        return trimmed
+        if not truncated and len(encoded) <= max_bytes and len(words) <= max_tokens:
+            open_fence = _find_unclosed_fence(kept_lines)
+            if open_fence:
+                close_str = f"\n{open_fence[0]}{open_fence[1]}\n"
+                return ("".join(kept_lines).rstrip() + close_str).strip()
+            return context
+
+        # Truncated: ensure any open code fence is closed and budget is respected
+        while kept_lines:
+            open_fence = _find_unclosed_fence(kept_lines)
+            close_fence = f"\n{open_fence[0]}{open_fence[1]}" if open_fence else ""
+            suffix = f"{close_fence}{trunc_comment}"
+            suffix_bytes = len(suffix.encode("utf-8"))
+            suffix_words = len(suffix.split())
+
+            current_bytes = len("".join(kept_lines).encode("utf-8"))
+            current_words = len("".join(kept_lines).split())
+
+            if (current_bytes + suffix_bytes <= max_bytes) and (
+                current_words + suffix_words <= max_tokens
+            ):
+                trimmed = "".join(kept_lines).rstrip() + suffix
+                return trimmed
+            kept_lines.pop()
+
+        return trunc_comment.strip()
 
 
     def _context_already_present(block_text: str, context: str) -> bool:
@@ -536,21 +642,18 @@ data:
     LIMIT="${RAG_TOP_K:-5}"
     REPO_FILTER="${RAG_REPO:-${GITHUB_REPO:-}}"
 
-    echo "Querying $QURL (top_k=$LIMIT, repo=${REPO_FILTER:-all})..."
-    if [ -n "$REPO_FILTER" ]; then
-      python3 /app/index_code.py \
-        --query "$QUERY" \
-        --qdrant-url "$QURL" \
-        --limit "$LIMIT" \
-        --repo "$REPO_FILTER" \
-        --output "$OUT"
-    else
-      python3 /app/index_code.py \
-        --query "$QUERY" \
-        --qdrant-url "$QURL" \
-        --limit "$LIMIT" \
-        --output "$OUT"
+    if [ -z "$REPO_FILTER" ]; then
+      echo "No repository specified; skipping RAG retrieval to prevent cross-repo leakage."
+      exit 0
     fi
+
+    echo "Querying $QURL (top_k=$LIMIT, repo=$REPO_FILTER)..."
+    python3 /app/index_code.py \
+      --query "$QUERY" \
+      --qdrant-url "$QURL" \
+      --limit "$LIMIT" \
+      --repo "$REPO_FILTER" \
+      --output "$OUT"
 
     if [ -s "$OUT" ]; then
       echo "Wrote retrieved context to $OUT"
@@ -849,7 +952,7 @@ data:
           if [[ -n "$repo_filter" ]]; then
             run_retriever "$repo_filter" || true
           else
-            run_retriever "" || true
+            echo "Note: no repository filter specified; skipping RAG retrieval."
           fi
         else
           echo "Note: retrieval query is empty; skipping RAG retrieval."

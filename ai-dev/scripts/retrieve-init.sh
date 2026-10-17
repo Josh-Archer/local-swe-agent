@@ -53,21 +53,18 @@ QURL="${QDRANT_URL:-http://qdrant.ai-dev.svc.cluster.local:6333}"
 LIMIT="${RAG_TOP_K:-5}"
 REPO_FILTER="${RAG_REPO:-${GITHUB_REPO:-}}"
 
-echo "Querying $QURL (top_k=$LIMIT, repo=${REPO_FILTER:-all})..."
-if [ -n "$REPO_FILTER" ]; then
-  python3 /app/index_code.py \
-    --query "$QUERY" \
-    --qdrant-url "$QURL" \
-    --limit "$LIMIT" \
-    --repo "$REPO_FILTER" \
-    --output "$OUT"
-else
-  python3 /app/index_code.py \
-    --query "$QUERY" \
-    --qdrant-url "$QURL" \
-    --limit "$LIMIT" \
-    --output "$OUT"
+if [ -z "$REPO_FILTER" ]; then
+  echo "No repository specified; skipping RAG retrieval to prevent cross-repo leakage."
+  exit 0
 fi
+
+echo "Querying $QURL (top_k=$LIMIT, repo=$REPO_FILTER)..."
+python3 /app/index_code.py \
+  --query "$QUERY" \
+  --qdrant-url "$QURL" \
+  --limit "$LIMIT" \
+  --repo "$REPO_FILTER" \
+  --output "$OUT"
 
 if [ -s "$OUT" ]; then
   echo "Wrote retrieved context to $OUT"

@@ -711,6 +711,50 @@ exec "{_bash_path(Path(real_git))}" "$@"
         assert len(calls) == 1
         assert "--repo target-repo" in calls[0]
 
+    def test_retrieve_init_skips_when_no_repo_set(self, tmp_path):
+        """retrieve-init.sh must skip retrieval and not call index_code when no repo is set (B1)."""
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        fake_app = tmp_path / "app"
+        fake_app.mkdir()
+        log = tmp_path / "calls.log"
+
+        indexer_stub = fake_app / "index_code.py"
+        indexer_stub.write_text(
+            f"#!/usr/bin/env python3\n"
+            f"import sys\n"
+            f"from pathlib import Path\n"
+            f"Path({str(log)!r}).open('a').write(' '.join(sys.argv[1:]) + '\\n')\n",
+            encoding="utf-8",
+        )
+        indexer_stub.chmod(0o755)
+
+        py_stub = fake_bin / "python3"
+        py_stub.write_text(
+            f'#!/bin/sh\nexec /usr/bin/python3 {str(indexer_stub)} "$@"\n',
+            encoding="utf-8",
+        )
+        py_stub.chmod(0o755)
+
+        script = AI_DEV / "scripts" / "retrieve-init.sh"
+        env = {
+            "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
+            "ENABLE_RAG": "true",
+            "RETRIEVAL_QUERY": "query text",
+            "RAG_REPO": "",
+            "GITHUB_REPO": "",
+            "RAG_TOP_K": "5",
+        }
+        res = subprocess.run(
+            ["sh", str(script)],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert res.returncode == 0, res.stdout + res.stderr
+        assert "No repository specified; skipping RAG retrieval" in res.stdout
+        assert not log.exists()
+
     def test_retrieve_init_and_configmap_do_not_contain_fallback(self):
         """retrieve-init.sh and run-swe-agent.sh must not contain fallback text."""
         init_text = (AI_DEV / "scripts" / "retrieve-init.sh").read_text(

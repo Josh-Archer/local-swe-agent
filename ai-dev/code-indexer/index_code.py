@@ -33,6 +33,7 @@ from inject_context import inject_context_into_system_template, redact_secrets
 MAX_TOP_K: int = 25
 DEFAULT_MAX_CONTEXT_BYTES: int = 16384  # 16 KiB
 DEFAULT_MAX_CONTEXT_TOKENS: int = 2048
+DEFAULT_MAX_CHUNK_BYTES: int = 8192
 DEFAULT_MAX_CHUNK_TOKENS: int = 512
 
 SECRET_FILE_PATTERNS = [
@@ -42,13 +43,23 @@ SECRET_FILE_PATTERNS = [
     r"(^|/)\.env(\.[a-zA-Z0-9_\-]+)?$",
     r"(^|/)[a-zA-Z0-9_\-]*\.env$",
     r"(^|/)keys?(\.(yaml|yml|json|txt|pem|key))?$",
-    r"(^|/)[a-zA-Z0-9_\-]*(key|keys)\.(py|yaml|yml|json|txt|pem|key|sh)$",
+    r"(^|/)(?:[a-zA-Z0-9_\-]*[_\-\.])?(key|keys)\.(py|yaml|yml|json|txt|pem|key|sh)$",
     r"(^|/)[a-zA-Z0-9_\-]*_key\.(pem|key|pub)$",
     r"(^|/)id_(rsa|dsa|ecdsa|ed25519)(\.pub)?$",
     r"\.tfvars(\.json)?$",
     r"\.(pem|p12|pfx|pkcs12|keystore|key)$",
     r"(^|/)(token|tokens)\.(yaml|yml|json|txt)$",
     r"(^|/)(passwd|password|passwords)(\.(txt|yaml|yml|json))?$",
+    r"(^|/)\.npmrc$",
+    r"(^|/|\.)kubeconfig.*$",
+    r"(^|/)(\.kube|kube)/config(\.(yaml|yml|json))?$",
+    r"(^|/)\.?netrc$",
+    r"(^|/)\.?pypirc$",
+    r"(^|/)\.?htpasswd.*$",
+    r"(^|/)(\.docker|docker)/config\.json$",
+    r"(^|/)service[-_]account.*\.json$",
+    r"(^|/)(\.?aws/)?credentials.*$",
+    r"(^|/)aws_credentials(\..+)?$",
 ]
 
 
@@ -69,6 +80,36 @@ def is_secret_path(file_path: Union[str, Path]) -> bool:
         part in ("secrets", "credentials", ".ssh", ".gnupg", "private")
         for part in parts
     ):
+        return True
+    if any(part in (".kube", "kube") for part in parts) and (
+        name == "config" or name.startswith("config.") or name.startswith("kubeconfig")
+    ):
+        return True
+    if any(part in (".docker", "docker") for part in parts) and name == "config.json":
+        return True
+    if any(part in (".aws", "aws") for part in parts) and name in (
+        "credentials",
+        "config",
+    ):
+        return True
+
+    if name in (
+        ".npmrc",
+        ".netrc",
+        "netrc",
+        ".pypirc",
+        "pypirc",
+        "aws_credentials",
+        "kubeconfig",
+    ):
+        return True
+    if name.startswith("kubeconfig"):
+        return True
+    if name.startswith(".htpasswd") or name.startswith("htpasswd"):
+        return True
+    if (
+        name.startswith("service-account") or name.startswith("service_account")
+    ) and name.endswith(".json"):
         return True
 
     if re.search(r"(\b|_)secret(\b|_)", name, re.IGNORECASE) and p.suffix.lower() in (
@@ -95,7 +136,7 @@ def is_secret_content(content: str) -> bool:
         return False
     if re.search(r"^\s*kind:\s*Secret\b", content, re.MULTILINE):
         return True
-    if "-----BEGIN" in content and "PRIVATE KEY-----" in content:
+    if re.search(r"-----(BEGIN|END)\s+([A-Z0-9_\s]*PRIVATE KEY)-----", content):
         return True
     return False
 
@@ -1265,6 +1306,59 @@ class CodeIndexer:
         )
 
     @staticmethod
+    def truncate_snippet_content(
+        content: str,
+        max_bytes: int,
+        max_tokens: int,
+        truncation_marker: str = "\n... [chunk truncated to limit]",
+    ) -> Tuple[str, bool]:
+        """Truncate code snippet to fit within max_bytes and max_tokens.
+
+        Preserves newlines and indentation (does not flatten with .split()).
+        """
+        if not content:
+            return "", False
+
+        encoded = content.encode("utf-8")
+        words = content.split()
+        if len(encoded) <= max_bytes and len(words) <= max_tokens:
+            return content, False
+
+        marker_bytes = len(truncation_marker.encode("utf-8"))
+        marker_words = len(truncation_marker.split())
+        target_bytes = max(0, max_bytes - marker_bytes)
+        target_words = max(0, max_tokens - marker_words)
+
+        lines = content.splitlines(keepends=True)
+        kept_lines: List[str] = []
+        curr_bytes = 0
+        curr_words = 0
+
+        for line in lines:
+            line_bytes = len(line.encode("utf-8"))
+            line_words = len(line.split())
+            if (curr_bytes + line_bytes <= target_bytes) and (
+                curr_words + line_words <= target_words
+            ):
+                kept_lines.append(line)
+                curr_bytes += line_bytes
+                curr_words += line_words
+            else:
+                if not kept_lines:
+                    raw_line = line.encode("utf-8")[:target_bytes].decode(
+                        "utf-8", errors="ignore"
+                    )
+                    w = raw_line.split()
+                    if len(w) > target_words:
+                        raw_line = " ".join(w[:target_words])
+                    if raw_line:
+                        kept_lines.append(raw_line)
+                break
+
+        result = "".join(kept_lines).rstrip("\r\n") + truncation_marker
+        return result, True
+
+    @staticmethod
     def format_retrieved_context(
         chunks: List[Dict[str, Any]],
         max_tokens: Optional[int] = None,
@@ -1294,10 +1388,11 @@ class CodeIndexer:
             "The following code snippets were retrieved from the repository to assist in solving the issue:",
             "",
         ]
+        header_str = "\n".join(header_lines) + "\n"
+        current_bytes = len(header_str.encode("utf-8"))
+        current_words = len(header_str.split())
 
         snippet_blocks: List[str] = []
-        current_bytes = len("\n".join(header_lines).encode("utf-8"))
-        current_words = len(" ".join(header_lines).split())
         snippet_idx = 1
 
         for chunk in chunks:
@@ -1312,50 +1407,55 @@ class CodeIndexer:
             # Redact any secrets in snippet content before emission
             content = redact_secrets(content)
 
-            # Cap individual chunk content if single chunk is abnormally large
-            content_words = content.split()
-            if len(content_words) > DEFAULT_MAX_CHUNK_TOKENS:
-                content = (
-                    " ".join(content_words[:DEFAULT_MAX_CHUNK_TOKENS])
-                    + "\n... [chunk truncated to token limit]"
-                )
-
             repo = chunk.get("repository", "")
             repo_label = f"[{repo}] " if repo else ""
             start_line = chunk.get("start_line", 1)
             end_line = chunk.get("end_line", 1)
             score = chunk.get("score")
             lang = chunk.get("language", "")
-
             score_str = (
                 f" (relevance: {score:.3f})" if isinstance(score, (int, float)) else ""
             )
 
             # Determine fence length: at least 3, and strictly longer than any run of backticks in content
-            fence_len = 3
             runs = re.findall(r"`+", content)
+            fence_len = 3
             if runs:
                 fence_len = max(3, max(len(r) for r in runs) + 1)
             fence = "`" * fence_len
 
-            block_lines = [
-                f"### Snippet {snippet_idx}: {repo_label}`{file_path}` (lines {start_line}-{end_line}){score_str}",
-                f"{fence}{lang}",
+            snippet_head = (
+                f"### Snippet {snippet_idx}: {repo_label}`{file_path}` "
+                f"(lines {start_line}-{end_line}){score_str}\n{fence}{lang}\n"
+            )
+            snippet_tail = f"\n{fence}\n\n"
+
+            overhead_bytes = len(snippet_head.encode("utf-8")) + len(
+                snippet_tail.encode("utf-8")
+            )
+            overhead_words = len(snippet_head.split()) + len(snippet_tail.split())
+
+            if (current_bytes + overhead_bytes > max_bytes) or (
+                current_words + overhead_words > max_tokens
+            ):
+                break
+
+            rem_bytes = max_bytes - (current_bytes + overhead_bytes)
+            rem_words = max_tokens - (current_words + overhead_words)
+
+            allowed_bytes = min(rem_bytes, DEFAULT_MAX_CHUNK_BYTES)
+            allowed_tokens = min(rem_words, DEFAULT_MAX_CHUNK_TOKENS)
+
+            content, _ = CodeIndexer.truncate_snippet_content(
                 content,
-                fence,
-                "",
-            ]
-            block_str = "\n".join(block_lines)
+                max_bytes=allowed_bytes,
+                max_tokens=allowed_tokens,
+                truncation_marker="\n... [chunk truncated to limit]",
+            )
+
+            block_str = f"{snippet_head}{content}{snippet_tail}"
             block_bytes = len(block_str.encode("utf-8"))
             block_words = len(block_str.split())
-
-            # If adding this block exceeds max_bytes or max_tokens:
-            if snippet_blocks and (
-                current_bytes + block_bytes > max_bytes
-                or current_words + block_words > max_tokens
-            ):
-                # Budget exceeded, stop including further snippets
-                break
 
             snippet_blocks.append(block_str)
             current_bytes += block_bytes

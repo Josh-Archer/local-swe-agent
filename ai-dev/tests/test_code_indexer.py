@@ -1821,6 +1821,63 @@ class TestTopKCappingAndBudgets:
         formatted = CodeIndexer.format_retrieved_context(huge_chunk)
         assert "chunk truncated" in formatted
 
+    def test_format_retrieved_context_enforces_budget_on_first_huge_snippet(self):
+        # 1,000,000-char single minified line
+        huge_chunk = [
+            {
+                "repository": "repo",
+                "file_path": "minified.js",
+                "start_line": 1,
+                "end_line": 1,
+                "content": "var x=" + ("a" * 1000000) + ";",
+            }
+        ]
+        formatted = CodeIndexer.format_retrieved_context(huge_chunk)
+        assert len(formatted.encode("utf-8")) <= DEFAULT_MAX_CONTEXT_BYTES
+        assert "chunk truncated" in formatted
+        assert formatted.endswith("```")
+
+    def test_format_retrieved_context_enforces_budget_on_500_large_words(self):
+        # 500 words of 2 KB each
+        content = " ".join(["x" * 2000 for _ in range(500)])
+        chunk = [
+            {
+                "repository": "repo",
+                "file_path": "bigwords.txt",
+                "start_line": 1,
+                "end_line": 10,
+                "content": content,
+            }
+        ]
+        formatted = CodeIndexer.format_retrieved_context(chunk)
+        assert len(formatted.encode("utf-8")) <= DEFAULT_MAX_CONTEXT_BYTES
+        assert "chunk truncated" in formatted
+        assert formatted.endswith("```")
+
+    def test_format_retrieved_context_preserves_newlines_and_indentation(self):
+        # 5,000-line snippet
+        code_lines = ["def compute():\n"] + [
+            f"    step_{i} = {i} * 2\n" for i in range(5000)
+        ]
+        content = "".join(code_lines)
+        chunk = [
+            {
+                "repository": "repo",
+                "file_path": "large_script.py",
+                "start_line": 1,
+                "end_line": 5001,
+                "language": "python",
+                "content": content,
+            }
+        ]
+        formatted = CodeIndexer.format_retrieved_context(chunk)
+        assert len(formatted.encode("utf-8")) <= DEFAULT_MAX_CONTEXT_BYTES
+        assert formatted.endswith("```")
+        # Ensure newlines and indentation were not flattened into space-delimited text
+        lines = formatted.splitlines()
+        assert len(lines) > 20
+        assert any(line.startswith("    step_") for line in lines)
+
     def test_inject_context_enforces_byte_budget(self):
         sample = "agent:\n  system_template: |\n    Original prompt.\n"
         huge_context = "## Relevant Code\n" + ("line of retrieved code\n" * 500)
@@ -1830,6 +1887,20 @@ class TestTopKCappingAndBudgets:
         loaded = yaml.safe_load(updated)
         template = loaded["agent"]["system_template"]
         assert "Context truncated to stay within budget" in template
+
+    def test_enforce_context_budget_closes_open_code_fence(self):
+        from inject_context import enforce_context_budget
+
+        unclosed = (
+            "## Relevant Code Context\n"
+            "```python\n"
+            "for item in items:\n"
+            "    process(item)\n" * 100
+        )
+        capped = enforce_context_budget(unclosed, max_bytes=350)
+        assert len(capped.encode("utf-8")) <= 350
+        assert "<!-- Context truncated to stay within budget -->" in capped
+        assert "```\n\n<!-- Context truncated to stay within budget -->" in capped
 
 
 class TestSecretDenylistAndRedaction:
@@ -1858,6 +1929,20 @@ class TestSecretDenylistAndRedaction:
             "prod.tfvars.json",
             "secrets/database.yaml",
             "credentials/google.json",
+            ".npmrc",
+            "kubeconfig",
+            "KUBECONFIG",
+            "k8s/kubeconfig.yaml",
+            "kube/config",
+            ".kube/config",
+            ".netrc",
+            ".pypirc",
+            ".htpasswd",
+            "htpasswd",
+            ".docker/config.json",
+            "service-account.json",
+            "service-account-prod.json",
+            "aws_credentials",
         ],
     )
     def test_is_secret_path_denylist(self, secret_path):
@@ -1872,6 +1957,10 @@ class TestSecretDenylistAndRedaction:
             "ai-dev/tests/test_code_indexer.py",
             "keyboard_handler.py",
             "monkeypatch.py",
+            "src/monkey.py",
+            "src/hotkeys.py",
+            "monkey.py",
+            "hotkeys.py",
         ],
     )
     def test_is_secret_path_safe_files(self, safe_path):
@@ -1880,6 +1969,9 @@ class TestSecretDenylistAndRedaction:
     def test_is_secret_content(self):
         assert is_secret_content("apiVersion: v1\nkind: Secret\n") is True
         assert is_secret_content("-----BEGIN RSA PRIVATE KEY-----\n") is True
+        assert is_secret_content("-----BEGIN PRIVATE KEY-----\n") is True
+        assert is_secret_content("-----END PRIVATE KEY-----\n") is True
+        assert is_secret_content("-----END RSA PRIVATE KEY-----\n") is True
         assert is_secret_content("def run(): pass") is False
 
     def test_should_index_file_blocks_secret_paths(
@@ -1943,28 +2035,61 @@ class TestSecretDenylistAndRedaction:
 
     def test_redact_secrets_patterns(self):
         text = (
-            "QAFAKE_SECRET_KEY_12345\n"
-            "api_key = 'abcdef123456'\n"
-            "password: 'hunter2password'\n"
-            "AKIAIOSFODNN7EXAMPLE\n"
-            "ghp_123456789012345678901234567890123456\n"
-            "xoxb-1234567890-1234567890123\n"
+            "token=abcdef123456\n"
+            "GITHUB_TOKEN=ghp_123456789012345678901234567890123456\n"
+            "PUSHOVER_TOKEN=xyz789\n"
+            "DB_PASSWORD=hunter2password\n"
+            "MY_SECRET=supersecretval\n"
+            "APP_KEY=secret_app_key\n"
+            "api_token: secret_api_token\n"
+            '{"password": "hunter2password", "api_token": "tokenval"}\n'
+            "secret=some_secret_value\n"
+            "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n"
+            "password=abc12\n"
+            "Authorization: token gh_auth_token_123\n"
             "Authorization: Bearer my_very_secret_token_12345\n"
-            "-----BEGIN RSA PRIVATE KEY-----\nMIIEogIBAAKCAQEA...\n-----END RSA PRIVATE KEY-----\n"
+            "AKIAIOSFODNN7EXAMPLE\n"
+            "xoxb-1234567890-1234567890123\n"
+            "-----BEGIN PRIVATE KEY-----\nMIIEogIBAAKCAQEA...\n-----END PRIVATE KEY-----\n"
         )
         redacted = redact_secrets(text)
-        assert "QAFAKE" not in redacted
         assert "abcdef123456" not in redacted
-        assert "hunter2password" not in redacted
-        assert "AKIAIOSFODNN7EXAMPLE" not in redacted
         assert "ghp_1234567890" not in redacted
-        assert "xoxb-" not in redacted
+        assert "xyz789" not in redacted
+        assert "hunter2password" not in redacted
+        assert "supersecretval" not in redacted
+        assert "secret_app_key" not in redacted
+        assert "secret_api_token" not in redacted
+        assert "some_secret_value" not in redacted
+        assert "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" not in redacted
+        assert "abc12" not in redacted
+        assert "gh_auth_token_123" not in redacted
         assert "my_very_secret_token_12345" not in redacted
+        assert "AKIAIOSFODNN7EXAMPLE" not in redacted
+        assert "xoxb-" not in redacted
         assert "MIIEogIBAAKCAQEA" not in redacted
         assert "[REDACTED_SECRET]" in redacted
         assert "[REDACTED_AWS_KEY]" in redacted
         assert "[REDACTED_GITHUB_TOKEN]" in redacted
         assert "[REDACTED_PRIVATE_KEY]" in redacted
+        assert "[REDACTED_TOKEN]" in redacted
+
+    def test_redact_secrets_split_private_keys(self):
+        # BEGIN without END in chunk (redact from BEGIN onward)
+        chunk_begin = "def get_key():\n    # Key begins here\n    -----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkq...\n"
+        redacted_begin = redact_secrets(chunk_begin)
+        assert "-----BEGIN PRIVATE KEY-----" not in redacted_begin
+        assert "MIIEvgIBADANBgkq" not in redacted_begin
+        assert "[REDACTED_PRIVATE_KEY]" in redacted_begin
+        assert "def get_key():" in redacted_begin
+
+        # END tail without BEGIN in chunk (redact from start up to END)
+        chunk_end = "MIIEvgIBADANBgkq...\n-----END PRIVATE KEY-----\n    return key\n"
+        redacted_end = redact_secrets(chunk_end)
+        assert "-----END PRIVATE KEY-----" not in redacted_end
+        assert "MIIEvgIBADANBgkq" not in redacted_end
+        assert "[REDACTED_PRIVATE_KEY]" in redacted_end
+        assert "return key" in redacted_end
 
     def test_format_retrieved_context_redacts_secrets(self):
         chunks = [
@@ -1973,11 +2098,11 @@ class TestSecretDenylistAndRedaction:
                 "file_path": "src/auth.py",
                 "start_line": 1,
                 "end_line": 5,
-                "content": "QAFAKE_TEST_TOKEN = 'xyz'\napi_key: 'topsecretkey123'\n",
+                "content": "DB_PASSWORD = 'xyz'\napi_key: 'topsecretkey123'\n",
             }
         ]
         formatted = CodeIndexer.format_retrieved_context(chunks)
-        assert "QAFAKE_TEST_TOKEN" not in formatted
+        assert "xyz" not in formatted
         assert "topsecretkey123" not in formatted
         assert "[REDACTED_SECRET]" in formatted
 
