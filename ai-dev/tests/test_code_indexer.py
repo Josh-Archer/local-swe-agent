@@ -202,6 +202,153 @@ class TestCodeChunking:
         common = lines_chunk0 & lines_chunk1
         assert len(common) == 2
 
+    def test_chunk_to_embedder_window(self, in_memory_qdrant, mock_embedding_model):
+        """Test that chunks fit the embedder context window (Issue #17)."""
+        mock_embedding_model.max_seq_length = 256
+        indexer = CodeIndexer(
+            config_path={},
+            qdrant_client=in_memory_qdrant,
+            embedding_model=mock_embedding_model,
+        )
+        assert indexer.chunk_size == 256
+        # Generate code with 500 lines that would exceed context window if chunked by 500 lines
+        lines = [f"x_{i} = calculate_value({i}, arg=True)" for i in range(500)]
+        content = "\n".join(lines)
+        chunks = indexer.chunk_code(content, "test.py")
+
+        assert len(chunks) > 1
+        for chunk in chunks:
+            token_count = indexer.count_tokens(chunk["content"])
+            assert token_count <= indexer.chunk_size
+            assert chunk["start_line"] <= chunk["end_line"]
+
+    def test_chunk_capping_to_embedder_window(
+        self, in_memory_qdrant, mock_embedding_model
+    ):
+        """Test that oversized chunk_size config is capped to embedder window (Issue #17)."""
+        mock_embedding_model.max_seq_length = 256
+        config = {
+            "indexing": {
+                "chunk_size": 1000,
+                "chunk_overlap": 50,
+            }
+        }
+        indexer = CodeIndexer(
+            config_path=config,
+            qdrant_client=in_memory_qdrant,
+            embedding_model=mock_embedding_model,
+        )
+        # Must be capped to 256 (the embedder window)
+        assert indexer.chunk_size == 256
+        assert indexer.chunk_overlap == 50
+
+    def test_chunk_with_custom_tokenizer(
+        self, mock_config, in_memory_qdrant, mock_embedding_model
+    ):
+        """Test chunking with a custom tokenizer (Issue #17)."""
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.encode.side_effect = lambda text, **kwargs: [1] * len(
+            text.split()
+        )
+
+        indexer = CodeIndexer(
+            config_path=mock_config,
+            qdrant_client=in_memory_qdrant,
+            embedding_model=mock_embedding_model,
+            tokenizer=mock_tokenizer,
+        )
+        indexer.chunk_size = 10
+        indexer.chunk_overlap = 2
+
+        # 5 words per line -> each line is 5 tokens
+        lines = [f"word1 word2 word3 word4 line_{i}" for i in range(10)]
+        content = "\n".join(lines)
+        chunks = indexer.chunk_code(content, "test.py")
+
+        assert len(chunks) > 1
+        for chunk in chunks:
+            assert indexer.count_tokens(chunk["content"]) <= 10
+
+    def test_chunk_splits_long_single_line(
+        self, mock_config, in_memory_qdrant, mock_embedding_model
+    ):
+        """Test that an unusually long single line is split into sub-chunks (Issue #17)."""
+        indexer = CodeIndexer(
+            config_path=mock_config,
+            qdrant_client=in_memory_qdrant,
+            embedding_model=mock_embedding_model,
+        )
+        indexer.chunk_size = 20
+        indexer.chunk_overlap = 5
+        # Single line with 50 words
+        long_line = " ".join([f"var_{i}" for i in range(50)])
+        chunks = indexer.chunk_code(long_line, "long.py")
+
+        assert len(chunks) >= 3
+        for chunk in chunks:
+            assert chunk["start_line"] == 1
+            assert chunk["end_line"] == 1
+            assert indexer.count_tokens(chunk["content"]) <= 20
+
+    def test_chunk_empty_and_whitespace(
+        self, mock_config, in_memory_qdrant, mock_embedding_model
+    ):
+        """Test that empty or whitespace-only code returns no chunks."""
+        indexer = CodeIndexer(
+            config_path=mock_config,
+            qdrant_client=in_memory_qdrant,
+            embedding_model=mock_embedding_model,
+        )
+        assert indexer.chunk_code("", "empty.py") == []
+        assert indexer.chunk_code("   \n\n\t  \n  ", "whitespace.py") == []
+
+    def test_chunk_real_tokenizer_integration(self, in_memory_qdrant):
+        """Test token-aware chunking with real transformers AutoTokenizer if available."""
+        try:
+            from transformers import AutoTokenizer
+
+            tokenizer = AutoTokenizer.from_pretrained(
+                "sentence-transformers/all-MiniLM-L6-v2", local_files_only=True
+            )
+        except Exception:
+            pytest.skip("Local HuggingFace model cache not available")
+
+        model = MagicMock()
+        model.max_seq_length = 256
+        model.encode.return_value = MagicMock(tolist=lambda: [0.1] * 384)
+        model.get_sentence_embedding_dimension.return_value = 384
+
+        indexer = CodeIndexer(
+            config_path={},
+            qdrant_client=in_memory_qdrant,
+            embedding_model=model,
+            tokenizer=tokenizer,
+        )
+        assert indexer.chunk_size == 256
+
+        # Multi-line python function repeated to exceed 256 tokens
+        sample = """def calculate_metrics(values):
+    total = sum(values)
+    count = len(values)
+    mean = total / count if count > 0 else 0
+    return {
+        'total': total,
+        'count': count,
+        'mean': mean,
+    }
+""" * 10
+        chunks = indexer.chunk_code(sample, "metrics.py")
+        assert len(chunks) > 1
+        for chunk in chunks:
+            token_count = len(
+                tokenizer.encode(chunk["content"], add_special_tokens=False)
+            )
+            assert token_count <= 254
+            full_encoded = len(
+                tokenizer.encode(chunk["content"], add_special_tokens=True)
+            )
+            assert full_encoded <= 256
+
 
 class TestFileFiltering:
     """Test file filtering logic."""
@@ -419,8 +566,8 @@ class TestConfigValidation:
             embedding_model=mock_embedding_model,
         )
         assert indexer.collection_name == "code_embeddings"
-        assert indexer.chunk_size == 500
-        assert indexer.chunk_overlap == 50
+        assert indexer.chunk_size == 256
+        assert indexer.chunk_overlap == 32
 
     def test_invalid_vector_size(self, in_memory_qdrant, mock_embedding_model):
         """Test handling vector size."""

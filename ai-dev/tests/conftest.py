@@ -34,8 +34,8 @@ def sample_config():
         },
         "embedding": {"model": "all-MiniLM-L6-v2", "batch_size": 32, "max_length": 512},
         "indexing": {
-            "chunk_size": 500,
-            "chunk_overlap": 50,
+            "chunk_size": 256,
+            "chunk_overlap": 32,
             "file_extensions": [".py", ".js", ".ts", ".java", ".go"],
             "exclude_patterns": [
                 "__pycache__",

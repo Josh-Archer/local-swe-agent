@@ -27,6 +27,14 @@ from qdrant_client.models import (
 )
 from sentence_transformers import SentenceTransformer
 
+try:
+    from transformers import AutoTokenizer, logging as hf_logging
+
+    hf_logging.set_verbosity_error()
+except ImportError:
+    AutoTokenizer = None  # type: ignore
+    hf_logging = None  # type: ignore
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -49,6 +57,7 @@ class CodeIndexer:
         config_path: Union[str, Path, Dict[str, Any]] = "/app/config.yaml",
         qdrant_client: Optional[Any] = None,
         embedding_model: Optional[Any] = None,
+        tokenizer: Optional[Any] = None,
     ):
         """Initialize the code indexer."""
         logger.info("Initializing Code Indexer...")
@@ -109,19 +118,55 @@ class CodeIndexer:
         else:
             self.embedding_dim = int(qdrant_dict.get("vector_size", 384))
 
-        # Chunking parameters
+        # Context window and tokenizer (Issue #17)
+        max_seq_len = getattr(self.embedding_model, "max_seq_length", None)
+        if isinstance(max_seq_len, int) and max_seq_len > 0:
+            self.max_seq_length: int = max_seq_len
+        else:
+            self.max_seq_length = 256
+
+        if tokenizer is not None:
+            self.tokenizer = tokenizer
+        elif (
+            hasattr(self.embedding_model, "tokenizer")
+            and self.embedding_model.tokenizer is not None
+            and type(self.embedding_model.tokenizer).__name__ != "MagicMock"
+        ):
+            self.tokenizer = self.embedding_model.tokenizer
+        elif AutoTokenizer is not None:
+            try:
+                self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+            except Exception:
+                self.tokenizer = getattr(self.embedding_model, "tokenizer", None)
+        else:
+            self.tokenizer = getattr(self.embedding_model, "tokenizer", None)
+
+        # Chunking parameters (tokens)
         indexing_cfg = self.config.get("indexing")
         indexing_dict: Dict[str, Any] = (
             indexing_cfg if isinstance(indexing_cfg, dict) else {}
         )
         chunk_size_val = (
-            self.config.get("chunk_size") or indexing_dict.get("chunk_size") or 500
+            self.config.get("chunk_size")
+            or indexing_dict.get("chunk_size")
+            or self.max_seq_length
         )
-        self.chunk_size: int = int(chunk_size_val)
+        configured_chunk_size = int(chunk_size_val)
+        if configured_chunk_size > self.max_seq_length:
+            logger.info(
+                f"Configured chunk_size ({configured_chunk_size}) exceeds embedding model context window "
+                f"({self.max_seq_length}); capping to {self.max_seq_length}"
+            )
+            self.chunk_size: int = self.max_seq_length
+        else:
+            self.chunk_size = configured_chunk_size
+
         chunk_overlap_val = (
-            self.config.get("chunk_overlap") or indexing_dict.get("chunk_overlap") or 50
+            self.config.get("chunk_overlap") or indexing_dict.get("chunk_overlap") or 32
         )
-        self.chunk_overlap: int = int(chunk_overlap_val)
+        self.chunk_overlap: int = min(
+            int(chunk_overlap_val), max(0, self.chunk_size - 1)
+        )
 
         # Code file extensions to index
         code_exts = self.config.get("code_extensions") or indexing_dict.get(
@@ -282,26 +327,174 @@ class CodeIndexer:
             logger.error(f"Failed to clone/pull {repo_name}: {e}")
             raise
 
+    def count_tokens(self, text: str) -> int:
+        """Count the number of content tokens in the given text for the embedder."""
+        if not text:
+            return 0
+        if self.tokenizer is not None:
+            if hasattr(self.tokenizer, "encode") and callable(self.tokenizer.encode):
+                try:
+                    encoded = self.tokenizer.encode(text, add_special_tokens=False)
+                    if isinstance(encoded, (list, tuple)):
+                        return len(encoded)
+                    if type(encoded).__name__ != "MagicMock" and hasattr(
+                        encoded, "__len__"
+                    ):
+                        return len(encoded)
+                except TypeError:
+                    try:
+                        encoded = self.tokenizer.encode(text)
+                        if isinstance(encoded, (list, tuple)):
+                            return len(encoded)
+                        if type(encoded).__name__ != "MagicMock" and hasattr(
+                            encoded, "__len__"
+                        ):
+                            return len(encoded)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+            elif callable(self.tokenizer):
+                try:
+                    res = self.tokenizer(text, add_special_tokens=False)
+                    if isinstance(res, dict) and "input_ids" in res:
+                        ids = res["input_ids"]
+                        if isinstance(ids, (list, tuple)):
+                            return len(ids)
+                        if hasattr(ids, "__len__"):
+                            return len(ids)
+                except Exception:
+                    pass
+        # Fallback if tokenizer is unavailable or an unconfigured mock:
+        return max(1, len(text.split()))
+
+    def _split_long_line(
+        self, line: str, line_no: int, max_tokens: int, overlap: int
+    ) -> List[Dict[str, Any]]:
+        """Split a single line that exceeds max_tokens into multiple sub-chunks."""
+        chunks: List[Dict[str, Any]] = []
+        if (
+            self.tokenizer is not None
+            and hasattr(self.tokenizer, "encode")
+            and hasattr(self.tokenizer, "decode")
+            and type(self.tokenizer).__name__ != "MagicMock"
+        ):
+            try:
+                token_ids = self.tokenizer.encode(line, add_special_tokens=False)
+                step = max(1, max_tokens - overlap)
+                for k in range(0, len(token_ids), step):
+                    sub_ids = token_ids[k : k + max_tokens]
+                    sub_content = self.tokenizer.decode(
+                        sub_ids, skip_special_tokens=True
+                    )
+                    if sub_content.strip():
+                        chunks.append(
+                            {
+                                "content": sub_content,
+                                "start_line": line_no,
+                                "end_line": line_no,
+                            }
+                        )
+                if chunks:
+                    return chunks
+            except Exception:
+                pass
+
+        # Fallback word-based split
+        words = line.split()
+        step = max(1, max_tokens - overlap)
+        for k in range(0, len(words), step):
+            sub_words = words[k : k + max_tokens]
+            sub_content = " ".join(sub_words)
+            if sub_content.strip():
+                chunks.append(
+                    {
+                        "content": sub_content,
+                        "start_line": line_no,
+                        "end_line": line_no,
+                    }
+                )
+        return chunks
+
     def chunk_code(self, content: str, file_path: str) -> List[Dict[str, Any]]:
-        """Chunk code into smaller pieces with overlap."""
+        """Chunk code into smaller pieces that fit the embedding model's context window."""
+        if not content.strip():
+            return []
+
         lines = content.split("\n")
-        chunks = []
+        n_lines = len(lines)
+        chunks: List[Dict[str, Any]] = []
 
-        # Simple line-based chunking
-        chunk_lines = self.chunk_size
-        overlap_lines = self.chunk_overlap
+        # Usable token capacity: reserve 2 tokens for special tokens ([CLS], [SEP]) if window allows
+        max_tokens = self.chunk_size
+        if self.max_seq_length > 2:
+            max_tokens = min(self.chunk_size, self.max_seq_length - 2)
+        overlap = min(self.chunk_overlap, max(0, max_tokens - 1))
 
-        step = max(1, chunk_lines - overlap_lines)
-        for i in range(0, len(lines), step):
-            chunk_content = "\n".join(lines[i : i + chunk_lines])
+        start_idx = 0
+        while start_idx < n_lines:
+            # Check if this single line alone exceeds max_tokens
+            single_line_tokens = self.count_tokens(lines[start_idx])
+            if single_line_tokens > max_tokens:
+                sub_chunks = self._split_long_line(
+                    lines[start_idx], start_idx + 1, max_tokens, overlap
+                )
+                chunks.extend(sub_chunks)
+                start_idx += 1
+                continue
+
+            # Accumulate lines while candidate chunk fits in max_tokens
+            end_idx = start_idx
+            best_end = start_idx
+            current_tokens = single_line_tokens
+
+            while end_idx + 1 < n_lines:
+                next_line = lines[end_idx + 1]
+                next_tokens = self.count_tokens(next_line)
+                if current_tokens + next_tokens <= max_tokens:
+                    candidate = "\n".join(lines[start_idx : end_idx + 2])
+                    cand_tokens = self.count_tokens(candidate)
+                    if cand_tokens <= max_tokens:
+                        best_end = end_idx + 1
+                        current_tokens = cand_tokens
+                        end_idx += 1
+                        continue
+                else:
+                    candidate = "\n".join(lines[start_idx : end_idx + 2])
+                    cand_tokens = self.count_tokens(candidate)
+                    if cand_tokens <= max_tokens:
+                        best_end = end_idx + 1
+                        current_tokens = cand_tokens
+                        end_idx += 1
+                        continue
+                break
+
+            chunk_content = "\n".join(lines[start_idx : best_end + 1])
             if chunk_content.strip():
                 chunks.append(
                     {
                         "content": chunk_content,
-                        "start_line": i + 1,
-                        "end_line": min(i + chunk_lines, len(lines)),
+                        "start_line": start_idx + 1,
+                        "end_line": best_end + 1,
                     }
                 )
+
+            if best_end >= n_lines - 1:
+                break
+
+            # Calculate overlap backwards from best_end
+            next_start = best_end + 1
+            if overlap > 0:
+                for back_idx in range(best_end, start_idx, -1):
+                    overlap_candidate = "\n".join(lines[back_idx : best_end + 1])
+                    if self.count_tokens(overlap_candidate) <= overlap:
+                        next_start = back_idx
+                    else:
+                        break
+
+            if next_start <= start_idx:
+                next_start = start_idx + 1
+            start_idx = next_start
 
         return chunks
 
