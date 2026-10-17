@@ -17,6 +17,20 @@ DEFAULT_MAX_INJECT_BYTES: int = 16384  # 16 KiB default byte budget
 DEFAULT_MAX_INJECT_TOKENS: int = 2048  # Default token/word estimate budget
 
 
+def _sub_if(needles, pattern, repl, text):
+    """re.sub that skips the scan when no literal needle is present.
+
+    Needles are lowercase literals every match of ``pattern`` must contain
+    (patterns using them are case-insensitive), so skipping is exact.
+    """
+    lowered = text.casefold()
+    if isinstance(needles, str):
+        needles = (needles,)
+    if not any(needle in lowered for needle in needles):
+        return text
+    return re.sub(pattern, repl, text)
+
+
 def redact_secrets(text: str) -> str:
     """Redact secret keys, tokens, credentials, and private keys from text."""
     if not text:
@@ -102,23 +116,27 @@ def redact_secrets(text: str) -> str:
     text = re.sub(r"\bxox[baprs]-[0-9A-Za-z\-]{10,}\b", "[REDACTED_SLACK_TOKEN]", text)
 
     # 6. Credentials embedded in URLs and authorization headers.
-    text = re.sub(
+    text = _sub_if(
+        "://",
         r"(?i)\b([a-z][a-z0-9+.-]*://)([^:/\s@]*:)[^@/\s]+(@)",
         r"\g<1>\g<2>[REDACTED_SECRET]\g<3>",
         text,
     )
-    text = re.sub(
+    text = _sub_if(
+        "://",
         r"(?i)\b([a-z][a-z0-9+.-]*://)([^:/\s@]{16,})(@)",
         r"\g<1>[REDACTED_SECRET]\g<3>",
         text,
     )
-    text = re.sub(
+    text = _sub_if(
+        "authorization",
         r"(?i)\b(authorization\s*:\s*[a-z][a-z0-9_-]*\s+)[^\s\r\n,\"'`;}]+",
         r"\g<1>[REDACTED_TOKEN]",
         text,
     )
     # Standalone Bearer tokens
-    text = re.sub(
+    text = _sub_if(
+        "bearer",
         r"(?i)\b(bearer\s+)[A-Za-z0-9_\-\.]{8,}\b",
         r"\g<1>[REDACTED_TOKEN]",
         text,
@@ -321,12 +339,26 @@ def redact_secrets(text: str) -> str:
         r"api[-_]?key|x-api-key)"
     )
     expression_call = re.compile(r"\s*\(")
-    text = re.sub(
+    text = _sub_if(
+        "!!binary",
         rf"(?i)(?P<prefix>(?:\b{credential_names})\b[ \t]*:[ \t]*)!!binary[ \t]+[^\s,;}}]+",
         lambda match: match.group("prefix") + json.dumps("[REDACTED_SECRET]"),
         text,
     )
     quoted_value = r"""(?P<q>['"`])(?:\\.|(?!\1)[^\\])*?\1"""
+
+    identifier_re = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*")
+    json_scalar_re = re.compile(
+        r"(?:-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?|true|false|null)",
+        re.IGNORECASE,
+    )
+    yaml_scalar_re = re.compile(
+        r"(?:~|null|true|false|\.nan|[+-]?\.inf|"
+        r"[-+]?(?:0x[0-9a-f]+|0o[0-7]+|0b[01]+|"
+        r"[0-9]+(?:_[0-9]+)*(?:\.[0-9]+(?:_[0-9]+)*)?"
+        r"(?:[eE][+-]?[0-9]+)?))",
+        re.IGNORECASE,
+    )
 
     def replace_literal(match):
         value = match.group("value")
@@ -343,7 +375,7 @@ def redact_secrets(text: str) -> str:
             quote = value[0]
             return match.group("prefix") + quote + "[REDACTED_SECRET]" + quote
         # Expressions and identifiers are source code, not literal credentials.
-        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*", value):
+        if identifier_re.fullmatch(value):
             key = (
                 match.group("prefix")
                 .split("=", 1)[0]
@@ -383,19 +415,8 @@ def redact_secrets(text: str) -> str:
             # Keep YAML/JSON scalar types intact. Structural redaction only
             # targets strings; this also protects their unquoted spellings
             # from the mixed-code fallback below.
-            json_scalar = re.fullmatch(
-                r"(?:-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?|true|false|null)",
-                value,
-                re.IGNORECASE,
-            )
-            yaml_scalar = re.fullmatch(
-                r"(?:~|null|true|false|\.nan|[+-]?\.inf|"
-                r"[-+]?(?:0x[0-9a-f]+|0o[0-7]+|0b[01]+|"
-                r"[0-9]+(?:_[0-9]+)*(?:\.[0-9]+(?:_[0-9]+)*)?"
-                r"(?:[eE][+-]?[0-9]+)?))",
-                value,
-                re.IGNORECASE,
-            )
+            json_scalar = json_scalar_re.fullmatch(value)
+            yaml_scalar = yaml_scalar_re.fullmatch(value)
             if json_scalar or (":" in match.group("prefix") and yaml_scalar):
                 return match.group(0)
         if expression_call.match(text, match.end()):
@@ -461,7 +482,8 @@ def redact_secrets(text: str) -> str:
         text,
     )
 
-    text = re.sub(
+    text = _sub_if(
+        "pgpassword",
         r"(?i)\bPGPASSWORD[ \t]*=[ \t]*(?P<value>[^\s;]+)",
         lambda match: (
             match.group(0)
@@ -482,12 +504,14 @@ def redact_secrets(text: str) -> str:
         ),
         text,
     )
-    text = re.sub(
+    text = _sub_if(
+        ("sshpass", "docker"),
         r"(?i)(sshpass\s+-p\s+|docker\s+login\b[^\n]*?\s-p\s+)([^\s]+)",
         r"\1[REDACTED_SECRET]",
         text,
     )
-    text = re.sub(
+    text = _sub_if(
+        "curl",
         r"(?i)(curl\s+[^\n]*?(?:--user|-u)\s+[^:\s]+:)([^\s'\"`]+)",
         r"\1[REDACTED_SECRET]",
         text,
@@ -497,34 +521,40 @@ def redact_secrets(text: str) -> str:
         r"\1[REDACTED_SECRET]",
         text,
     )
-    text = re.sub(
+    text = _sub_if(
+        "identified",
         r"(?i)(IDENTIFIED\s+BY\s+)(['\"])(?:\\.|(?!\2)[^\\])*\2",
         lambda m: m.group(1) + m.group(2) + "[REDACTED_SECRET]" + m.group(2),
         text,
     )
 
     # Authorization header literals retain the scheme and surrounding syntax.
-    text = re.sub(
+    text = _sub_if(
+        "authorization",
         r"""(?i)(authorization\s*:\s*)([A-Za-z][A-Za-z0-9_-]*\s+)([^\s\r\n,"'`;}]+)""",
         r"\1\2[REDACTED_TOKEN]",
         text,
     )
-    text = re.sub(
+    text = _sub_if(
+        "authorization",
         r"""(?i)(authorization\s*:\s*)(?!\[REDACTED_TOKEN\])(?![A-Za-z][A-Za-z0-9_-]*\s+)([^\s\r\n,"'`;}]+)""",
         r"\1[REDACTED_TOKEN]",
         text,
     )
-    text = re.sub(
+    text = _sub_if(
+        "authorization",
         r"""(?i)(authorization['"`]?\s*(?:\]\s*)?[:=][ \t]*)(['"`])(?P<auth>(?:\\.|(?!\2)[^\\])*?)\2""",
         lambda m: m.group(1) + m.group(2) + auth_redacted(m.group("auth")) + m.group(2),
         text,
     )
-    text = re.sub(
+    text = _sub_if(
+        "authorization",
         r"(?i)(authorization\s*=\s*)([A-Za-z][A-Za-z0-9_-]*\s+)?([^\s,;]+)",
         lambda m: m.group(1) + (m.group(2) or "") + "[REDACTED_TOKEN]",
         text,
     )
-    text = re.sub(
+    text = _sub_if(
+        "curl",
         r"(?i)(curl\s+[^\n]*?-H\s+['\"]Authorization:\s*[A-Za-z]+\s+)[^'\"]+",
         r"\1[REDACTED_TOKEN]",
         text,

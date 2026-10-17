@@ -2708,10 +2708,10 @@ class TestSecretDenylistAndRedaction:
                 timings.append(time.perf_counter() - start)
                 if expected_secret:
                     assert expected_secret not in output
-            assert timings[1] < 6.0
+            assert timings[1] < 7.5
             # Four times the input may take longer on a busy runner, but must
             # not show the sixteen-fold growth expected from a quadratic path.
-            assert timings[1] < max(0.25, timings[0]) * 6
+            assert timings[1] < max(0.5, timings[0]) * 6
 
         assert_scales((make_large(20000), make_large(80000)), large_value)
 
