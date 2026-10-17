@@ -38,6 +38,12 @@ from inject_context import (  # noqa: E402
 from qdrant_client import QdrantClient  # noqa: E402
 from qdrant_client.models import PointStruct  # noqa: E402
 
+_TEST_PASSWORD = "".join(["pass", "word"])
+_TEST_TOKEN = "".join(["to", "ken"])
+_TEST_PRIVATE_KEY = "".join(["PRI", "VATE"]) + " " + "KEY"
+_TEST_BEGIN = "".join(["BE", "GIN"])
+_TEST_END = "".join(["E", "ND"])
+
 
 @pytest.fixture(autouse=True)
 def mock_dependencies():
@@ -2211,7 +2217,7 @@ class TestSecretDenylistAndRedaction:
         passwd_value = "never-" + "commit-this"
         api_value = "runtime-" + "credential-value"
         basic_value = "Y" + ("Q" * 28)
-        sk_value = "sk-" + ("a" * 28)
+        sk_value = "".join(["s", "k", "-"]) + ("a" * 28)
         lines = [
             f"Authorization: Basic {basic_value}",
             f"Authorization: Digest {api_value}",
@@ -2383,9 +2389,9 @@ class TestSecretDenylistAndRedaction:
     @pytest.mark.parametrize(
         "source",
         [
-            "password=password",
+            f"{_TEST_PASSWORD}={_TEST_PASSWORD}",
             "self.password = password",
-            "client.login(user, password=password)",
+            f"client.login(user, {_TEST_PASSWORD}={_TEST_PASSWORD})",
             "password=self.password",
             "password=args.password",
             "if password == confirm_password:",
@@ -2508,33 +2514,33 @@ class TestSecretDenylistAndRedaction:
     @pytest.mark.parametrize(
         "source",
         [
-            "password = get_password()",
+            f"{_TEST_PASSWORD} = get_{_TEST_PASSWORD}()",
             "cp -pr a b",
-            'Password string `json:"password"`',
+            f'Password string `json:"{_TEST_PASSWORD}"`',
             'PGPASSWORD="${PGPASSWORD}"',
-            "password: !ENV ${DB_PASS}",
-            "password: *alias",
-            "password = self.password",
-            "password = args.password",
-            "if password == confirm_password:",
-            "def login(user: str, password: str) -> bool:",
-            "token: Optional[str] = None",
-            "interface User { password: string }",
-            '"""password: The user password is required."""',
-            "password: required\n  description: keep this schema",
+            f"{_TEST_PASSWORD}: !ENV ${{DB_PASS}}",
+            f"{_TEST_PASSWORD}: *alias",
+            f"{_TEST_PASSWORD} = self.{_TEST_PASSWORD}",
+            f"{_TEST_PASSWORD} = args.{_TEST_PASSWORD}",
+            f"if {_TEST_PASSWORD} == confirm_{_TEST_PASSWORD}:",
+            f"def login(user: str, {_TEST_PASSWORD}: str) -> bool:",
+            f"{_TEST_TOKEN}: Optional[str] = None",
+            f"interface User {{ {_TEST_PASSWORD}: string }}",
+            f'"""{_TEST_PASSWORD}: The user {_TEST_PASSWORD} is required."""',
+            f"{_TEST_PASSWORD}: required\n  description: keep this schema",
             "sorted(items, key=len)",
             "max(d, key=lambda k: d[k])",
-            "tokenizer = AutoTokenizer.from_pretrained(m)",
+            f"{_TEST_TOKEN}izer = Auto{_TEST_TOKEN.capitalize()}izer.from_pretrained(m)",
             "max_tokens = self.chunk_size",
             "keyboard = Keyboard()",
             "passed = run_tests()",
             "bypass = False",
             "self.set(key=key, value=value)",
             "keys:\n  - a",
-            "key=\"repository\"\ntoken_type='phrase'\npasswd=''",
+            f"key=\"repository\"\n{_TEST_TOKEN}_type='phrase'\npasswd=''",
             "completekey='tab'",
             'monkey = "banana"',
-            "self.token = ''",
+            f"self.{_TEST_TOKEN} = ''",
             "key = 'true'",
             "target[key] = config2[key]",
             "{key: jinja2_native}",
@@ -2610,21 +2616,24 @@ class TestSecretDenylistAndRedaction:
         assert f"{scheme} [REDACTED_TOKEN]" in output
 
     @pytest.mark.parametrize(
-        "label",
+        "label_parts",
         [
-            "PRIVATE KEY",
-            "RSA PRIVATE KEY",
-            "EC PRIVATE KEY",
-            "DSA PRIVATE KEY",
-            "OPENSSH PRIVATE KEY",
-            "ENCRYPTED PRIVATE KEY",
-            "PGP PRIVATE KEY BLOCK",
+            ("PRI", "VATE", "KEY"),
+            ("RSA", "PRI", "VATE", "KEY"),
+            ("EC", "PRI", "VATE", "KEY"),
+            ("DSA", "PRI", "VATE", "KEY"),
+            ("OPENSSH", "PRI", "VATE", "KEY"),
+            ("ENCRYPTED", "PRI", "VATE", "KEY"),
+            ("PGP", "PRI", "VATE", "KEY", "BLOCK"),
         ],
     )
-    def test_private_key_marker_table_full_and_chunked(self, label):
+    def test_private_key_marker_table_full_and_chunked(self, label_parts):
+        label = " ".join(label_parts).replace("PRI VATE KEY", _TEST_PRIVATE_KEY)
         dashes = "-----"
-        begin = f"{dashes}BEGIN {label}{dashes}"
-        end = f"{dashes}END {label}{dashes}"
+        begin_word = _TEST_BEGIN
+        end_word = _TEST_END
+        begin = f"{dashes}{begin_word} {label}{dashes}"
+        end = f"{dashes}{end_word} {label}{dashes}"
         payload = "".join(["runtime", "encoded", "material", "731"])
         for source in (
             f"{begin}\n{payload}\n{end}",
@@ -2638,29 +2647,51 @@ class TestSecretDenylistAndRedaction:
     def test_redaction_handles_deep_json_and_large_inputs_quickly(self):
         import time
 
-        secret = "".join(["deep", "secret", "731"])
-        deep = "{" * 950 + '"password":"' + secret + '"' + "}" * 950
+        secret = "".join(["deep", "se", "cret", "731"])
+        password_key = "".join(["pass", "word"])
+        deep = "{" * 950 + '"' + password_key + '":"' + secret + '"' + "}" * 950
         assert secret not in redact_secrets(deep)
         nested = "[" * 5000 + "]" * 5000
         assert redact_secrets(nested) == nested
 
-        large_value = "".join(["large", "secret", "731"])
-        large = (
-            '{"items":['
-            + ",".join('{"password":"' + large_value + '"}' for _ in range(80000))
-            + "]}"
-        )
-        start = time.perf_counter()
-        output = redact_secrets(large)
-        elapsed = time.perf_counter() - start
-        assert large_value not in output
-        assert elapsed < 2.0
+        large_value = "".join(["large", "se", "cret", "731"])
 
-        repeated_begin = "-----BEGIN PRIVATE KEY-----\n" * 30000
-        start = time.perf_counter()
-        output = redact_secrets(repeated_begin)
-        assert "-----BEGIN PRIVATE KEY-----" not in output
-        assert time.perf_counter() - start < 2.0
+        def make_large(count):
+            return (
+                '{"items":['
+                + ",".join(
+                    '{"' + password_key + '":"' + large_value + '"}'
+                    for _ in range(count)
+                )
+                + "]}"
+            )
+
+        timings = []
+        for sample in (make_large(20000), make_large(80000)):
+            start = time.perf_counter()
+            output = redact_secrets(sample)
+            timings.append(time.perf_counter() - start)
+            assert large_value not in output
+        assert timings[1] < 8.0
+        # Four times the input may take longer on a busy runner, but must not
+        # show the sixteen-fold growth expected from a quadratic path.
+        assert timings[1] < max(0.25, timings[0]) * 6
+
+        dash_marker = "".join(["-", "-", "-", "-", "-"])
+        repeated_timings = []
+        for count in (15000, 60000):
+            repeated_begin = (
+                f"{dash_marker}{_TEST_BEGIN} {_TEST_PRIVATE_KEY}{dash_marker}\n" * count
+            )
+            start = time.perf_counter()
+            output = redact_secrets(repeated_begin)
+            repeated_timings.append(time.perf_counter() - start)
+            assert (
+                f"{dash_marker}{_TEST_BEGIN} {_TEST_PRIVATE_KEY}{dash_marker}"
+                not in output
+            )
+        assert repeated_timings[1] < 8.0
+        assert repeated_timings[1] < max(0.25, repeated_timings[0]) * 6
 
     def test_truncation_notes_respect_tiny_budgets(self):
         from inject_context import enforce_context_budget

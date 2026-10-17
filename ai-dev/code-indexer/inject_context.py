@@ -29,11 +29,12 @@ def redact_secrets(text: str) -> str:
         go_tag_lines.append(match.group(0))
         return token
 
-    text = re.sub(
-        r'(?m)^.*\b[A-Z][A-Za-z0-9_]*\s+[A-Za-z0-9_*]+\s+`json:"[^"\n]+"`.*$',
-        protect_go_tag,
-        text,
-    )
+    if '`json:"' in text:
+        text = re.sub(
+            r'(?m)^.*\b[A-Z][A-Za-z0-9_]*\s+[A-Za-z0-9_*]+\s+`json:"[^"\n]+"`.*$',
+            protect_go_tag,
+            text,
+        )
 
     # Scan key markers once. A lazy BEGIN-to-END regex retries from every
     # unterminated BEGIN marker and becomes quadratic on damaged chunks.
