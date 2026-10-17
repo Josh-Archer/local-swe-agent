@@ -15,6 +15,11 @@
 #
 # After the agent finishes, review the branch, then open a PR only if guardrails
 # passed (see swe-agent/GUARDED_ISSUE_TO_PR.md).
+#
+# Retrieval: run-swe-agent.sh queries code_embeddings and appends snippets to the
+# agent system prompt before sweagent run. run-guarded-issue-job.sh adds a
+# retrieve-code init container when --indexer-image (or a non-placeholder
+# code-indexer image) is set. ENABLE_RAG=false skips retrieval.
 
 apiVersion: batch/v1
 kind: Job
@@ -48,6 +53,7 @@ spec:
 
       serviceAccountName: swe-agent
 
+      # rag-init-placeholder
       containers:
       - name: swe-agent
         image: sweagent/swe-agent:latest
@@ -87,6 +93,21 @@ spec:
         # Fail the job if post-run git checks violate guardrails
         - name: ENFORCE_GUARDRAILS
           value: "true"
+
+        # --- RAG Code Retrieval (issue #15) ---
+        # run-swe-agent.sh queries code_embeddings and appends hits to the
+        # agent system_template before sweagent run. When the launcher adds a
+        # retrieve-code init container, that container writes /rag first.
+        - name: ENABLE_RAG
+          value: "true"
+        - name: QDRANT_URL
+          value: "http://qdrant.ai-dev.svc.cluster.local:6333"
+        - name: RAG_TOP_K
+          value: "5"
+        - name: RAG_REPO
+          value: ""
+        - name: RETRIEVAL_QUERY
+          value: ""
 
         # Model configuration — follows llm-endpoint-config (gpu | fallback)
         - name: LM_BASE_URL
@@ -131,6 +152,7 @@ spec:
           mountPath: /var/run/docker.sock
         - name: workspace
           mountPath: /workspace
+        # rag-mount-placeholder
 
         resources:
           requests:
@@ -152,3 +174,4 @@ spec:
       - name: workspace
         emptyDir:
           sizeLimit: 30Gi
+      # rag-volume-placeholder

@@ -114,6 +114,24 @@ class TestGuardedArtifacts:
         assert "REQUIRE_HUMAN_APPROVAL" in text
         assert "PATH_ALLOWLIST" in text
         assert "ALLOW_FORCE_PUSH" in text
+        assert "inject_context.py" in text
+        assert "retrieve-init.sh" in text
+        assert "ENABLE_RAG" in text
+
+    def test_configmap_embeds_match_source_files(self):
+        """ConfigMap copies must stay in sync with the scripts the image runs."""
+        cm = yaml.safe_load(CONFIGMAP.read_text(encoding="utf-8"))
+        pairs = {
+            "inject_context.py": AI_DEV / "code-indexer" / "inject_context.py",
+            "retrieve-init.sh": SCRIPTS / "retrieve-init.sh",
+            "retrieve-code.py": SCRIPTS / "retrieve-code.py",
+        }
+        for key, path in pairs.items():
+            embedded = cm["data"][key].replace("\r\n", "\n").strip() + "\n"
+            source = (
+                path.read_text(encoding="utf-8").replace("\r\n", "\n").strip() + "\n"
+            )
+            assert embedded == source, key
 
     def test_run_swe_agent_uses_materialized_config(self):
         """Rewritten /tmp config must be what sweagent --config receives (#18)."""
@@ -341,6 +359,41 @@ class TestGuardrailsCheckScript:
         assert "swe-agent-issue-42" in result.stdout
         # OPEN_PR stays false without --approved
         assert "name: OPEN_PR" in result.stdout
+        # Placeholder indexer image must not add an init container.
+        assert "initContainers:" not in result.stdout
+
+    def test_launcher_dry_run_adds_rag_init_container(self):
+        image = "ghcr.io/josh-archer/local-swe-agent/code-indexer:1.2.3"
+        result = subprocess.run(
+            [
+                "bash",
+                _bash_path(LAUNCHER),
+                "--repo",
+                "acme/demo",
+                "--issue",
+                "42",
+                "--indexer-image",
+                image,
+                "--dry-run",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        manifest = result.stdout
+        assert "initContainers:" in manifest
+        assert image in manifest
+        assert "/config/retrieve-init.sh" in manifest
+        assert "name: rag-context" in manifest
+        assert "mountPath: /rag" in manifest
+        docs = list(yaml.safe_load_all(manifest))
+        job = docs[0]
+        pod = job["spec"]["template"]["spec"]
+        assert pod["initContainers"][0]["name"] == "retrieve-code"
+        assert pod["initContainers"][0]["image"] == image
+        mounts = pod["containers"][0]["volumeMounts"]
+        assert any(m["mountPath"] == "/rag" for m in mounts)
 
 
 @requires_bash
@@ -366,6 +419,12 @@ class TestRunSweAgentScript:
         config_content = cm["data"]["config.yaml"]
         config_file = script_dir / "config.yaml"
         config_file.write_text(config_content, encoding="utf-8")
+
+        injector_content = cm["data"].get("inject_context.py")
+        if injector_content:
+            injector_script = script_dir / "inject_context.py"
+            injector_script.write_text(injector_content, encoding="utf-8")
+            injector_script.chmod(0o755)
 
         bin_dir = temp_dir / "bin"
         bin_dir.mkdir()
@@ -512,6 +571,128 @@ exec "{_bash_path(Path(real_git))}" "$@"
             text=True,
         )
         assert result.returncode == 0, result.stderr
+
+    def _write_retriever_stub(self, runner_env, body):
+        stub = runner_env["script_dir"] / "retriever_stub.py"
+        stub.write_text(body, encoding="utf-8")
+        stub.chmod(0o755)
+        return stub
+
+    def test_rag_context_is_injected_into_system_template(self, runner_env):
+        """Retrieved code is appended to the agent system prompt before sweagent."""
+        log = runner_env["script_dir"] / "retriever.log"
+        stub = self._write_retriever_stub(
+            runner_env,
+            "\n".join(
+                [
+                    "#!/usr/bin/env python3",
+                    "import os, sys",
+                    "from pathlib import Path",
+                    "args = sys.argv[1:]",
+                    "out = args[args.index('--output') + 1]",
+                    "Path(os.environ['RETRIEVER_LOG']).open('a').write(' '.join(args) + '\\n')",
+                    "Path(out).write_text(",
+                    "    '## Relevant Code Context (retrieved from indexed codebase)\\n\\n'",
+                    "    'def stub_retrieved():\\n    return 1\\n',",
+                    "    encoding='utf-8',",
+                    ")",
+                    "",
+                ]
+            ),
+        )
+        result = self._run_runner(
+            runner_env,
+            env_overrides={
+                "RETRIEVER_SCRIPT": str(stub),
+                "RETRIEVER_LOG": str(log),
+                "OPEN_PR": "false",
+            },
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        config_text = Path("/tmp/swe-agent-config.yaml").read_text(encoding="utf-8")
+        loaded = yaml.safe_load(config_text)
+        for key in (
+            loaded["agent"]["system_template"],
+            loaded["agent"]["templates"]["system_template"],
+        ):
+            assert "def stub_retrieved()" in key
+            assert "Relevant Code Context" in key
+        assert "Injected RAG context" in result.stdout
+        swe_log = runner_env["sweagent_log"].read_text(encoding="utf-8")
+        assert "--config" in swe_log
+        assert "/tmp/swe-agent-config.yaml" in swe_log
+
+    def test_rag_retries_without_repo_filter_when_empty(self, runner_env):
+        log = runner_env["script_dir"] / "retriever.log"
+        stub = self._write_retriever_stub(
+            runner_env,
+            "\n".join(
+                [
+                    "#!/usr/bin/env python3",
+                    "import os, sys",
+                    "from pathlib import Path",
+                    "args = sys.argv[1:]",
+                    "out = args[args.index('--output') + 1]",
+                    "Path(os.environ['RETRIEVER_LOG']).open('a').write(' '.join(args) + '\\n')",
+                    "if '--repo' in args:",
+                    "    Path(out).write_text('', encoding='utf-8')",
+                    "else:",
+                    "    Path(out).write_text('def stub_retrieved():\\n    return 1\\n', encoding='utf-8')",
+                    "",
+                ]
+            ),
+        )
+        result = self._run_runner(
+            runner_env,
+            env_overrides={
+                "RETRIEVER_SCRIPT": str(stub),
+                "RETRIEVER_LOG": str(log),
+            },
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        calls = log.read_text(encoding="utf-8").strip().splitlines()
+        assert len(calls) == 2
+        assert "--repo" in calls[0]
+        assert "--repo" not in calls[1]
+        loaded = yaml.safe_load(
+            Path("/tmp/swe-agent-config.yaml").read_text(encoding="utf-8")
+        )
+        assert "def stub_retrieved()" in loaded["agent"]["system_template"]
+
+    def test_rag_failure_does_not_block_agent(self, runner_env):
+        stub = self._write_retriever_stub(
+            runner_env,
+            "#!/usr/bin/env python3\nimport sys\nsys.stderr.write('qdrant down\\n')\nsys.exit(1)\n",
+        )
+        result = self._run_runner(
+            runner_env,
+            env_overrides={"RETRIEVER_SCRIPT": str(stub), "OPEN_PR": "false"},
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "qdrant down" in result.stderr
+        assert runner_env["sweagent_log"].exists()
+        loaded = yaml.safe_load(
+            Path("/tmp/swe-agent-config.yaml").read_text(encoding="utf-8")
+        )
+        assert "stub_retrieved" not in loaded["agent"]["system_template"]
+
+    def test_rag_disabled_skips_retriever(self, runner_env):
+        marker = runner_env["script_dir"] / "retriever-called"
+        stub = self._write_retriever_stub(
+            runner_env,
+            "#!/usr/bin/env python3\nfrom pathlib import Path\n"
+            f"Path({str(marker)!r}).write_text('called')\n",
+        )
+        result = self._run_runner(
+            runner_env,
+            env_overrides={
+                "ENABLE_RAG": "false",
+                "RETRIEVER_SCRIPT": str(stub),
+            },
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert not marker.exists()
+        assert "DISABLED" in result.stdout
 
     def test_guardrails_failure_blocks_pr_even_if_approved(self, runner_env):
         # Create a file outside allowlist

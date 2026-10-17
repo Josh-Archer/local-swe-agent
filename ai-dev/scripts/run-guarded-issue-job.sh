@@ -26,6 +26,7 @@ OPEN_PR="false"
 HUMAN_APPROVED="false"
 PATH_ALLOWLIST="${PATH_ALLOWLIST:-ai-dev/,scripts/,docs/,*.md}"
 MAX_CHANGED_FILES="${MAX_CHANGED_FILES:-10}"
+INDEXER_IMAGE="${CODE_INDEXER_IMAGE:-}"
 DRY_RUN=0
 
 usage() {
@@ -45,6 +46,7 @@ Options:
   --allowlist LIST      Comma-separated path allowlist
   --max-files N         Max changed files (default: 10)
   --namespace NS        Kubernetes namespace (default: ai-dev)
+  --indexer-image IMG   Code-indexer image used to retrieve code before the run
   --dry-run             Print rendered manifest only
   -h, --help            Show this help
 
@@ -66,6 +68,7 @@ while [[ $# -gt 0 ]]; do
     --allowlist) PATH_ALLOWLIST="$2"; shift 2 ;;
     --max-files) MAX_CHANGED_FILES="$2"; shift 2 ;;
     --namespace) NAMESPACE="$2"; shift 2 ;;
+    --indexer-image) INDEXER_IMAGE="$2"; shift 2 ;;
     --dry-run|--no-apply) DRY_RUN=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown arg: $1" >&2; usage >&2; exit 2 ;;
@@ -194,7 +197,114 @@ log "Max files:  $MAX_CHANGED_FILES"
 log "Force-push: forbidden"
 log ""
 
+# Use the built code-indexer image for a pre-run retrieval init container.
+# Placeholder tags (the cronjob default) are skipped so issue jobs still start.
+resolve_indexer_image() {
+  local image="$1"
+  if [[ -z "$image" && -f "${AI_DEV_DIR}/code-indexer/cronjob.yaml" ]]; then
+    image="$(sed -n 's/^[[:space:]]*image:[[:space:]]*//p' "${AI_DEV_DIR}/code-indexer/cronjob.yaml" | head -1)"
+    image="${image%%#*}"
+    image="$(printf '%s' "$image" | sed -E 's/^["'\'']//; s/["'\'']$//; s/[[:space:]]+$//')"
+  fi
+  if [[ -z "$image" ]]; then
+    return 0
+  fi
+  if printf '%s' "$image" | grep -Eiq 'CHANGE_ME|YOUR_ORG|YOUR_REGISTRY|your-registry|REPLACE_ME|REPLACEME|TODO_IMAGE|example\.com|<registry>|<tag>|<owner>|[[:space:]]'; then
+    log "RAG init container skipped: code-indexer image is unset or still a placeholder."
+    log "Pass --indexer-image (or set CODE_INDEXER_IMAGE) to query Qdrant before the run."
+    return 0
+  fi
+  printf '%s' "$image"
+}
+
+INDEXER_IMAGE="$(resolve_indexer_image "$INDEXER_IMAGE")"
+
 RENDERED="$(render)"
+
+if [[ -n "$INDEXER_IMAGE" ]]; then
+  RENDERED="$(printf '%s\n' "$RENDERED" | \
+    INDEXER_IMAGE="$INDEXER_IMAGE" \
+    GITHUB_OWNER="$GITHUB_OWNER" \
+    GITHUB_REPO="$GITHUB_REPO" \
+    ISSUE_NUMBER="$ISSUE_NUMBER" \
+    ISSUE_LABEL="$ISSUE_LABEL" \
+    ISSUE_URL="$ISSUE_URL" \
+    RAG_TOP_K="${RAG_TOP_K:-5}" \
+    QDRANT_URL="${QDRANT_URL:-http://qdrant.ai-dev.svc.cluster.local:6333}" \
+    RAG_REPO="${RAG_REPO:-}" \
+    RETRIEVAL_QUERY="${RETRIEVAL_QUERY:-}" \
+    python3 -c '
+import json, os, sys
+image = os.environ["INDEXER_IMAGE"]
+manifest = sys.stdin.read()
+q = json.dumps
+
+def env_value(name, value):
+    return (
+        "        - name: " + name + "\n"
+        "          value: " + q(value) + "\n"
+    )
+
+init = """      initContainers:
+      - name: retrieve-code
+        image: {image}
+        imagePullPolicy: IfNotPresent
+        command: ["/bin/sh", "/config/retrieve-init.sh"]
+        env:
+{env}        - name: GITHUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: swe-agent-secrets
+              key: github-token
+              optional: true
+        volumeMounts:
+        - name: config
+          mountPath: /config
+        - name: rag-context
+          mountPath: /rag
+        resources:
+          requests:
+            memory: "2Gi"
+            cpu: "1"
+          limits:
+            memory: "4Gi"
+            cpu: "2"
+""".format(
+    image=q(image),
+    env="".join([
+        env_value("ENABLE_RAG", "true"),
+        env_value("QDRANT_URL", os.environ.get("QDRANT_URL", "")),
+        env_value("RAG_TOP_K", os.environ.get("RAG_TOP_K", "5")),
+        env_value("RAG_REPO", os.environ.get("RAG_REPO", "")),
+        env_value("RETRIEVAL_QUERY", os.environ.get("RETRIEVAL_QUERY", "")),
+        env_value("GITHUB_OWNER", os.environ.get("GITHUB_OWNER", "")),
+        env_value("GITHUB_REPO", os.environ.get("GITHUB_REPO", "")),
+        env_value("ISSUE_NUMBER", os.environ.get("ISSUE_NUMBER", "")),
+        env_value("ISSUE_LABEL", os.environ.get("ISSUE_LABEL", "")),
+        env_value("ISSUE_URL", os.environ.get("ISSUE_URL", "")),
+    ]),
+)
+mount = """        - name: rag-context
+          mountPath: /rag
+"""
+volume = """      - name: rag-context
+        emptyDir: {}
+"""
+replacements = {
+    "      # rag-init-placeholder": init.rstrip("\n"),
+    "        # rag-mount-placeholder": mount.rstrip("\n"),
+    "      # rag-volume-placeholder": volume.rstrip("\n"),
+}
+for marker, block in replacements.items():
+    if marker not in manifest:
+        sys.stderr.write("ERROR: job template missing %s\n" % marker.strip())
+        sys.exit(1)
+    manifest = manifest.replace(marker, block, 1)
+sys.stdout.write(manifest)
+'
+  )"
+  log "RAG init image: $INDEXER_IMAGE"
+fi
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
   printf '%s\n' "$RENDERED"

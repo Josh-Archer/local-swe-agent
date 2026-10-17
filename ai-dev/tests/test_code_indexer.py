@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch, MagicMock
 
 import pytest
+import yaml
 
 # Add code-indexer to sys.path
 INDEXER_DIR = Path(__file__).parent.parent / "code-indexer"
@@ -19,7 +20,13 @@ if str(INDEXER_DIR) not in sys.path:
 if "sentence_transformers" not in sys.modules:
     sys.modules["sentence_transformers"] = MagicMock()
 
-from index_code import CodeIndexer, generate_point_id  # noqa: E402
+from index_code import (  # noqa: E402
+    CodeIndexer,
+    CodeRetriever,
+    generate_point_id,
+    main,
+)
+from inject_context import inject_context_into_system_template  # noqa: E402
 from qdrant_client import QdrantClient  # noqa: E402
 from qdrant_client.models import PointStruct  # noqa: E402
 
@@ -891,6 +898,376 @@ class TestEndToEnd:
 
         points = indexer.get_repository_point_ids("large-repo")
         assert len(points) >= 5
+
+
+class TestCodeRetrieval:
+    """Tests for code retrieval functionality (Issue #15)."""
+
+    @pytest.fixture
+    def indexed_qdrant(self, in_memory_qdrant, mock_config):
+        """Prepare an in-memory Qdrant instance populated with sample indexed points."""
+        from qdrant_client.models import VectorParams, Distance
+
+        collection_name = mock_config["qdrant"]["collection_name"]
+        in_memory_qdrant.create_collection(
+            collection_name=collection_name,
+            vectors_config=VectorParams(size=384, distance=Distance.COSINE),
+        )
+
+        vec1 = [0.1] * 384
+        vec1[0] = 0.9
+
+        vec2 = [0.1] * 384
+        vec2[1] = 0.9
+
+        vec3 = [0.1] * 384
+        vec3[0] = 0.95
+
+        in_memory_qdrant.upsert(
+            collection_name=collection_name,
+            points=[
+                PointStruct(
+                    id=generate_point_id("repo1", "src/auth.py", 0),
+                    vector=vec1,
+                    payload={
+                        "repository": "repo1",
+                        "file_path": "src/auth.py",
+                        "content": "def authenticate(user, password):\n    return check_creds(user, password)",
+                        "start_line": 1,
+                        "end_line": 2,
+                        "language": "py",
+                        "content_hash": "hash1",
+                        "indexed_at": "2026-10-17T00:00:00",
+                    },
+                ),
+                PointStruct(
+                    id=generate_point_id("repo1", "src/db.py", 0),
+                    vector=vec2,
+                    payload={
+                        "repository": "repo1",
+                        "file_path": "src/db.py",
+                        "content": "def get_connection():\n    return pool.acquire()",
+                        "start_line": 1,
+                        "end_line": 2,
+                        "language": "py",
+                        "content_hash": "hash2",
+                        "indexed_at": "2026-10-17T00:00:00",
+                    },
+                ),
+                PointStruct(
+                    id=generate_point_id("repo2", "auth/service.py", 0),
+                    vector=vec3,
+                    payload={
+                        "repository": "repo2",
+                        "file_path": "auth/service.py",
+                        "content": "class AuthService:\n    def login(self, token): pass",
+                        "start_line": 1,
+                        "end_line": 2,
+                        "language": "py",
+                        "content_hash": "hash3",
+                        "indexed_at": "2026-10-17T00:00:00",
+                    },
+                ),
+            ],
+        )
+        return in_memory_qdrant
+
+    def test_retrieve_code_basic(
+        self, mock_config, indexed_qdrant, mock_embedding_model
+    ):
+        indexer = CodeIndexer(
+            config_path=mock_config,
+            qdrant_client=indexed_qdrant,
+            embedding_model=mock_embedding_model,
+        )
+        q_vec = [0.1] * 384
+        q_vec[0] = 0.9
+        mock_embedding_model.encode.return_value = MagicMock(tolist=lambda: q_vec)
+
+        results = indexer.retrieve_code(
+            "fix user authentication bug", repo_name="repo1", limit=5
+        )
+        assert len(results) >= 1
+        top = results[0]
+        assert top["repository"] == "repo1"
+        assert top["file_path"] == "src/auth.py"
+        assert "authenticate" in top["content"]
+        assert top["start_line"] == 1
+        assert top["end_line"] == 2
+        assert top["language"] == "py"
+        assert "score" in top
+        assert top["score"] > 0.0
+
+    def test_retrieve_code_filters_by_repository(
+        self, mock_config, indexed_qdrant, mock_embedding_model
+    ):
+        indexer = CodeIndexer(
+            config_path=mock_config,
+            qdrant_client=indexed_qdrant,
+            embedding_model=mock_embedding_model,
+        )
+        q_vec = [0.1] * 384
+        q_vec[0] = 0.9
+        mock_embedding_model.encode.return_value = MagicMock(tolist=lambda: q_vec)
+
+        results_repo1 = indexer.retrieve_code("auth", repo_name="repo1")
+        assert all(r["repository"] == "repo1" for r in results_repo1)
+        assert not any(r["repository"] == "repo2" for r in results_repo1)
+
+        results_repo2 = indexer.retrieve_code("auth", repo_name="repo2")
+        assert all(r["repository"] == "repo2" for r in results_repo2)
+        assert not any(r["repository"] == "repo1" for r in results_repo2)
+
+    def test_retrieve_code_all_repositories_when_repo_unspecified(
+        self, mock_config, indexed_qdrant, mock_embedding_model
+    ):
+        indexer = CodeIndexer(
+            config_path=mock_config,
+            qdrant_client=indexed_qdrant,
+            embedding_model=mock_embedding_model,
+        )
+        results = indexer.retrieve_code("auth", repo_name=None, limit=10)
+        repos = {r["repository"] for r in results}
+        assert "repo1" in repos
+        assert "repo2" in repos
+
+    def test_retrieve_code_respects_limit(
+        self, mock_config, indexed_qdrant, mock_embedding_model
+    ):
+        indexer = CodeIndexer(
+            config_path=mock_config,
+            qdrant_client=indexed_qdrant,
+            embedding_model=mock_embedding_model,
+        )
+        results = indexer.retrieve_code("auth", limit=1)
+        assert len(results) == 1
+
+    def test_retrieve_code_empty_and_whitespace_query(
+        self, mock_config, indexed_qdrant, mock_embedding_model
+    ):
+        indexer = CodeIndexer(
+            config_path=mock_config,
+            qdrant_client=indexed_qdrant,
+            embedding_model=mock_embedding_model,
+        )
+        assert indexer.retrieve_code("") == []
+        assert indexer.retrieve_code("   \n\t  ") == []
+        assert indexer.retrieve_code(None) == []  # type: ignore
+
+    def test_retrieve_code_nonexistent_collection(
+        self, mock_config, in_memory_qdrant, mock_embedding_model
+    ):
+        indexer = CodeIndexer(
+            config_path=mock_config,
+            qdrant_client=in_memory_qdrant,
+            embedding_model=mock_embedding_model,
+        )
+        assert indexer.retrieve_code("query") == []
+
+    def test_retrieve_code_score_threshold(
+        self, mock_config, indexed_qdrant, mock_embedding_model
+    ):
+        indexer = CodeIndexer(
+            config_path=mock_config,
+            qdrant_client=indexed_qdrant,
+            embedding_model=mock_embedding_model,
+        )
+        results = indexer.retrieve_code("auth", score_threshold=0.999999)
+        for r in results:
+            assert r["score"] >= 0.999999
+
+    def test_retrieve_code_long_query_token_chunking(
+        self, mock_config, indexed_qdrant, mock_embedding_model
+    ):
+        """Long query exceeding embedder window is chunked using chunk_code (#17 pair)."""
+        indexer = CodeIndexer(
+            config_path=mock_config,
+            qdrant_client=indexed_qdrant,
+            embedding_model=mock_embedding_model,
+        )
+        indexer.max_seq_length = 10
+        indexer.chunk_size = 10
+        indexer.chunk_overlap = 2
+
+        long_query = "word " * 30
+        results = indexer.retrieve_code(long_query, limit=5)
+        assert isinstance(results, list)
+
+    def test_format_retrieved_context(self):
+        chunks = [
+            {
+                "file_path": "ai-dev/main.py",
+                "start_line": 10,
+                "end_line": 20,
+                "language": "py",
+                "score": 0.912,
+                "content": "def run():\n    pass",
+            }
+        ]
+        context = CodeIndexer.format_retrieved_context(chunks)
+        assert "## Relevant Code Context" in context
+        assert "ai-dev/main.py" in context
+        assert "lines 10-20" in context
+        assert "def run():" in context
+        assert "0.912" in context
+
+        assert CodeIndexer.format_retrieved_context([]) == ""
+
+    def test_search_and_query_aliases(
+        self, mock_config, indexed_qdrant, mock_embedding_model
+    ):
+        indexer = CodeIndexer(
+            config_path=mock_config,
+            qdrant_client=indexed_qdrant,
+            embedding_model=mock_embedding_model,
+        )
+        with patch.object(
+            indexer, "retrieve_code", return_value=[{"id": "1"}]
+        ) as mock_ret:
+            indexer.search("foo", repo_name="repo1", limit=3)
+            mock_ret.assert_called_once_with(
+                query="foo", repo_name="repo1", limit=3, score_threshold=None
+            )
+
+        with patch.object(
+            indexer, "retrieve_code", return_value=[{"id": "1"}]
+        ) as mock_ret:
+            indexer.query("bar", repo_name="repo2", limit=4)
+            mock_ret.assert_called_once_with(
+                query="bar", repo_name="repo2", limit=4, score_threshold=None
+            )
+
+    def test_code_retriever_class(
+        self, mock_config, indexed_qdrant, mock_embedding_model
+    ):
+        retriever = CodeRetriever(
+            config_path=mock_config,
+            qdrant_client=indexed_qdrant,
+            embedding_model=mock_embedding_model,
+        )
+        chunks = retriever.retrieve("auth", repo_name="repo1")
+        assert isinstance(chunks, list)
+
+        formatted = retriever.retrieve_and_format("auth", repo_name="repo1")
+        assert isinstance(formatted, str)
+
+    def test_cli_main_retrieval(self, temp_workspace):
+        out_file = temp_workspace / "context.md"
+        with patch("index_code.CodeIndexer") as mock_cls:
+            mock_inst = MagicMock()
+            mock_inst.retrieve_code.return_value = [{"content": "hello"}]
+            mock_inst.format_retrieved_context.return_value = "## Formatted"
+            mock_cls.return_value = mock_inst
+
+            rc = main(["--query", "sample query", "--output", str(out_file)])
+            assert rc == 0
+            assert out_file.read_text(encoding="utf-8") == "## Formatted"
+
+    def test_retrieval_settings_keep_zero_values(
+        self, in_memory_qdrant, mock_embedding_model
+    ):
+        """top_k 0 and score_threshold 0.0 must not be treated as missing."""
+        indexer = CodeIndexer(
+            config_path={
+                "top_k": 0,
+                "retrieval": {"top_k": 9, "score_threshold": 0.5},
+                "score_threshold": 0.0,
+            },
+            qdrant_client=in_memory_qdrant,
+            embedding_model=mock_embedding_model,
+        )
+        assert indexer.default_top_k == 0
+        assert indexer.default_score_threshold == 0.0
+
+    def test_nested_retrieval_defaults(self, in_memory_qdrant, mock_embedding_model):
+        indexer = CodeIndexer(
+            config_path={"retrieval": {"top_k": 3, "score_threshold": 0.0}},
+            qdrant_client=in_memory_qdrant,
+            embedding_model=mock_embedding_model,
+        )
+        assert indexer.default_top_k == 3
+        assert indexer.default_score_threshold == 0.0
+
+    def test_query_points_falls_back_to_search(self, mock_config, mock_embedding_model):
+        client = MagicMock()
+        client.collection_exists.return_value = True
+        client.query_points.side_effect = RuntimeError("query_points unavailable")
+        point = MagicMock()
+        point.id = "abc"
+        point.score = 0.0
+        point.payload = {
+            "repository": "repo1",
+            "file_path": "src/a.py",
+            "content": "def zero():\n    return 0",
+            "start_line": 1,
+            "end_line": 2,
+            "language": "py",
+        }
+        client.search.return_value = [point]
+        indexer = CodeIndexer(
+            config_path=mock_config,
+            qdrant_client=client,
+            embedding_model=mock_embedding_model,
+        )
+        q_vec = [0.2] * 384
+        mock_embedding_model.encode.return_value = MagicMock(tolist=lambda: q_vec)
+        results = indexer.retrieve_code("zero score", limit=2)
+        assert len(results) == 1
+        assert results[0]["score"] == 0.0
+        assert results[0]["file_path"] == "src/a.py"
+        client.search.assert_called_once()
+
+
+class TestInjectRetrievedContext:
+    """Retrieved snippets must land inside the agent system prompt."""
+
+    SAMPLE = """\
+agent:
+  system_template: |
+    You are an autonomous software engineering agent.
+    never force-push.
+  templates:
+    system_template: |
+      You are an autonomous software engineering agent.
+      never force-push.
+
+# Environment configuration
+environment:
+  type: "docker"
+"""
+
+    def test_injects_into_every_system_template(self):
+        context = (
+            "## Relevant Code Context (retrieved from indexed codebase)\n\n"
+            "### Snippet 1: `ai-dev/main.py` (lines 10-20)\n"
+            "```py\n"
+            "def run():\n"
+            "    return 1\n"
+            "```\n"
+        )
+        updated = inject_context_into_system_template(self.SAMPLE, context)
+        loaded = yaml.safe_load(updated)
+        for text in (
+            loaded["agent"]["system_template"],
+            loaded["agent"]["templates"]["system_template"],
+        ):
+            assert "def run():" in text
+            assert "ai-dev/main.py" in text
+            assert "never force-push." in text
+        assert loaded["environment"]["type"] == "docker"
+
+    def test_inject_is_idempotent(self):
+        context = "def run():\n    return 1\n"
+        once = inject_context_into_system_template(self.SAMPLE, context)
+        twice = inject_context_into_system_template(once, context)
+        assert once == twice
+
+    def test_empty_context_is_noop(self):
+        assert inject_context_into_system_template(self.SAMPLE, "  \n") == self.SAMPLE
+
+    def test_missing_template_raises(self):
+        with pytest.raises(ValueError):
+            inject_context_into_system_template("agent:\n  max_steps: 1\n", "code")
 
 
 # Pytest configuration
