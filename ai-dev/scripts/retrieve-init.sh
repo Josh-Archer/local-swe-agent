@@ -61,14 +61,6 @@ if [ -n "$REPO_FILTER" ]; then
     --limit "$LIMIT" \
     --repo "$REPO_FILTER" \
     --output "$OUT"
-  if [ ! -s "$OUT" ]; then
-    echo "No hits for repo $REPO_FILTER; retrying across all indexed repositories."
-    python3 /app/index_code.py \
-      --query "$QUERY" \
-      --qdrant-url "$QURL" \
-      --limit "$LIMIT" \
-      --output "$OUT"
-  fi
 else
   python3 /app/index_code.py \
     --query "$QUERY" \

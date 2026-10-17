@@ -622,7 +622,8 @@ exec "{_bash_path(Path(real_git))}" "$@"
         assert "--config" in swe_log
         assert "/tmp/swe-agent-config.yaml" in swe_log
 
-    def test_rag_retries_without_repo_filter_when_empty(self, runner_env):
+    def test_rag_does_not_retry_without_repo_filter_when_empty(self, runner_env):
+        """Runner must NOT fall back to querying all repositories when repo filter has no hits."""
         log = runner_env["script_dir"] / "retriever.log"
         stub = self._write_retriever_stub(
             runner_env,
@@ -637,7 +638,7 @@ exec "{_bash_path(Path(real_git))}" "$@"
                     "if '--repo' in args:",
                     "    Path(out).write_text('', encoding='utf-8')",
                     "else:",
-                    "    Path(out).write_text('def stub_retrieved():\\n    return 1\\n', encoding='utf-8')",
+                    "    Path(out).write_text('def cross_repo_leak():\\n    return 1\\n', encoding='utf-8')",
                     "",
                 ]
             ),
@@ -651,13 +652,76 @@ exec "{_bash_path(Path(real_git))}" "$@"
         )
         assert result.returncode == 0, result.stdout + result.stderr
         calls = log.read_text(encoding="utf-8").strip().splitlines()
-        assert len(calls) == 2
+        assert len(calls) == 1
         assert "--repo" in calls[0]
-        assert "--repo" not in calls[1]
+        assert "retrying across all indexed repositories" not in result.stdout
         loaded = yaml.safe_load(
             Path("/tmp/swe-agent-config.yaml").read_text(encoding="utf-8")
         )
-        assert "def stub_retrieved()" in loaded["agent"]["system_template"]
+        assert "cross_repo_leak" not in loaded["agent"]["system_template"]
+
+    def test_retrieve_init_does_not_retry_without_repo_filter_when_empty(
+        self, tmp_path
+    ):
+        """retrieve-init.sh must query only with --repo and not fall back to all repos."""
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        fake_app = tmp_path / "app"
+        fake_app.mkdir()
+        log = tmp_path / "calls.log"
+
+        indexer_stub = fake_app / "index_code.py"
+        indexer_stub.write_text(
+            f"#!/usr/bin/env python3\n"
+            f"import sys\n"
+            f"from pathlib import Path\n"
+            f"Path({str(log)!r}).open('a').write(' '.join(sys.argv[1:]) + '\\n')\n"
+            f"args = sys.argv[1:]\n"
+            f"if '--output' in args:\n"
+            f"    Path(args[args.index('--output') + 1]).write_text('')\n",
+            encoding="utf-8",
+        )
+        indexer_stub.chmod(0o755)
+
+        py_stub = fake_bin / "python3"
+        py_stub.write_text(
+            f"#!/bin/sh\n" f'exec /usr/bin/python3 {str(indexer_stub)} "$@"\n',
+            encoding="utf-8",
+        )
+        py_stub.chmod(0o755)
+
+        script = AI_DEV / "scripts" / "retrieve-init.sh"
+        env = {
+            "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
+            "ENABLE_RAG": "true",
+            "RETRIEVAL_QUERY": "query text",
+            "RAG_REPO": "target-repo",
+            "RAG_TOP_K": "5",
+        }
+        res = subprocess.run(
+            ["sh", str(script)],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert res.returncode == 0, res.stdout + res.stderr
+        assert "retrying across all indexed repositories" not in res.stdout
+        assert "No hits for repo" not in res.stdout
+        calls = log.read_text(encoding="utf-8").strip().splitlines()
+        assert len(calls) == 1
+        assert "--repo target-repo" in calls[0]
+
+    def test_retrieve_init_and_configmap_do_not_contain_fallback(self):
+        """retrieve-init.sh and run-swe-agent.sh must not contain fallback text."""
+        init_text = (AI_DEV / "scripts" / "retrieve-init.sh").read_text(
+            encoding="utf-8"
+        )
+        assert "retrying across all indexed repositories" not in init_text
+        assert "No hits for repo" not in init_text
+
+        cm_text = CONFIGMAP.read_text(encoding="utf-8")
+        assert "retrying across all indexed repositories" not in cm_text
+        assert "No hits for repo" not in cm_text
 
     def test_rag_failure_does_not_block_agent(self, runner_env):
         stub = self._write_retriever_stub(

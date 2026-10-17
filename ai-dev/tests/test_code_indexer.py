@@ -26,8 +26,15 @@ from index_code import (  # noqa: E402
     CodeRetriever,
     generate_point_id,
     main,
+    MAX_TOP_K,
+    DEFAULT_MAX_CONTEXT_BYTES,
+    is_secret_path,
+    is_secret_content,
 )
-from inject_context import inject_context_into_system_template  # noqa: E402
+from inject_context import (  # noqa: E402
+    inject_context_into_system_template,
+    redact_secrets,
+)
 from qdrant_client import QdrantClient  # noqa: E402
 from qdrant_client.models import PointStruct  # noqa: E402
 
@@ -1694,6 +1701,318 @@ environment:
     def test_missing_template_raises(self):
         with pytest.raises(ValueError):
             inject_context_into_system_template("agent:\n  max_steps: 1\n", "code")
+
+
+class TestRepoSnippetLabelling:
+    """Tests that snippets are labelled with their repository in retrieved context."""
+
+    def test_snippets_are_labelled_with_repo(self):
+        chunks = [
+            {
+                "repository": "alpha-repo",
+                "file_path": "src/main.py",
+                "start_line": 1,
+                "end_line": 10,
+                "language": "py",
+                "score": 0.95,
+                "content": "def main():\n    pass",
+            },
+            {
+                "repository": "beta-repo",
+                "file_path": "lib/utils.js",
+                "start_line": 5,
+                "end_line": 15,
+                "language": "js",
+                "score": 0.88,
+                "content": "function util() {}",
+            },
+        ]
+        context = CodeIndexer.format_retrieved_context(chunks)
+        assert "[alpha-repo] `src/main.py`" in context
+        assert "[beta-repo] `lib/utils.js`" in context
+
+    def test_snippets_without_repo_omit_brackets(self):
+        chunks = [
+            {
+                "file_path": "orphan.py",
+                "start_line": 1,
+                "end_line": 5,
+                "language": "py",
+                "content": "x = 1",
+            }
+        ]
+        context = CodeIndexer.format_retrieved_context(chunks)
+        assert "`orphan.py`" in context
+        assert "[None]" not in context
+        assert "[]" not in context
+
+
+class TestTopKCappingAndBudgets:
+    """Tests for capping top_k and enforcing token/byte budgets."""
+
+    def test_default_max_context_bytes_constant(self):
+        assert DEFAULT_MAX_CONTEXT_BYTES == 16384
+
+    def test_top_k_is_capped_at_max(self, in_memory_qdrant, mock_embedding_model):
+        indexer = CodeIndexer(
+            config_path={
+                "collection_name": "test_topk",
+                "retrieval": {"top_k": 500},
+            },
+            qdrant_client=in_memory_qdrant,
+            embedding_model=mock_embedding_model,
+        )
+        assert indexer.default_top_k == MAX_TOP_K
+
+        # Also when limit is passed explicitly to retrieve_code
+        with patch.object(
+            indexer, "collection_exists", return_value=True
+        ), patch.object(indexer, "_search_points", return_value=[]) as mock_search:
+            indexer.retrieve_code("query", limit=100)
+            mock_search.assert_called_once()
+            # The second argument to _search_points is top_k, which must be <= MAX_TOP_K
+            call_top_k = mock_search.call_args[0][1]
+            assert call_top_k <= MAX_TOP_K
+
+    def test_format_retrieved_context_enforces_byte_budget(self):
+        # 10 chunks of 200 bytes each
+        chunks = [
+            {
+                "repository": "repo",
+                "file_path": f"file_{i}.py",
+                "start_line": 1,
+                "end_line": 10,
+                "content": "a" * 200,
+            }
+            for i in range(10)
+        ]
+        # Low byte budget of 500 bytes
+        formatted = CodeIndexer.format_retrieved_context(chunks, max_bytes=500)
+        assert len(formatted.encode("utf-8")) <= 500
+        # Should contain at least snippet 1, but not all 10
+        assert "file_0.py" in formatted
+        assert "file_9.py" not in formatted
+
+    def test_format_retrieved_context_enforces_token_budget(self):
+        chunks = [
+            {
+                "repository": "repo",
+                "file_path": f"file_{i}.py",
+                "start_line": 1,
+                "end_line": 10,
+                "content": f"word_{i} " * 50,
+            }
+            for i in range(10)
+        ]
+        formatted = CodeIndexer.format_retrieved_context(chunks, max_tokens=100)
+        assert "file_0.py" in formatted
+        assert "file_9.py" not in formatted
+
+    def test_format_retrieved_context_caps_oversized_chunk(self):
+        huge_chunk = [
+            {
+                "repository": "repo",
+                "file_path": "huge.py",
+                "start_line": 1,
+                "end_line": 2000,
+                "content": "word " * 1000,
+            }
+        ]
+        formatted = CodeIndexer.format_retrieved_context(huge_chunk)
+        assert "chunk truncated" in formatted
+
+    def test_inject_context_enforces_byte_budget(self):
+        sample = "agent:\n  system_template: |\n    Original prompt.\n"
+        huge_context = "## Relevant Code\n" + ("line of retrieved code\n" * 500)
+        updated = inject_context_into_system_template(
+            sample, huge_context, max_bytes=300
+        )
+        loaded = yaml.safe_load(updated)
+        template = loaded["agent"]["system_template"]
+        assert "Context truncated to stay within budget" in template
+
+
+class TestSecretDenylistAndRedaction:
+    """Tests ensuring secrets and sensitive paths never reach the prompt."""
+
+    @pytest.mark.parametrize(
+        "secret_path",
+        [
+            "config/secrets.yaml",
+            "secrets.yaml",
+            "config/credentials.json",
+            "credentials.json",
+            "deploy/env.sh",
+            "env.sh",
+            ".env",
+            "deploy/.env",
+            ".env.production",
+            "keys",
+            "keys.json",
+            "api_keys.py",
+            "server.key",
+            "id_rsa",
+            "id_rsa.pub",
+            "id_ed25519",
+            "terraform.tfvars",
+            "prod.tfvars.json",
+            "secrets/database.yaml",
+            "credentials/google.json",
+        ],
+    )
+    def test_is_secret_path_denylist(self, secret_path):
+        assert is_secret_path(secret_path) is True
+
+    @pytest.mark.parametrize(
+        "safe_path",
+        [
+            "index_code.py",
+            "src/main.py",
+            "src/huge.py",
+            "ai-dev/tests/test_code_indexer.py",
+            "keyboard_handler.py",
+            "monkeypatch.py",
+        ],
+    )
+    def test_is_secret_path_safe_files(self, safe_path):
+        assert is_secret_path(safe_path) is False
+
+    def test_is_secret_content(self):
+        assert is_secret_content("apiVersion: v1\nkind: Secret\n") is True
+        assert is_secret_content("-----BEGIN RSA PRIVATE KEY-----\n") is True
+        assert is_secret_content("def run(): pass") is False
+
+    def test_should_index_file_blocks_secret_paths(
+        self, in_memory_qdrant, mock_embedding_model
+    ):
+        indexer = CodeIndexer(
+            config_path={},
+            qdrant_client=in_memory_qdrant,
+            embedding_model=mock_embedding_model,
+        )
+        assert indexer.should_index_file(Path("config/secrets.yaml")) is False
+        assert indexer.should_index_file(Path("config/credentials.json")) is False
+        assert indexer.should_index_file(Path("deploy/env.sh")) is False
+        assert indexer.should_index_file(Path(".env")) is False
+        assert indexer.should_index_file(Path("keys.json")) is False
+        assert indexer.should_index_file(Path("main.py")) is True
+
+    def test_retrieve_code_filters_secret_paths_and_manifests(
+        self, in_memory_qdrant, mock_embedding_model
+    ):
+        indexer = CodeIndexer(
+            config_path={},
+            qdrant_client=in_memory_qdrant,
+            embedding_model=mock_embedding_model,
+        )
+        fake_points = [
+            Mock(
+                id="1",
+                score=0.99,
+                payload={
+                    "repository": "alpha",
+                    "file_path": "config/secrets.yaml",
+                    "content": "secret_key: supersecret",
+                },
+            ),
+            Mock(
+                id="2",
+                score=0.98,
+                payload={
+                    "repository": "alpha",
+                    "file_path": "k8s/secret.yaml",
+                    "content": "apiVersion: v1\nkind: Secret\ndata:\n  token: c2VjcmV0\n",
+                },
+            ),
+            Mock(
+                id="3",
+                score=0.95,
+                payload={
+                    "repository": "alpha",
+                    "file_path": "src/app.py",
+                    "content": "def app(): pass",
+                },
+            ),
+        ]
+        with patch.object(
+            indexer, "collection_exists", return_value=True
+        ), patch.object(indexer, "_search_points", return_value=fake_points):
+            results = indexer.retrieve_code("app")
+            assert len(results) == 1
+            assert results[0]["file_path"] == "src/app.py"
+
+    def test_redact_secrets_patterns(self):
+        text = (
+            "QAFAKE_SECRET_KEY_12345\n"
+            "api_key = 'abcdef123456'\n"
+            "password: 'hunter2password'\n"
+            "AKIAIOSFODNN7EXAMPLE\n"
+            "ghp_123456789012345678901234567890123456\n"
+            "xoxb-1234567890-1234567890123\n"
+            "Authorization: Bearer my_very_secret_token_12345\n"
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIEogIBAAKCAQEA...\n-----END RSA PRIVATE KEY-----\n"
+        )
+        redacted = redact_secrets(text)
+        assert "QAFAKE" not in redacted
+        assert "abcdef123456" not in redacted
+        assert "hunter2password" not in redacted
+        assert "AKIAIOSFODNN7EXAMPLE" not in redacted
+        assert "ghp_1234567890" not in redacted
+        assert "xoxb-" not in redacted
+        assert "my_very_secret_token_12345" not in redacted
+        assert "MIIEogIBAAKCAQEA" not in redacted
+        assert "[REDACTED_SECRET]" in redacted
+        assert "[REDACTED_AWS_KEY]" in redacted
+        assert "[REDACTED_GITHUB_TOKEN]" in redacted
+        assert "[REDACTED_PRIVATE_KEY]" in redacted
+
+    def test_format_retrieved_context_redacts_secrets(self):
+        chunks = [
+            {
+                "repository": "alpha",
+                "file_path": "src/auth.py",
+                "start_line": 1,
+                "end_line": 5,
+                "content": "QAFAKE_TEST_TOKEN = 'xyz'\napi_key: 'topsecretkey123'\n",
+            }
+        ]
+        formatted = CodeIndexer.format_retrieved_context(chunks)
+        assert "QAFAKE_TEST_TOKEN" not in formatted
+        assert "topsecretkey123" not in formatted
+        assert "[REDACTED_SECRET]" in formatted
+
+
+class TestNitsEmbedderAndFences:
+    """Tests for lazy embedder load and triple-backtick fence handling."""
+
+    def test_embedder_lazy_loaded_after_qdrant_check(self):
+        # Point to an unreachable Qdrant
+        indexer = CodeIndexer(
+            config_path={"qdrant_url": "http://127.0.0.1:1"},
+        )
+        # SentenceTransformer must not have been loaded yet
+        assert indexer._embedding_model is None
+        # In query mode when Qdrant is down, retrieve_code must return [] without loading embedder
+        results = indexer.retrieve_code("query")
+        assert results == []
+        assert indexer._embedding_model is None
+
+    def test_triple_backtick_escaping_in_snippets(self):
+        chunks = [
+            {
+                "repository": "repo",
+                "file_path": "docs.py",
+                "start_line": 1,
+                "end_line": 5,
+                "language": "py",
+                "content": 'code = """\n```python\nprint("hello")\n```\n"""',
+            }
+        ]
+        formatted = CodeIndexer.format_retrieved_context(chunks)
+        # Must use fence of 4 or more backticks so inner triple backticks don't break the code block
+        assert "````py\n" in formatted
+        assert "\n````" in formatted
+        assert 'print("hello")' in formatted
 
 
 # Pytest configuration

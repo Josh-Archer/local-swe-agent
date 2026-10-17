@@ -249,9 +249,114 @@ data:
     /config/inject_context.py.
     """
 
+    import os
+    import re
     import sys
     from pathlib import Path
     from typing import List, Optional, Tuple
+
+    DEFAULT_MAX_INJECT_BYTES: int = 16384  # 16 KiB default byte budget
+    DEFAULT_MAX_INJECT_TOKENS: int = 2048  # Default token/word estimate budget
+
+
+    def redact_secrets(text: str) -> str:
+        """Redact secret keys, tokens, credentials, and private keys from text."""
+        if not text:
+            return ""
+        # Private key blocks
+        text = re.sub(
+            r"-----BEGIN [A-Z0-9_\s]+PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9_\s]+PRIVATE KEY-----",
+            "[REDACTED_PRIVATE_KEY]",
+            text,
+        )
+        text = re.sub(
+            r"-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----",
+            "[REDACTED_CERTIFICATE]",
+            text,
+        )
+        # Synthetic QA fake keys
+        text = re.sub(r"\bQAFAKE[A-Za-z0-9_\-]*\b", "[REDACTED_SECRET]", text)
+        # AWS access keys
+        text = re.sub(r"\b(AKIA|ABIA|ACCA|ASIA)[0-9A-Z]{16}\b", "[REDACTED_AWS_KEY]", text)
+        # GitHub tokens
+        text = re.sub(
+            r"\b(gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b",
+            "[REDACTED_GITHUB_TOKEN]",
+            text,
+        )
+        # Slack tokens
+        text = re.sub(r"\bxox[baprs]-[0-9A-Za-z\-]{10,}\b", "[REDACTED_SLACK_TOKEN]", text)
+        # Bearer tokens
+        text = re.sub(
+            r"(?i)\b(bearer\s+)[A-Za-z0-9_\-\.]{16,}\b",
+            r"\g<1>[REDACTED_TOKEN]",
+            text,
+        )
+        secret_keys = (
+            r"api[_-]?key|apikey|secret[_-]?key|client[_-]?secret|"
+            r"access[_-]?token|auth[_-]?token|password|passwd|private[_-]?key"
+        )
+        text = re.sub(
+            rf"""(?i)\b({secret_keys})\b(\s*[:=]\s*['"]?)([^'"\s\n\r]{{6,}})(['"]?)""",
+            r"\g<1>\g<2>[REDACTED_SECRET]\g<4>",
+            text,
+        )
+        return text
+
+
+    def enforce_context_budget(
+        context: str,
+        max_bytes: Optional[int] = None,
+        max_tokens: Optional[int] = None,
+    ) -> str:
+        """Trim context to satisfy byte and token budgets."""
+        if not context or not context.strip():
+            return ""
+
+        if max_bytes is None:
+            env_bytes = os.environ.get("RAG_MAX_BYTES")
+            max_bytes = (
+                int(env_bytes)
+                if env_bytes and env_bytes.isdigit()
+                else DEFAULT_MAX_INJECT_BYTES
+            )
+        if max_tokens is None:
+            env_tokens = os.environ.get("RAG_MAX_TOKENS")
+            max_tokens = (
+                int(env_tokens)
+                if env_tokens and env_tokens.isdigit()
+                else DEFAULT_MAX_INJECT_TOKENS
+            )
+
+        # Fast path if within limits
+        encoded = context.encode("utf-8")
+        words = context.split()
+        if len(encoded) <= max_bytes and len(words) <= max_tokens:
+            return context
+
+        # If exceeding budgets, trim line by line
+        lines = context.splitlines(keepends=True)
+        kept_lines: List[str] = []
+        current_bytes = 0
+        current_words = 0
+        truncated = False
+
+        for line in lines:
+            line_bytes = len(line.encode("utf-8"))
+            line_words = len(line.split())
+            if (current_bytes + line_bytes > max_bytes) or (
+                current_words + line_words > max_tokens
+            ):
+                truncated = True
+                break
+            kept_lines.append(line)
+            current_bytes += line_bytes
+            current_words += line_words
+
+        trimmed = "".join(kept_lines).rstrip()
+        if truncated:
+            trimmed += "\n\n<!-- Context truncated to stay within budget -->"
+        return trimmed
 
 
     def _context_already_present(block_text: str, context: str) -> bool:
@@ -267,7 +372,12 @@ data:
         return False
 
 
-    def inject_context_into_system_template(config_text: str, context: str) -> str:
+    def inject_context_into_system_template(
+        config_text: str,
+        context: str,
+        max_bytes: Optional[int] = None,
+        max_tokens: Optional[int] = None,
+    ) -> str:
         """Append context inside every ``system_template: |`` literal block.
 
         Modern SWE-agent reads ``agent.templates.system_template``. This project
@@ -275,7 +385,10 @@ data:
         feeds the retrieved snippets to whichever key the agent actually loads.
         The rest of the document, including comments, is preserved.
         """
-        snippet = (context or "").strip("\n")
+        cleaned = redact_secrets(context or "")
+        snippet = enforce_context_budget(
+            cleaned, max_bytes=max_bytes, max_tokens=max_tokens
+        ).strip("\n")
         if not snippet.strip():
             return config_text
 
@@ -431,14 +544,6 @@ data:
         --limit "$LIMIT" \
         --repo "$REPO_FILTER" \
         --output "$OUT"
-      if [ ! -s "$OUT" ]; then
-        echo "No hits for repo $REPO_FILTER; retrying across all indexed repositories."
-        python3 /app/index_code.py \
-          --query "$QUERY" \
-          --qdrant-url "$QURL" \
-          --limit "$LIMIT" \
-          --output "$OUT"
-      fi
     else
       python3 /app/index_code.py \
         --query "$QUERY" \
@@ -743,10 +848,6 @@ data:
           repo_filter="${RAG_REPO:-${GITHUB_REPO:-}}"
           if [[ -n "$repo_filter" ]]; then
             run_retriever "$repo_filter" || true
-            if [[ ! -s "$RAG_CONTEXT_FILE" ]]; then
-              echo "No hits for repo ${repo_filter}; retrying across all indexed repositories."
-              run_retriever "" || true
-            fi
           else
             run_retriever "" || true
           fi

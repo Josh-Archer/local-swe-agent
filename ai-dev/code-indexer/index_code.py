@@ -5,6 +5,7 @@ Clones repositories, chunks code files, generates embeddings, and uploads to Qdr
 """
 
 import os
+import re
 import sys
 import logging
 import yaml
@@ -27,7 +28,77 @@ from qdrant_client.models import (
 )
 from sentence_transformers import SentenceTransformer
 
-from inject_context import inject_context_into_system_template
+from inject_context import inject_context_into_system_template, redact_secrets
+
+MAX_TOP_K: int = 25
+DEFAULT_MAX_CONTEXT_BYTES: int = 16384  # 16 KiB
+DEFAULT_MAX_CONTEXT_TOKENS: int = 2048
+DEFAULT_MAX_CHUNK_TOKENS: int = 512
+
+SECRET_FILE_PATTERNS = [
+    r"(^|/|\.)secrets?\.(yaml|yml|json|env|txt|sh)$",
+    r"(^|/|\.)credentials?\.(yaml|yml|json|ini|env|txt|sh)$",
+    r"(^|/)env\.sh$",
+    r"(^|/)\.env(\.[a-zA-Z0-9_\-]+)?$",
+    r"(^|/)[a-zA-Z0-9_\-]*\.env$",
+    r"(^|/)keys?(\.(yaml|yml|json|txt|pem|key))?$",
+    r"(^|/)[a-zA-Z0-9_\-]*(key|keys)\.(py|yaml|yml|json|txt|pem|key|sh)$",
+    r"(^|/)[a-zA-Z0-9_\-]*_key\.(pem|key|pub)$",
+    r"(^|/)id_(rsa|dsa|ecdsa|ed25519)(\.pub)?$",
+    r"\.tfvars(\.json)?$",
+    r"\.(pem|p12|pfx|pkcs12|keystore|key)$",
+    r"(^|/)(token|tokens)\.(yaml|yml|json|txt)$",
+    r"(^|/)(passwd|password|passwords)(\.(txt|yaml|yml|json))?$",
+]
+
+
+def is_secret_path(file_path: Union[str, Path]) -> bool:
+    """Return True if file_path matches known secret filename or credential patterns."""
+    p = Path(file_path)
+    posix_path = p.as_posix().lower()
+    name = p.name.lower()
+
+    for pattern in SECRET_FILE_PATTERNS:
+        if re.search(pattern, posix_path, re.IGNORECASE) or re.search(
+            pattern, name, re.IGNORECASE
+        ):
+            return True
+
+    parts = [part.lower() for part in p.parts]
+    if any(
+        part in ("secrets", "credentials", ".ssh", ".gnupg", "private")
+        for part in parts
+    ):
+        return True
+
+    if re.search(r"(\b|_)secret(\b|_)", name, re.IGNORECASE) and p.suffix.lower() in (
+        ".yaml",
+        ".yml",
+        ".json",
+        ".env",
+        ".sh",
+        ".txt",
+        ".ini",
+    ):
+        return True
+    if re.search(r"(\b|_)credential(\b|_)", name, re.IGNORECASE):
+        return True
+    if name in ("env.sh", ".env", "keys", "id_rsa") or name.startswith(".env"):
+        return True
+
+    return False
+
+
+def is_secret_content(content: str) -> bool:
+    """Return True if content matches known secret manifests (k8s Secret, private key, etc.)."""
+    if not content:
+        return False
+    if re.search(r"^\s*kind:\s*Secret\b", content, re.MULTILINE):
+        return True
+    if "-----BEGIN" in content and "PRIVATE KEY-----" in content:
+        return True
+    return False
+
 
 try:
     from transformers import AutoTokenizer, logging as hf_logging
@@ -161,7 +232,7 @@ class CodeIndexer:
                 self.qdrant = QdrantClient(url=qdrant_url)
             logger.info(f"Connected to Qdrant at {qdrant_url}")
 
-        # Initialize embedding model
+        # Initialize embedding model (lazy to avoid model loading before Qdrant check)
         embedding_cfg = self.config.get("embedding")
         embedding_dict: Dict[str, Any] = (
             embedding_cfg if isinstance(embedding_cfg, dict) else {}
@@ -172,26 +243,17 @@ class CodeIndexer:
             or "sentence-transformers/all-MiniLM-L6-v2"
         )
         self._embedding_model_name = model_name
+        self._embedding_model = embedding_model
+        self.embedding_dim: int = int(qdrant_dict.get("vector_size", 384))
+        self.max_seq_length: int = 256
         if embedding_model is not None:
-            self.embedding_model = embedding_model
-        else:
-            logger.info(f"Loading embedding model: {model_name}")
-            self.embedding_model = SentenceTransformer(model_name)
-
-        if hasattr(self.embedding_model, "get_sentence_embedding_dimension"):
-            self.embedding_dim: int = (
-                self.embedding_model.get_sentence_embedding_dimension()
-            )
-        else:
-            self.embedding_dim = int(qdrant_dict.get("vector_size", 384))
+            if hasattr(embedding_model, "get_sentence_embedding_dimension"):
+                self.embedding_dim = embedding_model.get_sentence_embedding_dimension()
+            max_seq_len = getattr(embedding_model, "max_seq_length", None)
+            if isinstance(max_seq_len, int) and max_seq_len > 0:
+                self.max_seq_length = max_seq_len
 
         # Context window and tokenizer (Issue #17)
-        max_seq_len = getattr(self.embedding_model, "max_seq_length", None)
-        if isinstance(max_seq_len, int) and max_seq_len > 0:
-            self.max_seq_length: int = max_seq_len
-        else:
-            self.max_seq_length = 256
-
         # Prefer an explicit tokenizer or the one bundled with the embedding
         # model. Do not download a tokenizer here: a missing tokenizer is
         # resolved lazily from the local cache on first use.
@@ -203,8 +265,8 @@ class CodeIndexer:
         if tokenizer is not None:
             self.tokenizer = tokenizer
             self._tokenizer_resolved = True
-        else:
-            model_tokenizer = getattr(self.embedding_model, "tokenizer", None)
+        elif self._embedding_model is not None:
+            model_tokenizer = getattr(self._embedding_model, "tokenizer", None)
             if _usable_tokenizer(model_tokenizer):
                 self.tokenizer = model_tokenizer
                 self._tokenizer_resolved = True
@@ -286,7 +348,13 @@ class CodeIndexer:
             top_k_val = retrieval_dict.get("top_k")
         if top_k_val is None:
             top_k_val = 5
-        self.default_top_k: int = int(top_k_val)
+        self.default_top_k: int = min(int(top_k_val), MAX_TOP_K)
+        max_top_k_cfg = self.config.get("max_top_k") or retrieval_dict.get("max_top_k")
+        self.max_top_k: int = (
+            min(int(max_top_k_cfg), MAX_TOP_K)
+            if max_top_k_cfg is not None
+            else MAX_TOP_K
+        )
         if "score_threshold" in self.config:
             thresh = self.config.get("score_threshold")
         else:
@@ -299,6 +367,31 @@ class CodeIndexer:
         # nosec B108
         self.work_dir = Path(self.config.get("work_dir", "/tmp/indexer"))  # nosec
         self.work_dir.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def embedding_model(self) -> Any:
+        """Lazily load SentenceTransformer so Qdrant can be checked before model load."""
+        if self._embedding_model is None:
+            logger.info(f"Loading embedding model: {self._embedding_model_name}")
+            self._embedding_model = SentenceTransformer(self._embedding_model_name)
+            if hasattr(self._embedding_model, "get_sentence_embedding_dimension"):
+                self.embedding_dim = (
+                    self._embedding_model.get_sentence_embedding_dimension()
+                )
+            max_seq_len = getattr(self._embedding_model, "max_seq_length", None)
+            if isinstance(max_seq_len, int) and max_seq_len > 0:
+                self.max_seq_length = max_seq_len
+        return self._embedding_model
+
+    @embedding_model.setter
+    def embedding_model(self, model: Any) -> None:
+        self._embedding_model = model
+        if model is not None:
+            if hasattr(model, "get_sentence_embedding_dimension"):
+                self.embedding_dim = model.get_sentence_embedding_dimension()
+            max_seq_len = getattr(model, "max_seq_length", None)
+            if isinstance(max_seq_len, int) and max_seq_len > 0:
+                self.max_seq_length = max_seq_len
 
     @staticmethod
     def generate_point_id(repo_name: str, file_path: str, chunk_index: int = 0) -> str:
@@ -445,6 +538,11 @@ class CodeIndexer:
         if self._tokenizer_resolved:
             return self.tokenizer
         self._tokenizer_resolved = True
+        if self._embedding_model is not None:
+            model_tok = getattr(self._embedding_model, "tokenizer", None)
+            if _usable_tokenizer(model_tok):
+                self.tokenizer = model_tok
+                return self.tokenizer
         if AutoTokenizer is None:
             self._tokenizer_failure = "transformers is not installed"
             self.tokenizer = None
@@ -796,6 +894,10 @@ class CodeIndexer:
         if file_path.suffix.lower() not in self.code_extensions:
             return False
 
+        # Skip secret files and credentials
+        if is_secret_path(file_path):
+            return False
+
         # Skip hidden files and directories
         if any(part.startswith(".") for part in file_path.parts):
             return False
@@ -843,8 +945,8 @@ class CodeIndexer:
                 with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                     content = f.read()
 
-                # Skip empty files
-                if not content.strip():
+                # Skip empty files or secret content
+                if not content.strip() or is_secret_content(content):
                     continue
 
                 # Get relative path from repo root
@@ -969,6 +1071,7 @@ class CodeIndexer:
         top_k = limit if limit is not None else self.default_top_k
         if top_k <= 0:
             return []
+        top_k = min(top_k, self.max_top_k)
 
         min_score = (
             score_threshold
@@ -1034,6 +1137,13 @@ class CodeIndexer:
 
                 repo = payload.get("repository", "")
                 f_path = payload.get("file_path", "")
+                if is_secret_path(f_path):
+                    continue
+
+                content = payload.get("content", "")
+                if is_secret_content(content):
+                    continue
+
                 s_line = payload.get("start_line", 0)
                 e_line = payload.get("end_line", 0)
 
@@ -1049,7 +1159,7 @@ class CodeIndexer:
                         "score": score,
                         "repository": repo,
                         "file_path": f_path,
-                        "content": payload.get("content", ""),
+                        "content": content,
                         "start_line": int(s_line) if s_line is not None else 0,
                         "end_line": int(e_line) if e_line is not None else 0,
                         "language": payload.get("language", ""),
@@ -1155,36 +1265,108 @@ class CodeIndexer:
         )
 
     @staticmethod
-    def format_retrieved_context(chunks: List[Dict[str, Any]]) -> str:
+    def format_retrieved_context(
+        chunks: List[Dict[str, Any]],
+        max_tokens: Optional[int] = None,
+        max_bytes: Optional[int] = None,
+    ) -> str:
         """Format retrieved code chunks into a markdown context block for the agent."""
         if not chunks:
             return ""
 
-        lines = [
+        if max_bytes is None:
+            env_bytes = os.environ.get("RAG_MAX_BYTES")
+            max_bytes = (
+                int(env_bytes)
+                if env_bytes and env_bytes.isdigit()
+                else DEFAULT_MAX_CONTEXT_BYTES
+            )
+        if max_tokens is None:
+            env_tokens = os.environ.get("RAG_MAX_TOKENS")
+            max_tokens = (
+                int(env_tokens)
+                if env_tokens and env_tokens.isdigit()
+                else DEFAULT_MAX_CONTEXT_TOKENS
+            )
+
+        header_lines = [
             "## Relevant Code Context (retrieved from indexed codebase)",
             "The following code snippets were retrieved from the repository to assist in solving the issue:",
             "",
         ]
-        for idx, chunk in enumerate(chunks, 1):
+
+        snippet_blocks: List[str] = []
+        current_bytes = len("\n".join(header_lines).encode("utf-8"))
+        current_words = len(" ".join(header_lines).split())
+        snippet_idx = 1
+
+        for chunk in chunks:
             file_path = chunk.get("file_path", "unknown")
+            if is_secret_path(file_path):
+                continue
+
+            content = chunk.get("content", "")
+            if is_secret_content(content):
+                continue
+
+            # Redact any secrets in snippet content before emission
+            content = redact_secrets(content)
+
+            # Cap individual chunk content if single chunk is abnormally large
+            content_words = content.split()
+            if len(content_words) > DEFAULT_MAX_CHUNK_TOKENS:
+                content = (
+                    " ".join(content_words[:DEFAULT_MAX_CHUNK_TOKENS])
+                    + "\n... [chunk truncated to token limit]"
+                )
+
+            repo = chunk.get("repository", "")
+            repo_label = f"[{repo}] " if repo else ""
             start_line = chunk.get("start_line", 1)
             end_line = chunk.get("end_line", 1)
             score = chunk.get("score")
             lang = chunk.get("language", "")
-            content = chunk.get("content", "")
 
             score_str = (
                 f" (relevance: {score:.3f})" if isinstance(score, (int, float)) else ""
             )
-            lines.append(
-                f"### Snippet {idx}: `{file_path}` (lines {start_line}-{end_line}){score_str}"
-            )
-            lines.append(f"```{lang}")
-            lines.append(content)
-            lines.append("```")
-            lines.append("")
 
-        return "\n".join(lines).strip()
+            # Determine fence length: at least 3, and strictly longer than any run of backticks in content
+            fence_len = 3
+            runs = re.findall(r"`+", content)
+            if runs:
+                fence_len = max(3, max(len(r) for r in runs) + 1)
+            fence = "`" * fence_len
+
+            block_lines = [
+                f"### Snippet {snippet_idx}: {repo_label}`{file_path}` (lines {start_line}-{end_line}){score_str}",
+                f"{fence}{lang}",
+                content,
+                fence,
+                "",
+            ]
+            block_str = "\n".join(block_lines)
+            block_bytes = len(block_str.encode("utf-8"))
+            block_words = len(block_str.split())
+
+            # If adding this block exceeds max_bytes or max_tokens:
+            if snippet_blocks and (
+                current_bytes + block_bytes > max_bytes
+                or current_words + block_words > max_tokens
+            ):
+                # Budget exceeded, stop including further snippets
+                break
+
+            snippet_blocks.append(block_str)
+            current_bytes += block_bytes
+            current_words += block_words
+            snippet_idx += 1
+
+        if not snippet_blocks:
+            return ""
+
+        result = "\n".join(header_lines) + "\n" + "".join(snippet_blocks)
+        return result.strip()
 
     format_retrieved_code = format_retrieved_context
 
@@ -1271,7 +1453,7 @@ def main(args: Optional[List[str]] = None):
         "-k",
         type=int,
         default=None,
-        help="Maximum number of code chunks to retrieve (default: config top_k or 5)",
+        help=f"Maximum number of code chunks to retrieve (default: config top_k or 5, capped at {MAX_TOP_K})",
     )
     parser.add_argument(
         "--score-threshold",

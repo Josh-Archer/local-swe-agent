@@ -103,11 +103,11 @@ bash ai-dev/scripts/run-guarded-issue-job.sh \
 | `ENABLE_RAG` | `true` queries `code_embeddings` before `sweagent run` |
 | `QDRANT_URL` | Qdrant HTTP endpoint (default: in-cluster Service) |
 | `RAG_TOP_K` | How many code chunks to inject (default: 5) |
-| `RAG_REPO` | Optional payload `repository` filter; empty uses `GITHUB_REPO`, then all repos |
+| `RAG_REPO` | Optional payload `repository` filter; empty uses `GITHUB_REPO` (no cross-repo fallback) |
 | `RETRIEVAL_QUERY` | Optional query text; empty uses the GitHub issue title and body |
 | `--indexer-image` | Launcher flag: code-indexer image for the retrieval init container |
 
-Retrieval is best-effort. If Qdrant is down or the indexer image is still a placeholder, the job continues and the agent runs without extra code context. Snippets are appended to every `system_template` block in the materialized config.
+Retrieval is best-effort. If Qdrant is down or the indexer image is still a placeholder, the job continues and the agent runs without extra code context. The primary retrieval path runs in the init container where indexer dependencies are present; the in-container path serves as a graceful fallback if dependencies exist. Snippets are appended to every `system_template` block in the materialized config.
 
 ## Local guardrails check
 
