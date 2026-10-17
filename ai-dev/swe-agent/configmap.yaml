@@ -30,6 +30,22 @@ data:
         Always verify your changes by running tests when available.
         Respect repository guardrails: only touch allowlisted paths, keep
         the change set small, and never force-push.
+        When a Relevant Code Context section is appended below, use those
+        indexed snippets as starting points and verify them in the repository
+        before editing.
+      # templates.system_template is what current SWE-agent loads. The flat key
+      # above is kept so older readers still see the same instructions.
+      templates:
+        system_template: |
+          You are an autonomous software engineering agent.
+          You have access to tools to read, edit, and execute code.
+          Your goal is to solve GitHub issues by making the necessary code changes.
+          Always verify your changes by running tests when available.
+          Respect repository guardrails: only touch allowlisted paths, keep
+          the change set small, and never force-push.
+          When a Relevant Code Context section is appended below, use those
+          indexed snippets as starting points and verify them in the repository
+          before editing.
 
     # Environment configuration
     environment:
@@ -223,6 +239,472 @@ data:
     echo "=== GUARDRAILS PASSED ==="
     exit 0
 
+  # Pre-run RAG helpers (also under ai-dev/code-indexer and ai-dev/scripts)
+  inject_context.py: |
+    #!/usr/bin/env python3
+    """Insert retrieved code into SWE-agent system_template blocks.
+
+    Stdlib only so the swe-agent container can run this without the indexer
+    dependencies. The same file is mounted from the swe-agent ConfigMap at
+    /config/inject_context.py.
+    """
+
+    import os
+    import re
+    import sys
+    from pathlib import Path
+    from typing import List, Optional, Tuple
+
+    DEFAULT_MAX_INJECT_BYTES: int = 16384  # 16 KiB default byte budget
+    DEFAULT_MAX_INJECT_TOKENS: int = 2048  # Default token/word estimate budget
+
+
+    def redact_secrets(text: str) -> str:
+        """Redact secret keys, tokens, credentials, and private keys from text."""
+        if not text:
+            return ""
+
+        # 1. Private key blocks (full block: PKCS#1, PKCS#8, etc.)
+        text = re.sub(
+            r"-----BEGIN\s+(?:[A-Z0-9_\s]*PRIVATE KEY)-----[\s\S]*?-----END\s+(?:[A-Z0-9_\s]*PRIVATE KEY)-----",
+            "[REDACTED_PRIVATE_KEY]",
+            text,
+        )
+        # Private key blocks split across chunks: BEGIN onward if no END in chunk
+        text = re.sub(
+            r"-----BEGIN\s+(?:[A-Z0-9_\s]*PRIVATE KEY)-----[\s\S]*$",
+            "[REDACTED_PRIVATE_KEY]",
+            text,
+        )
+        # Private key blocks split across chunks: END tail without BEGIN in chunk
+        text = re.sub(
+            r"^[\s\S]*?-----END\s+(?:[A-Z0-9_\s]*PRIVATE KEY)-----",
+            "[REDACTED_PRIVATE_KEY]",
+            text,
+        )
+
+        # 2. Certificate blocks (full, or split)
+        text = re.sub(
+            r"-----BEGIN\s+(?:[A-Z0-9_\s]*CERTIFICATE)-----[\s\S]*?-----END\s+(?:[A-Z0-9_\s]*CERTIFICATE)-----",
+            "[REDACTED_CERTIFICATE]",
+            text,
+        )
+        text = re.sub(
+            r"-----BEGIN\s+(?:[A-Z0-9_\s]*CERTIFICATE)-----[\s\S]*$",
+            "[REDACTED_CERTIFICATE]",
+            text,
+        )
+        text = re.sub(
+            r"^[\s\S]*?-----END\s+(?:[A-Z0-9_\s]*CERTIFICATE)-----",
+            "[REDACTED_CERTIFICATE]",
+            text,
+        )
+
+        # 3. AWS access keys
+        text = re.sub(r"\b(AKIA|ABIA|ACCA|ASIA)[0-9A-Z]{16}\b", "[REDACTED_AWS_KEY]", text)
+
+        # 4. GitHub tokens
+        text = re.sub(
+            r"\b(gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b",
+            "[REDACTED_GITHUB_TOKEN]",
+            text,
+        )
+
+        # 5. Slack tokens
+        text = re.sub(r"\bxox[baprs]-[0-9A-Za-z\-]{10,}\b", "[REDACTED_SLACK_TOKEN]", text)
+
+        # 6. Authorization headers (token or Bearer)
+        text = re.sub(
+            r"(?i)\b(authorization\s*:\s*(?:bearer|token)\s+)[^\s\r\n]+",
+            r"\g<1>[REDACTED_TOKEN]",
+            text,
+        )
+        # Standalone Bearer tokens
+        text = re.sub(
+            r"(?i)\b(bearer\s+)[A-Za-z0-9_\-\.]{8,}\b",
+            r"\g<1>[REDACTED_TOKEN]",
+            text,
+        )
+
+        # 7. Key-value secrets
+        # Catches:
+        # - bare token, secret, password, passwd, apikey, api_key, api_token
+        # - aws_secret_access_key, aws_access_key_id
+        # - prefixed KEY-style names (*_TOKEN=, *_PASSWORD=, *_SECRET, *_KEY, etc.)
+        # - JSON keys with quotes ("password":, 'api_token':)
+        key_names = (
+            r"token|secret|password|passwd|apikey|api_key|api_token|"
+            r"secret_key|client_secret|access_token|auth_token|private_key|"
+            r"aws_secret_access_key|aws_access_key_id|"
+            r"[a-zA-Z0-9_]+_(?:token|secret|password|passwd|key|apikey|keys)"
+        )
+
+        def _replace_kv(m: re.Match) -> str:
+            prefix = m.group(1)
+            key = m.group(2)
+            sep = m.group(3)
+            quote = m.group(4)
+            val = m.group(5) if quote else m.group(6)
+            if val and val.startswith("[REDACTED_"):
+                return m.group(0)
+            if quote:
+                return f"{prefix}{key}{sep}{quote}[REDACTED_SECRET]{quote}"
+            return f"{prefix}{key}{sep}[REDACTED_SECRET]"
+
+        kv_pattern = (
+            rf"""(?i)(^|[^a-zA-Z0-9_])(['"]?(?:{key_names})['"]?)(\s*[:=]\s*)"""
+            r"""(?:(['"])(.*?)\4|([^\s"',;\r\n]+))"""
+        )
+        text = re.sub(kv_pattern, _replace_kv, text)
+
+        return text
+
+
+    def _find_unclosed_fence(lines: List[str]) -> Optional[Tuple[str, str]]:
+        """Return (indent, fence_marker) if lines end inside an unclosed markdown fence."""
+        open_fence: Optional[Tuple[str, str]] = None
+        for line in lines:
+            stripped = line.strip()
+            m = re.match(r"^(\s*)(`{3,}|~{3,})", line)
+            if m:
+                indent = m.group(1)
+                marker = m.group(2)
+                is_closing_fence = stripped == marker
+                if open_fence is None:
+                    open_fence = (indent, marker)
+                elif is_closing_fence and marker.startswith(open_fence[1]):
+                    open_fence = None
+        return open_fence
+
+
+    def enforce_context_budget(
+        context: str,
+        max_bytes: Optional[int] = None,
+        max_tokens: Optional[int] = None,
+    ) -> str:
+        """Trim context to satisfy byte and token budgets while preserving newlines and closing fences."""
+        if not context or not context.strip():
+            return ""
+
+        if max_bytes is None:
+            env_bytes = os.environ.get("RAG_MAX_BYTES")
+            max_bytes = (
+                int(env_bytes)
+                if env_bytes and env_bytes.isdigit()
+                else DEFAULT_MAX_INJECT_BYTES
+            )
+        if max_tokens is None:
+            env_tokens = os.environ.get("RAG_MAX_TOKENS")
+            max_tokens = (
+                int(env_tokens)
+                if env_tokens and env_tokens.isdigit()
+                else DEFAULT_MAX_INJECT_TOKENS
+            )
+
+        # Fast path if within limits and fences are closed
+        encoded = context.encode("utf-8")
+        words = context.split()
+        lines = context.splitlines(keepends=True)
+        if (
+            len(encoded) <= max_bytes
+            and len(words) <= max_tokens
+            and _find_unclosed_fence(lines) is None
+        ):
+            return context
+
+        kept_lines: List[str] = []
+        current_bytes = 0
+        current_words = 0
+        truncated = False
+
+        trunc_comment = "\n\n<!-- Context truncated to stay within budget -->"
+
+        for line in lines:
+            line_bytes = len(line.encode("utf-8"))
+            line_words = len(line.split())
+            if (current_bytes + line_bytes > max_bytes) or (
+                current_words + line_words > max_tokens
+            ):
+                truncated = True
+                if not kept_lines:
+                    # Truncate oversized single line to fit
+                    max_slice = max(0, max_bytes - len(trunc_comment.encode("utf-8")) - 10)
+                    raw = line.encode("utf-8")[:max_slice].decode("utf-8", errors="ignore")
+                    if raw:
+                        kept_lines.append(raw)
+                break
+            kept_lines.append(line)
+            current_bytes += line_bytes
+            current_words += line_words
+
+        if not truncated and len(encoded) <= max_bytes and len(words) <= max_tokens:
+            open_fence = _find_unclosed_fence(kept_lines)
+            if open_fence:
+                close_str = f"\n{open_fence[0]}{open_fence[1]}\n"
+                return ("".join(kept_lines).rstrip() + close_str).strip()
+            return context
+
+        # Truncated: ensure any open code fence is closed and budget is respected
+        while kept_lines:
+            open_fence = _find_unclosed_fence(kept_lines)
+            close_fence = f"\n{open_fence[0]}{open_fence[1]}" if open_fence else ""
+            suffix = f"{close_fence}{trunc_comment}"
+            suffix_bytes = len(suffix.encode("utf-8"))
+            suffix_words = len(suffix.split())
+
+            current_bytes = len("".join(kept_lines).encode("utf-8"))
+            current_words = len("".join(kept_lines).split())
+
+            if (current_bytes + suffix_bytes <= max_bytes) and (
+                current_words + suffix_words <= max_tokens
+            ):
+                trimmed = "".join(kept_lines).rstrip() + suffix
+                return trimmed
+            kept_lines.pop()
+
+        return trunc_comment.strip()
+
+
+    def _context_already_present(block_text: str, context: str) -> bool:
+        """True when context's non-empty lines already appear, in order, in the block."""
+        wanted = [line.strip() for line in context.splitlines() if line.strip()]
+        if not wanted:
+            return True
+        have = [line.strip() for line in block_text.splitlines()]
+        span = len(wanted)
+        for index in range(len(have) - span + 1):
+            if have[index : index + span] == wanted:
+                return True
+        return False
+
+
+    def inject_context_into_system_template(
+        config_text: str,
+        context: str,
+        max_bytes: Optional[int] = None,
+        max_tokens: Optional[int] = None,
+    ) -> str:
+        """Append context inside every ``system_template: |`` literal block.
+
+        Modern SWE-agent reads ``agent.templates.system_template``. This project
+        also keeps a flat ``agent.system_template``. Updating every literal block
+        feeds the retrieved snippets to whichever key the agent actually loads.
+        The rest of the document, including comments, is preserved.
+        """
+        cleaned = redact_secrets(context or "")
+        snippet = enforce_context_budget(
+            cleaned, max_bytes=max_bytes, max_tokens=max_tokens
+        ).strip("\n")
+        if not snippet.strip():
+            return config_text
+
+        if not config_text.endswith("\n"):
+            config_text += "\n"
+
+        lines = config_text.splitlines(keepends=True)
+        inserts: List[Tuple[int, int]] = []
+        index = 0
+        while index < len(lines):
+            line = lines[index]
+            stripped = line.rstrip("\n").rstrip("\r")
+            prefix_len = len(stripped) - len(stripped.lstrip(" "))
+            body = stripped.lstrip(" ")
+            if not body.startswith("system_template:") or "|" not in body:
+                index += 1
+                continue
+            # Accept `|`, `|-`, and `|+` and ignore a trailing comment.
+            after_pipe = body.split("|", 1)[1].lstrip("+-").strip()
+            if after_pipe and not after_pipe.startswith("#"):
+                index += 1
+                continue
+
+            key_indent = prefix_len
+            content_indent = None
+            cursor = index + 1
+            end = index + 1
+            while cursor < len(lines):
+                raw = lines[cursor]
+                if raw.strip() == "":
+                    end = cursor + 1
+                    cursor += 1
+                    continue
+                indent = len(raw) - len(raw.lstrip(" "))
+                if content_indent is None:
+                    if indent > key_indent:
+                        content_indent = indent
+                        end = cursor + 1
+                        cursor += 1
+                        continue
+                    break
+                if indent >= content_indent:
+                    end = cursor + 1
+                    cursor += 1
+                    continue
+                break
+
+            if content_indent is None:
+                content_indent = key_indent + 2
+
+            block_text = "".join(lines[index + 1 : end])
+            if not _context_already_present(block_text, snippet):
+                inserts.append((end, content_indent))
+            index = end if end > index else index + 1
+
+        if not inserts and not any(
+            "system_template:" in item and "|" in item for item in lines
+        ):
+            raise ValueError("system_template literal block not found")
+
+        for end, content_indent in reversed(inserts):
+            prefix = " " * content_indent
+            block = [prefix + "\n"]
+            for context_line in snippet.splitlines():
+                block.append(prefix + context_line + "\n")
+            block.append("\n")
+            lines[end:end] = block
+
+        return "".join(lines)
+
+
+    def main(argv: Optional[List[str]] = None) -> int:
+        """Write retrieved markdown into a SWE-agent config file."""
+        args = list(sys.argv[1:] if argv is None else argv)
+        if len(args) != 2:
+            sys.stderr.write("Usage: inject_context.py CONFIG_PATH CONTEXT_PATH\n")
+            return 2
+
+        config_path = Path(args[0])
+        context_path = Path(args[1])
+        context = context_path.read_text(encoding="utf-8")
+        original = config_path.read_text(encoding="utf-8")
+        updated = inject_context_into_system_template(original, context)
+        if updated != original:
+            config_path.write_text(updated, encoding="utf-8")
+            print("Injected RAG context into agent system_template.")
+        return 0
+
+
+    if __name__ == "__main__":
+        sys.exit(main())
+  retrieve-init.sh: |
+    #!/bin/sh
+    # Best-effort retrieval of indexed code into /rag/retrieved_code_context.md.
+    # Runs in the code-indexer image (init container) before sweagent. Always exits 0
+    # so a Qdrant outage does not block the agent job.
+    set +e
+
+    echo "=== RAG init retrieval ==="
+    enable=$(printf '%s' "${ENABLE_RAG:-true}" | tr '[:upper:]' '[:lower:]')
+    if [ "$enable" != "true" ] && [ "$enable" != "1" ]; then
+      echo "RAG disabled (ENABLE_RAG=$ENABLE_RAG)"
+      exit 0
+    fi
+
+    QUERY="${RETRIEVAL_QUERY:-}"
+    if [ -z "$QUERY" ] && [ -n "${GITHUB_TOKEN:-}" ] && [ -n "${GITHUB_OWNER:-}" ] && [ -n "${GITHUB_REPO:-}" ] && [ -n "${ISSUE_NUMBER:-}" ]; then
+      echo "Fetching issue #${ISSUE_NUMBER} for the retrieval query..."
+      issue_json=$(curl -fsSL \
+        -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+        -H "Accept: application/vnd.github+json" \
+        "https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/issues/${ISSUE_NUMBER}" 2>/dev/null)
+      if [ -n "$issue_json" ]; then
+        parsed=$(printf '%s' "$issue_json" | python3 -c 'import json,sys
+    try:
+        data=json.load(sys.stdin)
+    except Exception:
+        raise SystemExit(0)
+    title=data.get("title") or ""
+    body=data.get("body") or ""
+    text=(title + "\n" + body).strip()
+    sys.stdout.write(text)
+    ')
+        if [ -n "$parsed" ]; then
+          QUERY=$parsed
+        fi
+      fi
+    fi
+
+    if [ -z "$QUERY" ]; then
+      QUERY="issue ${ISSUE_NUMBER:-} ${ISSUE_LABEL:-} ${GITHUB_REPO:-}"
+      QUERY=$(printf '%s' "$QUERY" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+    fi
+
+    if [ -z "$QUERY" ]; then
+      echo "Retrieval query is empty; skipping."
+      exit 0
+    fi
+
+    OUT="/rag/retrieved_code_context.md"
+    mkdir -p /rag
+    rm -f "$OUT"
+
+    QURL="${QDRANT_URL:-http://qdrant.ai-dev.svc.cluster.local:6333}"
+    LIMIT="${RAG_TOP_K:-5}"
+    REPO_FILTER="${RAG_REPO:-${GITHUB_REPO:-}}"
+
+    if [ -z "$REPO_FILTER" ]; then
+      echo "No repository specified; skipping RAG retrieval to prevent cross-repo leakage."
+      exit 0
+    fi
+
+    echo "Querying $QURL (top_k=$LIMIT, repo=$REPO_FILTER)..."
+    python3 /app/index_code.py \
+      --query "$QUERY" \
+      --qdrant-url "$QURL" \
+      --limit "$LIMIT" \
+      --repo "$REPO_FILTER" \
+      --output "$OUT"
+
+    if [ -s "$OUT" ]; then
+      echo "Wrote retrieved context to $OUT"
+    else
+      echo "No code context retrieved (continuing without RAG)."
+      rm -f "$OUT"
+    fi
+    exit 0
+  retrieve-code.py: |
+    #!/usr/bin/env python3
+    """
+    Retrieve relevant indexed code from Qdrant and format as context for the agent.
+    Used prior to SWE-agent runs to inject RAG context into the agent's prompt.
+    """
+
+    import sys
+    from pathlib import Path
+
+    # Add code-indexer to sys.path
+    SCRIPT_DIR = Path(__file__).resolve().parent
+    AI_DEV_DIR = SCRIPT_DIR.parent
+
+    for candidate_dir in [
+        AI_DEV_DIR / "code-indexer",
+        Path("/app"),
+        Path("/config"),
+        SCRIPT_DIR,
+    ]:
+        if candidate_dir.exists() and str(candidate_dir) not in sys.path:
+            sys.path.insert(0, str(candidate_dir))
+
+    try:
+        from index_code import CodeIndexer, CodeRetriever, main
+
+        __all__ = ["CodeIndexer", "CodeRetriever", "main"]
+    except ImportError:
+        CodeIndexer = None  # type: ignore
+        CodeRetriever = None  # type: ignore
+        main = None  # type: ignore
+
+
+    def run():
+        if main is None:
+            sys.stderr.write("ERROR: index_code module could not be found or imported.\n")
+            return 1
+        result = main(sys.argv[1:])
+        return 0 if result is None else int(result)
+
+
+    if __name__ == "__main__":
+        sys.exit(run())
   run-swe-agent.sh: |
     #!/bin/bash
     set -euo pipefail
@@ -241,6 +723,10 @@ data:
     ALLOW_FORCE_PUSH="${ALLOW_FORCE_PUSH:-false}"
     ENFORCE_GUARDRAILS="${ENFORCE_GUARDRAILS:-true}"
     WORKSPACE="${WORKSPACE:-/workspace}"
+    ENABLE_RAG="${ENABLE_RAG:-true}"
+    QDRANT_URL="${QDRANT_URL:-http://qdrant.ai-dev.svc.cluster.local:6333}"
+    RAG_TOP_K="${RAG_TOP_K:-5}"
+    RETRIEVAL_QUERY="${RETRIEVAL_QUERY:-}"
 
     # Strip placeholder tokens left by the template
     strip_placeholder() {
@@ -265,6 +751,7 @@ data:
     echo "OPEN_PR:        $OPEN_PR"
     echo "Human approval: require=$REQUIRE_HUMAN_APPROVAL approved=$HUMAN_APPROVED"
     echo "Guardrails:     allowlist=$PATH_ALLOWLIST max_files=$MAX_CHANGED_FILES force_push=$ALLOW_FORCE_PUSH"
+    echo "RAG retrieval:  enable=$ENABLE_RAG qdrant=$QDRANT_URL top_k=$RAG_TOP_K"
     echo ""
 
     # Resolve ISSUE_URL from number or label when needed
@@ -379,6 +866,129 @@ data:
         -e "s|base_url:.*|base_url: \"${LM_BASE_URL}\"|" \
         "$CONFIG_FILE"
     rm -f "${CONFIG_FILE}.bak"
+
+    # --- RAG Code Retrieval (Issue #15) ---
+    # Query code_embeddings before sweagent and append hits to system_template.
+    # An init container may already have written /rag/retrieved_code_context.md.
+    # Retrieval failure must not fail the agent run.
+    RAG_CONTEXT_FILE="/tmp/retrieved_code_context.md"
+    rm -f "$RAG_CONTEXT_FILE"
+    enable_rag_l=$(echo "$ENABLE_RAG" | tr "[:upper:]" "[:lower:]")
+    if [[ "$enable_rag_l" == "true" || "$enable_rag_l" == "1" ]]; then
+      echo "=== RAG Code Retrieval ==="
+      if [[ -s /rag/retrieved_code_context.md ]]; then
+        cp /rag/retrieved_code_context.md "$RAG_CONTEXT_FILE"
+        echo "Using code context written by the retrieve-code init container."
+      else
+        RAG_QUERY="${RETRIEVAL_QUERY:-}"
+        if [[ -z "$RAG_QUERY" && -n "${GITHUB_TOKEN:-}" && -n "$GITHUB_OWNER" && -n "$GITHUB_REPO" && -n "$ISSUE_NUMBER" ]]; then
+          echo "Fetching issue #${ISSUE_NUMBER} details from GitHub for retrieval query..."
+          issue_json="$(curl -fsSL -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/issues/${ISSUE_NUMBER}" 2>/dev/null || true)"
+          if [[ -n "$issue_json" ]]; then
+            parsed_query="$(printf '%s' "$issue_json" | python3 -c 'import json,sys
+    try:
+        data=json.load(sys.stdin)
+    except Exception:
+        raise SystemExit(0)
+    title=data.get("title") or ""
+    body=data.get("body") or ""
+    text=(title+"\n"+body).strip()
+    sys.stdout.write(text)
+    ' || true)"
+            if [[ -n "$parsed_query" ]]; then
+              RAG_QUERY="$parsed_query"
+            fi
+          fi
+        fi
+
+        if [[ -z "$RAG_QUERY" ]]; then
+          RAG_QUERY="${ISSUE_TITLE:-} ${ISSUE_BODY:-} ${ISSUE_LABEL:-} issue #${ISSUE_NUMBER:-} on ${GITHUB_REPO:-}"
+          RAG_QUERY="$(echo "$RAG_QUERY" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+        fi
+
+        if [[ -n "${RETRIEVER_SCRIPT:-}" ]]; then
+          retriever_candidates=("$RETRIEVER_SCRIPT")
+        else
+          retriever_candidates=(
+            /app/index_code.py
+            "$(dirname "$0")/../code-indexer/index_code.py"
+            "$(pwd)/ai-dev/code-indexer/index_code.py"
+            /config/index_code.py
+            /config/retrieve-code.py
+            "$(dirname "$0")/retrieve-code.py"
+            "$(dirname "$0")/../scripts/retrieve-code.py"
+          )
+        fi
+
+        run_retriever() {
+          local repo_filter="$1"
+          local candidate rc
+          for candidate in "${retriever_candidates[@]}"; do
+            if [[ ! -f "$candidate" ]]; then
+              continue
+            fi
+            echo "Querying Qdrant ($QDRANT_URL) via $candidate (repo: ${repo_filter:-all}, top_k=$RAG_TOP_K)..."
+            local -a args
+            args=(python3 "$candidate" --query "$RAG_QUERY" --qdrant-url "$QDRANT_URL" --limit "$RAG_TOP_K" --output "$RAG_CONTEXT_FILE")
+            if [[ -n "$repo_filter" ]]; then
+              args+=(--repo "$repo_filter")
+            fi
+            set +e
+            "${args[@]}"
+            rc=$?
+            set -e
+            if [[ "$rc" -eq 0 && -s "$RAG_CONTEXT_FILE" ]]; then
+              return 0
+            fi
+            rm -f "$RAG_CONTEXT_FILE"
+          done
+          return 1
+        }
+
+        if [[ -n "$RAG_QUERY" ]]; then
+          repo_filter="${RAG_REPO:-${GITHUB_REPO:-}}"
+          if [[ -n "$repo_filter" ]]; then
+            run_retriever "$repo_filter" || true
+          else
+            echo "Note: no repository filter specified; skipping RAG retrieval."
+          fi
+        else
+          echo "Note: retrieval query is empty; skipping RAG retrieval."
+        fi
+      fi
+
+      if [[ -s "$RAG_CONTEXT_FILE" ]]; then
+        injector=""
+        for candidate in \
+          /config/inject_context.py \
+          "$(dirname "$0")/inject_context.py" \
+          "$(dirname "$0")/../code-indexer/inject_context.py" \
+          "$(pwd)/ai-dev/code-indexer/inject_context.py"; do
+          if [[ -f "$candidate" ]]; then
+            injector="$candidate"
+            break
+          fi
+        done
+        if [[ -n "$injector" ]]; then
+          set +e
+          python3 "$injector" "$CONFIG_FILE" "$RAG_CONTEXT_FILE"
+          inject_rc=$?
+          set -e
+          if [[ "$inject_rc" -ne 0 ]]; then
+            echo "Note: Could not inject RAG context into $CONFIG_FILE (continuing)."
+          fi
+        else
+          echo "Note: inject_context.py not found; retrieved context left at $RAG_CONTEXT_FILE."
+        fi
+      else
+        echo "Note: No relevant code retrieved from Qdrant or Qdrant unavailable (continuing without RAG context)."
+      fi
+      echo "=========================="
+    else
+      echo "RAG code retrieval: DISABLED (ENABLE_RAG=$ENABLE_RAG)"
+    fi
 
     # Build command
     CMD=(sweagent run --config "$CONFIG_FILE")

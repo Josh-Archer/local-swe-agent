@@ -48,7 +48,7 @@ jobs:
 
       - name: Lint with black
         run: |
-          black --check ai-dev/code-indexer/index_code.py ai-dev/tests/
+          black --check ai-dev/code-indexer/index_code.py ai-dev/code-indexer/inject_context.py ai-dev/tests/
 
       - name: Lint with flake8
         run: |

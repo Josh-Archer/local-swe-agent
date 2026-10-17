@@ -54,6 +54,13 @@ spec:
             configMapKeyRef:
               name: llm-endpoint-config
               key: STATUS_MESSAGE
+        # RAG code retrieval parameters
+        - name: ENABLE_RAG
+          value: "true"
+        - name: QDRANT_URL
+          value: "http://qdrant.ai-dev.svc.cluster.local:6333"
+        - name: RAG_TOP_K
+          value: "5"
         # Prefer real key from secret when using remote APIs; run script defaults to dummy-key for local vLLM
         - name: OPENAI_API_KEY
           valueFrom:

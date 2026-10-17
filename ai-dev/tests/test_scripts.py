@@ -22,6 +22,7 @@ class TestScriptSyntax:
             "validate-manifests.sh",
             "guardrails-check.sh",
             "run-guarded-issue-job.sh",
+            "retrieve-init.sh",
         ],
     )
     def test_script_syntax(self, script):
