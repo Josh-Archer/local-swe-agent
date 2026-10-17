@@ -22,45 +22,70 @@ def redact_secrets(text: str) -> str:
     if not text:
         return ""
 
-    # 1. Private key blocks (full block: PKCS#1, PKCS#8, etc.)
+    go_tag_lines = []
+
+    def protect_go_tag(match):
+        token = f"__CODE_INDEXER_GO_TAG_{len(go_tag_lines)}__"
+        go_tag_lines.append(match.group(0))
+        return token
+
     text = re.sub(
-        r"-----BEGIN\s+(?:[A-Z0-9_]+\s+)*PRIVATE KEY(?:\s+BLOCK)?-----"
-        r"[\s\S]*?-----END\s+(?:[A-Z0-9_]+\s+)*PRIVATE KEY(?:\s+BLOCK)?-----",
-        "[REDACTED_PRIVATE_KEY]",
+        r'(?m)^.*\b[A-Z][A-Za-z0-9_]*\s+[A-Za-z0-9_*]+\s+`json:"[^"\n]+"`.*$',
+        protect_go_tag,
         text,
-        flags=re.IGNORECASE,
-    )
-    # Private key blocks split across chunks: BEGIN onward if no END in chunk
-    text = re.sub(
-        r"-----BEGIN\s+(?:[A-Z0-9_]+\s+)*PRIVATE KEY(?:\s+BLOCK)?-----[\s\S]*$",
-        "[REDACTED_PRIVATE_KEY]",
-        text,
-        flags=re.IGNORECASE,
-    )
-    # Private key blocks split across chunks: END tail without BEGIN in chunk
-    text = re.sub(
-        r"^[\s\S]*?-----END\s+(?:[A-Z0-9_]+\s+)*PRIVATE KEY(?:\s+BLOCK)?-----",
-        "[REDACTED_PRIVATE_KEY]",
-        text,
-        flags=re.IGNORECASE,
     )
 
-    # 2. Certificate blocks (full, or split)
-    text = re.sub(
-        r"-----BEGIN\s+(?:[A-Z0-9_\s]*CERTIFICATE)-----[\s\S]*?-----END\s+(?:[A-Z0-9_\s]*CERTIFICATE)-----",
-        "[REDACTED_CERTIFICATE]",
-        text,
+    # Scan key markers once. A lazy BEGIN-to-END regex retries from every
+    # unterminated BEGIN marker and becomes quadratic on damaged chunks.
+    key_marker = re.compile(
+        r"-----((?:BEGIN|END)\s+(?:[A-Z0-9_]+\s+)*PRIVATE KEY(?:\s+BLOCK)?)-----",
+        re.IGNORECASE,
     )
-    text = re.sub(
-        r"-----BEGIN\s+(?:[A-Z0-9_\s]*CERTIFICATE)-----[\s\S]*$",
-        "[REDACTED_CERTIFICATE]",
-        text,
+    key_edits = []
+    key_start = None
+    for marker in key_marker.finditer(text):
+        if marker.group(1).upper().startswith("BEGIN"):
+            if key_start is None:
+                key_start = marker.start()
+        elif key_start is not None:
+            key_edits.append((key_start, marker.end()))
+            key_start = None
+        elif not key_edits and marker.start() > 0:
+            # A chunk containing only the tail of a split block is sensitive.
+            key_edits.append((0, marker.end()))
+    if key_start is not None:
+        key_edits.append((key_start, len(text)))
+    for start, end in reversed(key_edits):
+        text = text[:start] + "[REDACTED_PRIVATE_KEY]" + text[end:]
+
+    # Certificate blocks use the same marker scan. An END-only chunk is
+    # redacted only when its prefix resembles encoded certificate data, so a
+    # source constant such as PEM_FOOTER remains indexable.
+    cert_marker = re.compile(
+        r"-----((?:BEGIN|END)\s+[A-Z0-9_\s]*CERTIFICATE)-----", re.IGNORECASE
     )
-    text = re.sub(
-        r"^[\s\S]*?-----END\s+(?:[A-Z0-9_\s]*CERTIFICATE)-----",
-        "[REDACTED_CERTIFICATE]",
-        text,
-    )
+    cert_edits = []
+    cert_start = None
+    for marker in cert_marker.finditer(text):
+        if marker.group(1).upper().startswith("BEGIN"):
+            if cert_start is None:
+                cert_start = marker.start()
+        elif cert_start is not None:
+            cert_edits.append((cert_start, marker.end()))
+            cert_start = None
+        elif not cert_edits and marker.start() > 0:
+            prefix = text[: marker.start()]
+            encoded_lines = [
+                line.strip() for line in prefix.splitlines() if line.strip()
+            ]
+            if encoded_lines and all(
+                re.fullmatch(r"[A-Za-z0-9+/=]+", line) for line in encoded_lines
+            ):
+                cert_edits.append((0, marker.end()))
+    if cert_start is not None:
+        cert_edits.append((cert_start, len(text)))
+    for start, end in reversed(cert_edits):
+        text = text[:start] + "[REDACTED_CERTIFICATE]" + text[end:]
 
     # 3. AWS access keys
     text = re.sub(r"\b(AKIA|ABIA|ACCA|ASIA)[0-9A-Z]{16}\b", "[REDACTED_AWS_KEY]", text)
@@ -99,206 +124,208 @@ def redact_secrets(text: str) -> str:
     )
 
     # OpenAI-style secret keys can occur outside key/value assignments.
-    text = re.sub(r"\bsk-[A-Za-z0-9_-]{16,}\b", "[REDACTED_API_KEY]", text)
-
-    # Structured documents are edited through YAML node source marks. This
-    # preserves comments, quoting, flow style, block scalars, and whitespace.
-    # JSON is YAML too, so the same node walk handles both while safe_load
-    # confirms that aliases and scalar types have normal safe semantics.
-    candidate = text.lstrip()
-    looks_structured = candidate.startswith(("{", "[", "---")) or re.search(
-        r"(?m)^\s*(?:-\s+)?(?:['\"][^'\"\n]+['\"]|[A-Za-z_][\w.-]*)\s*:",
+    text = re.sub(
+        r"\bsk-(?!toggleable(?:__|\b))[A-Za-z0-9_-]{16,}\b",
+        "[REDACTED_API_KEY]",
         text,
     )
-    try:
-        if not looks_structured:
-            raise ValueError("not a structured document")
-        import yaml
 
-        root = yaml.compose(text, Loader=yaml.SafeLoader)
-        yaml.safe_load(text)
-    except Exception:
-        root = None
-    if root is not None:
-        secret_name = re.compile(
-            r"(?i)(?:password|passwd|passphrase|pwd|secret|token|"
-            r"api[-_]?key|[a-z0-9]+[_-](?:password|passwd|passphrase|pwd|secret|token)|"
-            r"[a-z0-9]+_token|"
-            r"[a-z0-9]+(?:Secret|Token)|secret_key_base|secret_key|aws_secret_access_key|"
-            r"x-api-key|x_api_key)"
+    # Structural passes preserve JSON types and YAML syntax. They are an
+    # additional layer: code and shell patterns below always run afterward.
+    secret_name_re = re.compile(
+        r"(?i)(?:password|passwd|passphrase|pwd|secret|token|api[-_]?key|"
+        r"(?:[a-z0-9]+[_-])*[a-z0-9]+[_-](?:password|passwd|passphrase|pwd|secret|token|key)|"
+        r"(?:[a-z0-9]+[_-])*[a-z0-9]+_(?:token|key)|"
+        r"[a-z0-9]+(?:Secret|Token)|secret_key_base|secret_key|"
+        r"aws_secret_access_key|x-api-key|x_api_key)"
+    )
+
+    def auth_redacted(value):
+        scheme = re.match(r"^([A-Za-z][A-Za-z0-9_-]*)\s+", value)
+        return (scheme.group(1) + " " if scheme else "") + "[REDACTED_TOKEN]"
+
+    candidate = text.lstrip()
+    if candidate.startswith(("{", "[")):
+        try:
+            parsed = json.loads(text)
+            stack = [parsed]
+            changed = False
+            while stack:
+                item = stack.pop()
+                if isinstance(item, dict):
+                    for key, value in list(item.items()):
+                        if (
+                            isinstance(key, str)
+                            and key.lower() == "authorization"
+                            and isinstance(value, str)
+                            and value
+                        ):
+                            item[key] = auth_redacted(value)
+                            changed = True
+                        elif (
+                            isinstance(key, str)
+                            and secret_name_re.fullmatch(key)
+                            and isinstance(value, str)
+                            and value
+                        ):
+                            item[key] = "[REDACTED_SECRET]"
+                            changed = True
+                        elif isinstance(value, (dict, list)):
+                            stack.append(value)
+                elif isinstance(item, list):
+                    stack.extend(
+                        value for value in item if isinstance(value, (dict, list))
+                    )
+            if changed:
+                text = json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+        except (ValueError, TypeError, RecursionError):
+            pass
+    else:
+        looks_yaml = not re.search(r'`[A-Za-z_][\w-]*:"[^"\n]*"`', text) and (
+            candidate.startswith("---")
+            or re.search(
+                r"(?m)^\s*(?:-\s+)?(?:['\"][^'\"\n]+['\"]|[A-Za-z_][\w.-]*)\s*:",
+                text,
+            )
         )
-        edits = []
+        if looks_yaml:
+            try:
+                import yaml
 
-        def add_scalar(value_node, marker="[REDACTED_SECRET]"):
-            if (
-                not isinstance(value_node, yaml.ScalarNode)
-                or value_node.tag != "tag:yaml.org,2002:str"
-                or not value_node.value
-            ):
-                return
-            start, end = value_node.start_mark.index, value_node.end_mark.index
-            raw = text[start:end]
-            if raw.lstrip().startswith(("*", "&", "${")):
-                return
-            if re.match(
-                r"(?i)^(?:[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*\s*[\[(]|"
-                r"Optional\[|Union\[|list\[|dict\[)",
-                raw.strip(),
-            ):
-                return
-            style = value_node.style
-            if style == '"':
-                replacement = json.dumps(marker)
-            elif style == "'":
-                replacement = "'" + marker + "'"
-            elif style in ("|", ">"):
-                header, _, body = raw.partition("\n")
-                indent = re.match(r"[ \t]*", body).group(0)
-                replacement = (
-                    header
-                    + "\n"
-                    + indent
-                    + marker
-                    + ("\n" if raw.endswith("\n") else "")
-                )
-            else:
-                replacement = marker
-            edits.append((start, end, replacement))
+                root = yaml.compose(text, Loader=yaml.SafeLoader)
+                edits = []
+                seen = set()
 
-        def visit(node):
-            if isinstance(node, yaml.MappingNode):
-                names = {
-                    key.value.lower(): value
-                    for key, value in node.value
-                    if isinstance(key, yaml.ScalarNode)
-                }
-                name_node = names.get("name")
-                value_node = names.get("value")
-                if (
-                    name_node is not None
-                    and value_node is not None
-                    and isinstance(name_node, yaml.ScalarNode)
-                    and secret_name.fullmatch(name_node.value)
-                ):
-                    add_scalar(value_node)
-                for key_node, value_node in node.value:
+                def add_scalar(node, marker="[REDACTED_SECRET]"):
                     if (
-                        isinstance(key_node, yaml.ScalarNode)
-                        and key_node.tag == "tag:yaml.org,2002:str"
-                        and secret_name.fullmatch(key_node.value)
-                        and isinstance(value_node, yaml.ScalarNode)
-                        and value_node.tag == "tag:yaml.org,2002:str"
-                        and value_node.value
+                        not isinstance(node, yaml.ScalarNode)
+                        or node.tag != "tag:yaml.org,2002:str"
+                        or not node.value
                     ):
-                        add_scalar(value_node)
-                    elif (
-                        isinstance(key_node, yaml.ScalarNode)
-                        and key_node.tag == "tag:yaml.org,2002:str"
-                        and key_node.value.lower() == "authorization"
-                        and isinstance(value_node, yaml.ScalarNode)
-                        and value_node.tag == "tag:yaml.org,2002:str"
-                        and value_node.value
+                        return
+                    raw = text[node.start_mark.index : node.end_mark.index]
+                    if raw.lstrip().startswith(("*", "&", "${", "!ENV")):
+                        return
+                    if node.value.lower() in {
+                        "required",
+                        "the",
+                        "string",
+                        "str",
+                        "optional",
+                        "none",
+                        "true",
+                        "false",
+                    }:
+                        return
+                    if re.match(
+                        r"(?i)^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*\s*(?:\(|\[)", raw.strip()
                     ):
-                        auth_value = value_node.value
-                        scheme = re.match(r"^([A-Za-z][A-Za-z0-9_-]*)\s+", auth_value)
-                        marker = (
-                            scheme.group(1) + " " if scheme else ""
-                        ) + "[REDACTED_TOKEN]"
-                        add_scalar(value_node, marker)
-                    visit(key_node)
-                    visit(value_node)
-            elif isinstance(node, yaml.SequenceNode):
-                for child in node.value:
-                    visit(child)
+                        return
+                    style = node.style
+                    if style == '"':
+                        replacement = json.dumps(marker)
+                    elif style == "'":
+                        replacement = "'" + marker + "'"
+                    elif style in ("|", ">"):
+                        header, _, body = raw.partition("\n")
+                        indent = re.match(r"[ \t]*", body).group(0)
+                        replacement = (
+                            header
+                            + "\n"
+                            + indent
+                            + marker
+                            + ("\n" if raw.endswith("\n") else "")
+                        )
+                    else:
+                        replacement = json.dumps(marker)
+                    edits.append(
+                        (node.start_mark.index, node.end_mark.index, replacement)
+                    )
 
-        visit(root)
-        for start, end, replacement in sorted(edits, reverse=True):
-            text = text[:start] + replacement + text[end:]
-        if isinstance(root, (yaml.MappingNode, yaml.SequenceNode)):
-            return text
+                def visit(node):
+                    ident = id(node)
+                    if ident in seen:
+                        return
+                    seen.add(ident)
+                    if isinstance(node, yaml.MappingNode):
+                        name_value = next(
+                            (
+                                v
+                                for k, v in node.value
+                                if isinstance(k, yaml.ScalarNode)
+                                and k.value.lower() == "name"
+                            ),
+                            None,
+                        )
+                        value_value = next(
+                            (
+                                v
+                                for k, v in node.value
+                                if isinstance(k, yaml.ScalarNode)
+                                and k.value.lower() == "value"
+                            ),
+                            None,
+                        )
+                        if (
+                            isinstance(name_value, yaml.ScalarNode)
+                            and isinstance(value_value, yaml.ScalarNode)
+                            and secret_name_re.fullmatch(name_value.value)
+                        ):
+                            add_scalar(value_value)
+                        for key, value in node.value:
+                            if isinstance(
+                                key, yaml.ScalarNode
+                            ) and secret_name_re.fullmatch(key.value):
+                                add_scalar(value)
+                            elif (
+                                isinstance(key, yaml.ScalarNode)
+                                and key.value.lower() == "authorization"
+                                and isinstance(value, yaml.ScalarNode)
+                                and value.value
+                            ):
+                                add_scalar(value, auth_redacted(value.value))
+                            visit(key)
+                            visit(value)
+                    elif isinstance(node, yaml.SequenceNode):
+                        for child in node.value:
+                            visit(child)
+
+                visit(root)
+                for start, end, replacement in sorted(set(edits), reverse=True):
+                    text = text[:start] + replacement + text[end:]
+            except Exception:
+                pass
 
     # A source file can mix shell/code with a complete JSON object on one line.
     # Parse those lines independently so valid JSON islands get the same
     # structural treatment without applying JSON rules to surrounding code.
-    json_key = re.compile(
-        r"(?i)(?:password|passwd|passphrase|pwd|secret|token|api[-_]?key|"
-        r"[a-z0-9]+[_-](?:password|passwd|passphrase|pwd|secret|token)|"
-        r"[a-z0-9]+(?:Secret|Token)|[a-z0-9]+_(?:KEY|TOKEN)|TOKEN_VALUE|"
-        r"secret_key_base|secret_key|aws_secret_access_key|"
-        r"x-api-key|x_api_key)"
-    )
-
-    def scrub_json(value):
-        if isinstance(value, dict):
-            return {
-                key: (
-                    "[REDACTED_SECRET]"
-                    if isinstance(key, str)
-                    and json_key.fullmatch(key)
-                    and isinstance(child, str)
-                    and child
-                    else (
-                        (
-                            re.sub(
-                                r"^([A-Za-z][A-Za-z0-9_-]*)\s+.*$",
-                                r"\1 [REDACTED_TOKEN]",
-                                child,
-                            )
-                            if re.match(r"^[A-Za-z][A-Za-z0-9_-]*\s+", child)
-                            else "[REDACTED_TOKEN]"
-                        )
-                        if isinstance(key, str)
-                        and key.lower() == "authorization"
-                        and isinstance(child, str)
-                        and child
-                        else scrub_json(child)
-                    )
-                )
-                for key, child in value.items()
-            }
-        if isinstance(value, list):
-            return [scrub_json(child) for child in value]
-        return value
-
-    changed_lines = []
-    for line in text.splitlines(keepends=True):
-        candidate = line.strip()
-        if not candidate.startswith(("{", "[")):
-            changed_lines.append(line)
-            continue
-        try:
-            parsed_line = json.loads(candidate)
-        except (ValueError, TypeError):
-            changed_lines.append(line)
-            continue
-        scrubbed = scrub_json(parsed_line)
-        if scrubbed != parsed_line:
-            leading = line[: len(line) - len(line.lstrip())]
-            ending = "\n" if line.endswith("\n") else ""
-            changed_lines.append(
-                leading + json.dumps(scrubbed, separators=(",", ":")) + ending
-            )
-        else:
-            changed_lines.append(line)
-    text = "".join(changed_lines)
-
     # Targeted code and shell forms. Quoted literals may contain escaped quotes;
     # bare values are redacted only when they look like literals, not names or
     # expressions. Separators and closing syntax stay outside the match.
     credential_names = (
-        r"(?:password|passwd|passphrase|pwd|secret|token|SECRET_KEY|"
+        r"(?:password|passwd|passphrase|pwd|secret|token|SECRET_KEY|default|"
         r"secret_key_base|aws_secret_access_key|aws_access_key_id|"
-        r"[A-Za-z0-9]+[_-](?:PASSWORD|SECRET|TOKEN|KEY)|"
-        r"[A-Za-z0-9]+_(?:TOKEN|KEY)|TOKEN_VALUE|[A-Za-z0-9]+Secret|[A-Za-z0-9]+Token|"
+        r"(?:[A-Za-z0-9]+[_-])*[A-Za-z0-9]+[_-](?:PASSWORD|SECRET|TOKEN|KEY)|"
+        r"(?:[A-Za-z0-9]+[_-])*[A-Za-z0-9]+_(?:TOKEN|KEY)|TOKEN_VALUE|[A-Za-z0-9]+Secret|[A-Za-z0-9]+Token|"
         r"api[-_]?key|x-api-key)"
+    )
+    text = re.sub(
+        rf"(?i)(?P<prefix>(?:\b{credential_names})\b[ \t]*:[ \t]*)!!binary[ \t]+[^\s,;}}]+",
+        lambda match: match.group("prefix") + json.dumps("[REDACTED_SECRET]"),
+        text,
     )
     quoted_value = r"""(?P<q>['"`])(?:\\.|(?!\1)[^\\])*?\1"""
 
     def replace_literal(match):
         value = match.group("value")
-        if value.startswith(("*", "&", "${")):
+        if value == "$" and text[match.end() :].startswith("{"):
+            return match.group(0)
+        if value.startswith(("*", "&", "${", "!")):
             return match.group(0)
         if value[0] in "'\"`":
+            inner = value[1:-1]
+            if inner.startswith("${"):
+                return match.group(0)
             if len(value) == 2:
                 return match.group(0)
             quote = value[0]
@@ -306,7 +333,12 @@ def redact_secrets(text: str) -> str:
         # Expressions and identifiers are source code, not literal credentials.
         if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*", value):
             key = (
-                match.group("prefix").split("=", 1)[0].split(":", 1)[0].strip().lower()
+                match.group("prefix")
+                .split("=", 1)[0]
+                .split(":", 1)[0]
+                .strip()
+                .lower()
+                .split(".")[-1]
             )
             if value.lower() == key or "." in value:
                 return match.group(0)
@@ -320,15 +352,43 @@ def redact_secrets(text: str) -> str:
                 "false",
             }:
                 return match.group(0)  # common prose and type annotation values
-        if value in {"|", ">", "True", "False", "None", "null", "true", "false"}:
+        if value in {
+            "|",
+            ">",
+            "True",
+            "False",
+            "None",
+            "null",
+            "true",
+            "false",
+            "string",
+            "int",
+            "bool",
+            "required",
+        }:
             return match.group(0)
-        return match.group("prefix") + "[REDACTED_SECRET]"
+        if re.match(r"\s*\(", text[match.end() :]):
+            return match.group(0)
+        marker = (
+            json.dumps("[REDACTED_SECRET]")
+            if ":" in match.group("prefix")
+            else "[REDACTED_SECRET]"
+        )
+        return match.group("prefix") + marker
 
     kv = re.compile(
-        rf"(?i)(?P<prefix>(?:\b{credential_names})\b[ \t]*(?:=(?!=)|:[ \t]*))[ \t]*(?P<value>"
+        rf"(?i)(?P<prefix>(?<![\w'\"])(?:\b{credential_names})\b[ \t]*(?:=(?!=)[ \t]*|:[ \t]*))[ \t]*(?P<value>"
         rf"(?:'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"|`(?:\\.|[^`\\])*`|[^\s,;,)}}\[{{(]+))"
     )
     text = kv.sub(replace_literal, text)
+
+    # Quoted keys occur in partial JSON and inline code dictionaries. Match
+    # their literal value independently of whether the surrounding chunk parses.
+    quoted_key = re.compile(
+        rf"(?i)(?P<prefix>(?P<keyquote>['\"])(?:{credential_names})(?P=keyquote)[ \t]*:[ \t]*)(?P<value>"
+        rf"(?:'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"|`(?:\\.|[^`\\])*`|[^\s,;}}\]]+))"
+    )
+    text = quoted_key.sub(replace_literal, text)
 
     # Preserve block scalar headers while replacing only their indented bodies
     # in mixed snippets that are not a complete YAML document.
@@ -336,7 +396,7 @@ def redact_secrets(text: str) -> str:
         r"(?im)^(?P<indent>[ \t]*)(?P<key>password|passwd|passphrase|pwd|secret|token|"
         r"[A-Za-z0-9]+[_-](?:password|passwd|passphrase|pwd|secret|token))"
         r"[ \t]*:[ \t]*(?P<indicator>[|>][-+]?(?:[1-9])?)[ \t]*(?:#.*)?\r?\n"
-        r"(?P<body>(?:(?:[ \t]+[^\r\n]*|[ \t]*)\r?\n)*)"
+        r"(?P<body>(?:(?:[ \t]*?(?P=indent)[ \t]+[^\r\n]*|[ \t]*)\r?\n)*)"
     )
 
     def replace_block(match):
@@ -371,14 +431,18 @@ def redact_secrets(text: str) -> str:
     )
 
     text = re.sub(
-        r"(?i)\bPGPASSWORD[ \t]*=[ \t]*([^\s;]+)",
-        r"PGPASSWORD=[REDACTED_SECRET]",
+        r"(?i)\bPGPASSWORD[ \t]*=[ \t]*(?P<value>[^\s;]+)",
+        lambda match: (
+            match.group(0)
+            if "${" in match.group("value")
+            else "PGPASSWORD=[REDACTED_SECRET]"
+        ),
         text,
     )
 
     # Short -p forms and common client-specific password switches.
     text = re.sub(
-        r"(?i)(?<![\w-])-p(?P<value>'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"|[^\s]+)",
+        r"(?i)(?<![\w-])-p(?!r\b)(?P<value>'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"|[^\s]+)",
         lambda m: "-p"
         + (
             m.group("value")[0] + "[REDACTED_SECRET]" + m.group("value")[0]
@@ -393,7 +457,9 @@ def redact_secrets(text: str) -> str:
         text,
     )
     text = re.sub(
-        r"(?i)(curl\s+[^\n]*?-u\s+[^:\s]+:)([^\s'\"`]+)", r"\1[REDACTED_SECRET]", text
+        r"(?i)(curl\s+[^\n]*?(?:--user|-u)\s+[^:\s]+:)([^\s'\"`]+)",
+        r"\1[REDACTED_SECRET]",
+        text,
     )
     text = re.sub(
         r"(?im)(^\s*(?:machine\s+\S+\s+)?(?:login\s+\S+\s+)?password[ \t]+)(?![=])([^\s#]+)",
@@ -418,8 +484,8 @@ def redact_secrets(text: str) -> str:
         text,
     )
     text = re.sub(
-        r"""(?i)(authorization['"`]?\s*(?:\]\s*)?[:=][ \t]*)(['"`])(?:\\.|(?!\2)[^\\])*?\2""",
-        lambda m: m.group(1) + m.group(2) + "[REDACTED_TOKEN]" + m.group(2),
+        r"""(?i)(authorization['"`]?\s*(?:\]\s*)?[:=][ \t]*)(['"`])(?P<auth>(?:\\.|(?!\2)[^\\])*?)\2""",
+        lambda m: m.group(1) + m.group(2) + auth_redacted(m.group("auth")) + m.group(2),
         text,
     )
     text = re.sub(
@@ -432,6 +498,8 @@ def redact_secrets(text: str) -> str:
         r"\1[REDACTED_TOKEN]",
         text,
     )
+    for index, source_line in enumerate(go_tag_lines):
+        text = text.replace(f"__CODE_INDEXER_GO_TAG_{index}__", source_line)
     return text
 
 

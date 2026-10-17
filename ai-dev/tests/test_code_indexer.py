@@ -2376,7 +2376,7 @@ class TestSecretDenylistAndRedaction:
     )
     def test_round_four_secret_leak_regressions(self, template):
         value = "".join(["qa", "round", "four", "731"])
-        output = redact_secrets(template.format(value=value))
+        output = redact_secrets(template.replace("{value}", value))
         assert value not in output
         assert "[REDACTED_SECRET]" in output
 
@@ -2473,6 +2473,194 @@ class TestSecretDenylistAndRedaction:
             assert "still-secret" not in output
         if "flow:" in source:
             assert after["flow"]["count"] == 4
+
+    @pytest.mark.parametrize(
+        "template",
+        [
+            'requests.post(url, json={"password": "{value}"})',
+            'creds = {"password": "{value}", "user": "bob"}',
+            'creds = {\n  "password": "{value}",\n  "user": "bob"\n}',
+            "const creds = {'password': '{value}'};",
+            '  "password": "{value}",\n  "host": "db"',
+            '  "password": "{value}",\n  "host": "db"',
+            "environment:\n  - POSTGRES_PASSWORD={value}",
+            "command: mysql -uroot -p{value}",
+            'args: ["sh", "-c", "PGPASSWORD={value} psql"]',
+            "- run: |\n    docker login -u bob -p {value} ghcr.io",
+            "MYSQL_ROOT_PASSWORD: {value}",
+            "SLACK_BOT_TOKEN={value}",
+            "db_admin_password: {value}",
+            "DB_ADMIN_PASSWORD = '{value}'",
+            "- name: MYSQL_ROOT_PASSWORD\n  value: {value}",
+            "private_key: {value}",
+            'default = "{value}"',
+            "password: !!binary {value}",
+            "curl --user bob:{value} https://example.invalid",
+            'requests.post(url, json={"password": "{value}",',
+            '  "password": "{value}',
+        ],
+    )
+    def test_round_f_layered_secret_leak_regressions(self, template):
+        value = "".join(["qa", "round", "five", "secret", "731"])
+        output = redact_secrets(template.replace("{value}", value))
+        assert value not in output
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "password = get_password()",
+            "cp -pr a b",
+            'Password string `json:"password"`',
+            'PGPASSWORD="${PGPASSWORD}"',
+            "password: !ENV ${DB_PASS}",
+            "password: *alias",
+            "password = self.password",
+            "password = args.password",
+            "if password == confirm_password:",
+            "def login(user: str, password: str) -> bool:",
+            "token: Optional[str] = None",
+            "interface User { password: string }",
+            '"""password: The user password is required."""',
+            "password: required\n  description: keep this schema",
+            "sorted(items, key=len)",
+            "max(d, key=lambda k: d[k])",
+            "tokenizer = AutoTokenizer.from_pretrained(m)",
+            "max_tokens = self.chunk_size",
+            "keyboard = Keyboard()",
+            "passed = run_tests()",
+            "bypass = False",
+            "self.set(key=key, value=value)",
+            "keys:\n  - a",
+            "key=\"repository\"\ntoken_type='phrase'\npasswd=''",
+            "completekey='tab'",
+            'monkey = "banana"',
+            "self.token = ''",
+            "key = 'true'",
+            "target[key] = config2[key]",
+            "{key: jinja2_native}",
+            "key: valid2",
+            ".sk-toggleable__content",
+            'PEM_FOOTER = "-----END CERTIFICATE-----"',
+        ],
+    )
+    def test_round_f_false_positive_regressions(self, source):
+        assert redact_secrets(source) == source
+
+    def test_round_f_structural_yaml_markers_and_aliases(self):
+        import yaml
+
+        value = "".join(["alias", "secret", "731"])
+        cases = [
+            f"password: {value}\n",
+            f"db: {{user: bob, password: {value}}}\n",
+            f"---\nstringData:\n  password: {value}\n---\npassword: {value}\n",
+            f"base: &b\n  password: {value}\nprod:\n  <<: *b\n",
+            f"a: &x {{password: {value}}}\nb: *x\nc: *x\n",
+        ]
+        for source in cases:
+            output = redact_secrets(source)
+            parsed = list(yaml.safe_load_all(output))
+            assert value not in output
+            assert "'[REDACTED_SECRET]'" in output or '"[REDACTED_SECRET]"' in output
+            assert parsed
+
+    @pytest.mark.parametrize(
+        "source,scheme",
+        [
+            ('headers = {"Authorization": "Bearer VALUE"}', "Bearer"),
+            ('headers = {"Authorization": "Basic VALUE"}', "Basic"),
+            ('headers["Authorization"] = "Digest VALUE"', "Digest"),
+        ],
+    )
+    def test_round_f_authorization_mapping_keeps_scheme(self, source, scheme):
+        value = "".join(["auth", "mapping", "secret", "731"])
+        output = redact_secrets(source.replace("VALUE", value))
+        assert value not in output
+        assert scheme + " [REDACTED_TOKEN]" in output
+
+    def test_round_f_secret_assignment_keeps_separator_whitespace(self):
+        value = "".join(["secret", "spacing", "731"])
+        output = redact_secrets("SECRET_KEY = '" + value + "'")
+        assert value not in output
+        assert output.startswith("SECRET_KEY = '")
+
+    @pytest.mark.parametrize(
+        "scheme",
+        [
+            "Basic",
+            "Bearer",
+            "token",
+            "Digest",
+            "AWS4-HMAC-SHA256",
+            "Negotiate",
+            "NTLM",
+            "HOBA",
+            "Mutual",
+            "SCRAM-SHA-256",
+            "vapid",
+            "DPoP",
+            "PrivateToken",
+            "Signature",
+        ],
+    )
+    def test_authorization_scheme_table(self, scheme):
+        value = "".join(["scheme", "credential", "731"])
+        output = redact_secrets(f"Authorization: {scheme} {value}")
+        assert value not in output
+        assert f"{scheme} [REDACTED_TOKEN]" in output
+
+    @pytest.mark.parametrize(
+        "label",
+        [
+            "PRIVATE KEY",
+            "RSA PRIVATE KEY",
+            "EC PRIVATE KEY",
+            "DSA PRIVATE KEY",
+            "OPENSSH PRIVATE KEY",
+            "ENCRYPTED PRIVATE KEY",
+            "PGP PRIVATE KEY BLOCK",
+        ],
+    )
+    def test_private_key_marker_table_full_and_chunked(self, label):
+        dashes = "-----"
+        begin = f"{dashes}BEGIN {label}{dashes}"
+        end = f"{dashes}END {label}{dashes}"
+        payload = "".join(["runtime", "encoded", "material", "731"])
+        for source in (
+            f"{begin}\n{payload}\n{end}",
+            f"{begin}\n{payload}",
+            f"{payload}\n{end}\nreturn key",
+        ):
+            output = redact_secrets(source)
+            assert payload not in output
+            assert "[REDACTED_PRIVATE_KEY]" in output
+
+    def test_redaction_handles_deep_json_and_large_inputs_quickly(self):
+        import time
+
+        secret = "".join(["deep", "secret", "731"])
+        deep = "{" * 950 + '"password":"' + secret + '"' + "}" * 950
+        assert secret not in redact_secrets(deep)
+        nested = "[" * 5000 + "]" * 5000
+        assert redact_secrets(nested) == nested
+
+        large_value = "".join(["large", "secret", "731"])
+        large = (
+            '{"items":['
+            + ",".join('{"password":"' + large_value + '"}' for _ in range(80000))
+            + "]}"
+        )
+        start = time.perf_counter()
+        output = redact_secrets(large)
+        elapsed = time.perf_counter() - start
+        assert large_value not in output
+        assert elapsed < 2.0
+
+        repeated_begin = "-----BEGIN PRIVATE KEY-----\n" * 30000
+        start = time.perf_counter()
+        output = redact_secrets(repeated_begin)
+        assert "-----BEGIN PRIVATE KEY-----" not in output
+        assert time.perf_counter() - start < 2.0
 
     def test_truncation_notes_respect_tiny_budgets(self):
         from inject_context import enforce_context_budget
