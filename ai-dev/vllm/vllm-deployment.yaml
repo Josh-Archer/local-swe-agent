@@ -99,9 +99,9 @@ spec:
         - --max-num-seqs=$(MAX_NUM_SEQS)
         # Quantization enabled for AWQ model
         - --quantization=$(QUANTIZATION)
-        # Uncomment to enable LoRA adapters
-        # - --enable-lora
-        # - --lora-modules=custom=/adapters/custom-lora
+        # LoRA adapters enabled
+        - --enable-lora
+        - --lora-modules=custom=/adapters/custom-lora
         ports:
         - name: http
           containerPort: 8000

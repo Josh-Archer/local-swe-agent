@@ -348,6 +348,30 @@ class TestManifestValidation:
             in deploy_safe
         )
 
+    def test_vllm_deployment_enables_lora_flags(self):
+        """vLLM deployment must enable LoRA flags and adapter volume mount."""
+        import yaml
+
+        dep_path = Path(__file__).parent.parent / "vllm" / "vllm-deployment.yaml"
+        docs = list(yaml.safe_load_all(dep_path.read_text(encoding="utf-8")))
+        dep = next(doc for doc in docs if doc and doc.get("kind") == "Deployment")
+        pod_spec = dep["spec"]["template"]["spec"]
+        vllm_container = next(c for c in pod_spec["containers"] if c["name"] == "vllm")
+        args = vllm_container.get("args", [])
+
+        assert "--enable-lora" in args
+        assert "--lora-modules=custom=/adapters/custom-lora" in args
+
+        mount_paths = [vm["mountPath"] for vm in vllm_container.get("volumeMounts", [])]
+        assert "/adapters" in mount_paths
+
+        claim_names = [
+            v["persistentVolumeClaim"]["claimName"]
+            for v in pod_spec.get("volumes", [])
+            if "persistentVolumeClaim" in v
+        ]
+        assert "adapter-storage" in claim_names
+
 
 @pytest.mark.integration
 class TestPythonScripts:
