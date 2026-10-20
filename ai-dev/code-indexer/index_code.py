@@ -9,7 +9,7 @@ import sys
 import logging
 import yaml
 from pathlib import Path
-from typing import List, Dict, Any, Set, Union, Optional, cast
+from typing import List, Dict, Any, Set, Union, Optional, cast, Tuple
 from datetime import datetime
 import hashlib
 import uuid
@@ -27,11 +27,83 @@ from qdrant_client.models import (
 )
 from sentence_transformers import SentenceTransformer
 
+try:
+    from transformers import AutoTokenizer, logging as hf_logging
+
+    hf_logging.set_verbosity_error()
+except ImportError:
+    AutoTokenizer = None  # type: ignore
+    hf_logging = None  # type: ignore
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+
+def _usable_tokenizer(tokenizer: Any) -> bool:
+    """Return True when `tokenizer` exposes an encode callable."""
+    if tokenizer is None:
+        return False
+    encode = getattr(tokenizer, "encode", None)
+    return callable(encode)
+
+
+def _coerce_id_list(encoded: Any) -> Optional[List[Any]]:
+    """Return token ids when `encoded` is a sequence of ids, else None."""
+    if isinstance(encoded, tuple):
+        encoded = list(encoded)
+    if not isinstance(encoded, list):
+        return None
+    if encoded and isinstance(encoded[0], (list, tuple)):
+        encoded = list(encoded[0])
+    if not encoded:
+        return []
+    try:
+        int(encoded[0])
+    except (TypeError, ValueError):
+        return None
+    return encoded
+
+
+def _coerce_offset_spans(offsets: Any) -> Optional[List[Tuple[int, int]]]:
+    """Return character spans when `offsets` is a list of (start, end) pairs."""
+    if not isinstance(offsets, (list, tuple)):
+        return None
+    spans: List[Tuple[int, int]] = []
+    for pair in offsets:
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            return None
+        try:
+            start = int(pair[0])
+            end = int(pair[1])
+        except (TypeError, ValueError):
+            return None
+        if isinstance(pair[0], bool) or isinstance(pair[1], bool):
+            return None
+        if start < 0 or end < 0:
+            return None
+        spans.append((start, end))
+    return spans
+
+
+def _whitespace_spans(text: str) -> List[Tuple[int, int]]:
+    """Spans of non-whitespace runs, measured on the original string."""
+    spans: List[Tuple[int, int]] = []
+    index = 0
+    length = len(text)
+    while index < length:
+        while index < length and text[index].isspace():
+            index += 1
+        if index >= length:
+            break
+        end = index + 1
+        while end < length and not text[end].isspace():
+            end += 1
+        spans.append((index, end))
+        index = end
+    return spans
 
 
 def generate_point_id(repo_name: str, file_path: str, chunk_index: int = 0) -> str:
@@ -49,6 +121,7 @@ class CodeIndexer:
         config_path: Union[str, Path, Dict[str, Any]] = "/app/config.yaml",
         qdrant_client: Optional[Any] = None,
         embedding_model: Optional[Any] = None,
+        tokenizer: Optional[Any] = None,
     ):
         """Initialize the code indexer."""
         logger.info("Initializing Code Indexer...")
@@ -96,6 +169,7 @@ class CodeIndexer:
             or embedding_dict.get("model")
             or "sentence-transformers/all-MiniLM-L6-v2"
         )
+        self._embedding_model_name = model_name
         if embedding_model is not None:
             self.embedding_model = embedding_model
         else:
@@ -109,19 +183,56 @@ class CodeIndexer:
         else:
             self.embedding_dim = int(qdrant_dict.get("vector_size", 384))
 
-        # Chunking parameters
+        # Context window and tokenizer (Issue #17)
+        max_seq_len = getattr(self.embedding_model, "max_seq_length", None)
+        if isinstance(max_seq_len, int) and max_seq_len > 0:
+            self.max_seq_length: int = max_seq_len
+        else:
+            self.max_seq_length = 256
+
+        # Prefer an explicit tokenizer or the one bundled with the embedding
+        # model. Do not download a tokenizer here: a missing tokenizer is
+        # resolved lazily from the local cache on first use.
+        self._tokenizer_resolved = False
+        self._tokenizer_failure: Optional[str] = None
+        self._token_fallback_warned = False
+        self._offset_fallback_warned = False
+        self.tokenizer = None
+        if tokenizer is not None:
+            self.tokenizer = tokenizer
+            self._tokenizer_resolved = True
+        else:
+            model_tokenizer = getattr(self.embedding_model, "tokenizer", None)
+            if _usable_tokenizer(model_tokenizer):
+                self.tokenizer = model_tokenizer
+                self._tokenizer_resolved = True
+
+        # Chunking parameters (tokens)
         indexing_cfg = self.config.get("indexing")
         indexing_dict: Dict[str, Any] = (
             indexing_cfg if isinstance(indexing_cfg, dict) else {}
         )
         chunk_size_val = (
-            self.config.get("chunk_size") or indexing_dict.get("chunk_size") or 500
+            self.config.get("chunk_size")
+            or indexing_dict.get("chunk_size")
+            or self.max_seq_length
         )
-        self.chunk_size: int = int(chunk_size_val)
+        configured_chunk_size = int(chunk_size_val)
+        if configured_chunk_size > self.max_seq_length:
+            logger.info(
+                f"Configured chunk_size ({configured_chunk_size}) exceeds embedding model context window "
+                f"({self.max_seq_length}); capping to {self.max_seq_length}"
+            )
+            self.chunk_size: int = self.max_seq_length
+        else:
+            self.chunk_size = configured_chunk_size
+
         chunk_overlap_val = (
-            self.config.get("chunk_overlap") or indexing_dict.get("chunk_overlap") or 50
+            self.config.get("chunk_overlap") or indexing_dict.get("chunk_overlap") or 32
         )
-        self.chunk_overlap: int = int(chunk_overlap_val)
+        self.chunk_overlap: int = min(
+            int(chunk_overlap_val), max(0, self.chunk_size - 1)
+        )
 
         # Code file extensions to index
         code_exts = self.config.get("code_extensions") or indexing_dict.get(
@@ -282,26 +393,365 @@ class CodeIndexer:
             logger.error(f"Failed to clone/pull {repo_name}: {e}")
             raise
 
+    def _warn_token_fallback(self, reason: str) -> None:
+        """Log once when token counts fall back to a whitespace word count."""
+        if self._token_fallback_warned:
+            return
+        self._token_fallback_warned = True
+        logger.warning(
+            "Tokenizer unavailable (%s); falling back to whitespace word count. "
+            "Word counts can be much lower than the embedding model's token counts "
+            "and may let chunks exceed the context window.",
+            reason,
+        )
+
+    def _get_tokenizer(self) -> Any:
+        """Return the tokenizer, loading it from the local cache on first use."""
+        if self._tokenizer_resolved:
+            return self.tokenizer
+        self._tokenizer_resolved = True
+        if AutoTokenizer is None:
+            self._tokenizer_failure = "transformers is not installed"
+            self.tokenizer = None
+            return None
+        try:
+            # local_files_only: never reach the network from indexing.
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self._embedding_model_name,
+                local_files_only=True,
+            )
+            logger.info(
+                "Loaded tokenizer for %s from the local cache",
+                self._embedding_model_name,
+            )
+        except Exception as exc:
+            self.tokenizer = None
+            self._tokenizer_failure = (
+                f"could not load a cached tokenizer for {self._embedding_model_name}: "
+                f"{exc}"
+            )
+        return self.tokenizer
+
+    def _token_ids(self, text: str) -> Optional[List[Any]]:
+        """Encode `text` to content token ids, or None when that is not possible."""
+        tokenizer = self._get_tokenizer()
+        if tokenizer is None:
+            self._warn_token_fallback(
+                self._tokenizer_failure or "no tokenizer is configured"
+            )
+            return None
+        try:
+            encoded: Any = None
+            if hasattr(tokenizer, "encode") and callable(tokenizer.encode):
+                try:
+                    encoded = tokenizer.encode(text, add_special_tokens=False)
+                except TypeError:
+                    encoded = tokenizer.encode(text)
+            elif callable(tokenizer):
+                called = tokenizer(text, add_special_tokens=False)
+                if isinstance(called, dict) or hasattr(called, "get"):
+                    encoded = called.get("input_ids")
+            ids = _coerce_id_list(encoded)
+        except Exception as exc:
+            self._warn_token_fallback(f"tokenizer error: {exc}")
+            return None
+        if ids is None:
+            self._warn_token_fallback("tokenizer returned no token ids")
+            return None
+        return ids
+
+    def count_tokens(self, text: str) -> int:
+        """Count the number of content tokens in the given text for the embedder."""
+        if not text:
+            return 0
+        ids = self._token_ids(text)
+        if ids is not None:
+            return len(ids)
+        return max(1, len(text.split()))
+
+    def _offset_spans(self, text: str) -> Optional[List[Tuple[int, int]]]:
+        """Character spans of tokens in `text`, or None when offsets are unavailable.
+
+        Spans index the original string. Callers slice with them instead of
+        decoding token ids, which would lowercase, strip accents, and drop
+        characters the vocabulary maps to unknown.
+        """
+        tokenizer = self._get_tokenizer()
+        if tokenizer is None or not callable(tokenizer):
+            return None
+        try:
+            encoded = tokenizer(
+                text,
+                add_special_tokens=False,
+                return_offsets_mapping=True,
+            )
+        except Exception as exc:
+            if not self._offset_fallback_warned:
+                self._offset_fallback_warned = True
+                logger.warning(
+                    "Tokenizer offset mapping unavailable (%s); "
+                    "splitting long lines on original whitespace spans",
+                    exc,
+                )
+            return None
+        offsets = None
+        if isinstance(encoded, dict) or hasattr(encoded, "get"):
+            try:
+                offsets = encoded.get("offset_mapping")
+            except Exception:
+                offsets = None
+        spans = _coerce_offset_spans(offsets)
+        if not spans:
+            if not self._offset_fallback_warned:
+                self._offset_fallback_warned = True
+                logger.warning(
+                    "Tokenizer did not return offset mappings; "
+                    "splitting long lines on original whitespace spans"
+                )
+            return None
+        return spans
+
+    def _fit_prefix(self, text: str, max_tokens: int) -> str:
+        """Longest prefix of `text` whose content token count is <= max_tokens."""
+        if not text:
+            return ""
+        if max_tokens < 1:
+            max_tokens = 1
+        if self.count_tokens(text) <= max_tokens:
+            return text
+        best = ""
+        low = 1
+        high = len(text)
+        while low <= high:
+            mid = (low + high) // 2
+            candidate = text[:mid]
+            if candidate.strip() and self.count_tokens(candidate) <= max_tokens:
+                best = candidate
+                low = mid + 1
+            else:
+                high = mid - 1
+        if best:
+            return best
+        return text[:1]
+
+    def _pieces_from_spans(
+        self,
+        text: str,
+        spans: List[Tuple[int, int]],
+        max_tokens: int,
+        overlap: int,
+    ) -> List[str]:
+        """Slice `text` into exact substrings that each re-encode within max_tokens.
+
+        A window that cannot extend past the previous piece drops its overlap
+        instead of emitting a suffix that is already fully covered.
+        """
+        if max_tokens < 1:
+            max_tokens = 1
+        overlap = min(max(0, overlap), max_tokens - 1)
+        spans = list(spans)
+        pieces: List[str] = []
+        total = len(spans)
+        cursor = 0
+        previous_end = 0
+        steps = 0
+        # Each step consumes at least one character or one span.
+        step_limit = len(text) + total + 5
+        length = len(text)
+
+        while cursor < total and steps < step_limit:
+            steps += 1
+            span_start, span_end = spans[cursor]
+            if span_end <= span_start:
+                cursor += 1
+                continue
+
+            window_end = min(cursor + max_tokens, total)
+            while (
+                window_end > cursor
+                and spans[window_end - 1][1] <= spans[window_end - 1][0]
+            ):
+                window_end -= 1
+
+            chosen_end: Optional[int] = None
+            piece = ""
+            end = window_end
+            while end > cursor:
+                char_start = min(max(spans[cursor][0], 0), length)
+                char_end = min(max(spans[end - 1][1], 0), length)
+                if char_end <= char_start:
+                    end -= 1
+                    continue
+                candidate = text[char_start:char_end]
+                if candidate.strip() and self.count_tokens(candidate) <= max_tokens:
+                    chosen_end = end
+                    piece = candidate
+                    break
+                end -= 1
+
+            if chosen_end is None:
+                # Still inside the previous piece: drop the overlap and try
+                # the first uncovered span on its own.
+                if cursor < previous_end:
+                    cursor = previous_end
+                    continue
+                char_start = min(max(span_start, 0), length)
+                char_end = min(max(span_end, 0), length)
+                raw = text[char_start:char_end]
+                piece = self._fit_prefix(raw, max_tokens)
+                if not piece or not piece.strip():
+                    cursor += 1
+                    continue
+                pieces.append(piece)
+                consumed = len(piece)
+                if char_start + consumed < char_end:
+                    spans[cursor] = (char_start + consumed, char_end)
+                else:
+                    cursor += 1
+                    previous_end = max(previous_end, cursor)
+                continue
+
+            if chosen_end <= previous_end:
+                # Overlap tail cannot take in new tokens. Resume after the
+                # previous piece so the tail is not emitted again.
+                if cursor < previous_end:
+                    cursor = previous_end
+                    continue
+                break
+
+            pieces.append(piece)
+            previous_end = chosen_end
+            next_cursor = chosen_end - overlap
+            if next_cursor <= cursor:
+                next_cursor = cursor + 1
+            cursor = next_cursor
+
+        if cursor < total:
+            logger.warning(
+                "Stopped splitting a long line after %s steps; %s token spans were not covered",
+                steps,
+                total - cursor,
+            )
+        return pieces
+
+    def _split_long_line(
+        self, line: str, line_no: int, max_tokens: int, overlap: int
+    ) -> List[Dict[str, Any]]:
+        """Split one over-long line into substrings that fit in max_tokens."""
+        spans = self._offset_spans(line)
+        if not spans:
+            spans = _whitespace_spans(line)
+        pieces = (
+            self._pieces_from_spans(line, spans, max_tokens, overlap) if spans else []
+        )
+        chunks: List[Dict[str, Any]] = []
+        for piece in pieces:
+            if piece.strip():
+                chunks.append(
+                    {
+                        "content": piece,
+                        "start_line": line_no,
+                        "end_line": line_no,
+                    }
+                )
+        return chunks
+
     def chunk_code(self, content: str, file_path: str) -> List[Dict[str, Any]]:
-        """Chunk code into smaller pieces with overlap."""
+        """Chunk code into smaller pieces that fit the embedding model's context window."""
+        if not content.strip():
+            return []
+
         lines = content.split("\n")
-        chunks = []
+        n_lines = len(lines)
+        chunks: List[Dict[str, Any]] = []
 
-        # Simple line-based chunking
-        chunk_lines = self.chunk_size
-        overlap_lines = self.chunk_overlap
+        # Reserve 2 tokens for special tokens ([CLS], [SEP]) when the window allows.
+        max_tokens = self.chunk_size
+        if self.max_seq_length > 2:
+            max_tokens = min(self.chunk_size, self.max_seq_length - 2)
+        if max_tokens < 1:
+            max_tokens = 1
+        overlap = min(self.chunk_overlap, max(0, max_tokens - 1))
 
-        step = max(1, chunk_lines - overlap_lines)
-        for i in range(0, len(lines), step):
-            chunk_content = "\n".join(lines[i : i + chunk_lines])
+        start_idx = 0
+        last_emitted_end = -1
+        steps = 0
+        while start_idx < n_lines:
+            steps += 1
+            if steps > n_lines + 2:
+                logger.warning(
+                    "Stopped chunking %s early at line %s to avoid a non-progress loop",
+                    file_path,
+                    start_idx + 1,
+                )
+                break
+
+            single_line_tokens = self.count_tokens(lines[start_idx])
+            if single_line_tokens > max_tokens:
+                sub_chunks = self._split_long_line(
+                    lines[start_idx], start_idx + 1, max_tokens, overlap
+                )
+                chunks.extend(sub_chunks)
+                last_emitted_end = start_idx
+                start_idx += 1
+                continue
+
+            end_idx = start_idx
+            best_end = start_idx
+            while end_idx + 1 < n_lines:
+                candidate = "\n".join(lines[start_idx : end_idx + 2])
+                if self.count_tokens(candidate) <= max_tokens:
+                    best_end = end_idx + 1
+                    end_idx += 1
+                    continue
+                break
+
+            # Overlap left a window that cannot pass the previous chunk.
+            if best_end <= last_emitted_end:
+                next_start = last_emitted_end + 1
+                if next_start <= start_idx:
+                    next_start = start_idx + 1
+                start_idx = next_start
+                continue
+
+            chunk_content = "\n".join(lines[start_idx : best_end + 1])
             if chunk_content.strip():
                 chunks.append(
                     {
                         "content": chunk_content,
-                        "start_line": i + 1,
-                        "end_line": min(i + chunk_lines, len(lines)),
+                        "start_line": start_idx + 1,
+                        "end_line": best_end + 1,
                     }
                 )
+            last_emitted_end = best_end
+
+            if best_end >= n_lines - 1:
+                break
+
+            next_start = best_end + 1
+            if overlap > 0:
+                overlap_start = best_end + 1
+                for back_idx in range(best_end, start_idx, -1):
+                    overlap_candidate = "\n".join(lines[back_idx : best_end + 1])
+                    if self.count_tokens(overlap_candidate) <= overlap:
+                        overlap_start = back_idx
+                    else:
+                        break
+                # Keep the overlap only when the next chunk can include the
+                # following line. Otherwise the overlap is re-emitted as a
+                # series of contained tails (lines 75-80, 76-80, 77-80, ...).
+                if overlap_start <= best_end and best_end + 1 < n_lines:
+                    extended = "\n".join(lines[overlap_start : best_end + 2])
+                    next_line_tokens = self.count_tokens(lines[best_end + 1])
+                    if (
+                        next_line_tokens <= max_tokens
+                        and self.count_tokens(extended) <= max_tokens
+                    ):
+                        next_start = overlap_start
+
+            if next_start <= start_idx:
+                next_start = best_end + 1
+            start_idx = next_start
 
         return chunks
 
