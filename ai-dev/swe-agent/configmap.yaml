@@ -401,68 +401,60 @@ data:
                 else DEFAULT_MAX_INJECT_TOKENS
             )
 
-        # Fast path if within limits and fences are closed
         encoded = context.encode("utf-8")
-        words = context.split()
         lines = context.splitlines(keepends=True)
         if (
             len(encoded) <= max_bytes
-            and len(words) <= max_tokens
+            and len(context.split()) <= max_tokens
             and _find_unclosed_fence(lines) is None
         ):
             return context
 
-        kept_lines: List[str] = []
-        current_bytes = 0
-        current_words = 0
-        truncated = False
-
         trunc_comment = "\n\n<!-- Context truncated to stay within budget -->"
 
-        for line in lines:
-            line_bytes = len(line.encode("utf-8"))
-            line_words = len(line.split())
-            if (current_bytes + line_bytes > max_bytes) or (
-                current_words + line_words > max_tokens
-            ):
-                truncated = True
-                if not kept_lines:
-                    # Truncate oversized single line to fit
-                    max_slice = max(0, max_bytes - len(trunc_comment.encode("utf-8")) - 10)
-                    raw = line.encode("utf-8")[:max_slice].decode("utf-8", errors="ignore")
-                    if raw:
-                        kept_lines.append(raw)
-                break
-            kept_lines.append(line)
-            current_bytes += line_bytes
-            current_words += line_words
+        def fit_prefix(candidate: str) -> str:
+            """Fit a prefix plus truncation marker and any required closing fence."""
+            # Respect word budget without flattening whitespace or line endings.
+            word_count = 0
+            token_end = len(candidate)
+            for match in re.finditer(r"\S+", candidate):
+                word_count += 1
+                if word_count > max_tokens:
+                    token_end = match.start()
+                    break
+            candidate = candidate[:token_end]
 
-        if not truncated and len(encoded) <= max_bytes and len(words) <= max_tokens:
-            open_fence = _find_unclosed_fence(kept_lines)
-            if open_fence:
-                close_str = f"\n{open_fence[0]}{open_fence[1]}\n"
-                return ("".join(kept_lines).rstrip() + close_str).strip()
-            return context
+            while candidate:
+                open_fence = _find_unclosed_fence(candidate.splitlines(keepends=True))
+                close_fence = f"\n{open_fence[0]}{open_fence[1]}" if open_fence else ""
+                suffix = close_fence + trunc_comment
+                result = candidate.rstrip() + suffix
+                if (
+                    len(result.encode("utf-8")) <= max_bytes
+                    and len(result.split()) <= max_tokens
+                ):
+                    return result
 
-        # Truncated: ensure any open code fence is closed and budget is respected
-        while kept_lines:
-            open_fence = _find_unclosed_fence(kept_lines)
-            close_fence = f"\n{open_fence[0]}{open_fence[1]}" if open_fence else ""
-            suffix = f"{close_fence}{trunc_comment}"
-            suffix_bytes = len(suffix.encode("utf-8"))
-            suffix_words = len(suffix.split())
+                # Remove a complete line first to preserve source formatting. If
+                # the only line is oversized, trim at a UTF-8 character boundary.
+                if "\n" in candidate.rstrip("\n"):
+                    candidate = candidate.rsplit("\n", 1)[0] + "\n"
+                else:
+                    candidate = candidate[:-1]
 
-            current_bytes = len("".join(kept_lines).encode("utf-8"))
-            current_words = len("".join(kept_lines).split())
+            # Very small budgets cannot fit the full marker. Return a bounded
+            # prefix of it rather than exceeding the caller's byte limit.
+            marker = "<!-- Context truncated -->"
+            return marker.encode("utf-8")[: max(0, max_bytes)].decode(
+                "utf-8", errors="ignore"
+            )
 
-            if (current_bytes + suffix_bytes <= max_bytes) and (
-                current_words + suffix_words <= max_tokens
-            ):
-                trimmed = "".join(kept_lines).rstrip() + suffix
-                return trimmed
-            kept_lines.pop()
-
-        return trunc_comment.strip()
+        # Keep a newline-aware prefix first. Oversized individual lines are then
+        # shortened by bytes, preserving any newline characters in the prefix.
+        reserve = len(trunc_comment.encode("utf-8")) + 8
+        max_prefix_bytes = max(0, max_bytes - reserve)
+        prefix = encoded[:max_prefix_bytes].decode("utf-8", errors="ignore")
+        return fit_prefix(prefix)
 
 
     def _context_already_present(block_text: str, context: str) -> bool:

@@ -1592,9 +1592,27 @@ class TestCodeRetrieval:
             mock_inst.format_retrieved_context.return_value = "## Formatted"
             mock_cls.return_value = mock_inst
 
-            rc = main(["--query", "sample query", "--output", str(out_file)])
+            rc = main(
+                [
+                    "--query",
+                    "sample query",
+                    "--repo",
+                    "synthetic-repo",
+                    "--output",
+                    str(out_file),
+                ]
+            )
             assert rc == 0
             assert out_file.read_text(encoding="utf-8") == "## Formatted"
+            mock_inst.retrieve_code.assert_called_once()
+
+    def test_cli_skips_unscoped_retrieval(self, temp_workspace):
+        out_file = temp_workspace / "context.md"
+        out_file.write_text("stale context", encoding="utf-8")
+        with patch("index_code.CodeIndexer") as mock_cls:
+            assert main(["--query", "sample query", "--output", str(out_file)]) == 0
+        mock_cls.assert_not_called()
+        assert out_file.read_text(encoding="utf-8") == ""
 
     def test_retrieval_settings_keep_zero_values(
         self, in_memory_qdrant, mock_embedding_model
@@ -1943,6 +1961,11 @@ class TestSecretDenylistAndRedaction:
             "service-account.json",
             "service-account-prod.json",
             "aws_credentials",
+            "nested/KUBECONFIG",
+            "nested/KUBE/config",
+            "nested/.DOCKER/config.json",
+            "nested/SERVICE-ACCOUNT.json",
+            "nested/AWS_CREDENTIALS",
         ],
     )
     def test_is_secret_path_denylist(self, secret_path):
@@ -2090,6 +2113,41 @@ class TestSecretDenylistAndRedaction:
         assert "MIIEvgIBADANBgkq" not in redacted_end
         assert "[REDACTED_PRIVATE_KEY]" in redacted_end
         assert "return key" in redacted_end
+
+    def test_redact_qa_key_value_forms(self):
+        text = (
+            "token=SYNTHETIC_TOKEN_VALUE\n"
+            "GITHUB_TOKEN=SYNTHETIC_GITHUB_VALUE\n"
+            "PUSHOVER_TOKEN=SYNTHETIC_PUSHOVER_VALUE\n"
+            "DB_PASSWORD=SYNTHETIC_PASSWORD_VALUE\n"
+            "api_token: SYNTHETIC_API_TOKEN_VALUE\n"
+            '"password": "SYNTHETIC_JSON_PASSWORD_VALUE"\n'
+            "secret=SYNTHETIC_SECRET_VALUE\n"
+            "aws_secret_access_key = SYNTHETIC_AWS_SECRET_VALUE\n"
+            "Authorization: token SYNTHETIC_AUTH_TOKEN_VALUE\n"
+        )
+        redacted = redact_secrets(text)
+        for value in (
+            "SYNTHETIC_TOKEN_VALUE",
+            "SYNTHETIC_GITHUB_VALUE",
+            "SYNTHETIC_PUSHOVER_VALUE",
+            "SYNTHETIC_PASSWORD_VALUE",
+            "SYNTHETIC_API_TOKEN_VALUE",
+            "SYNTHETIC_JSON_PASSWORD_VALUE",
+            "SYNTHETIC_SECRET_VALUE",
+            "SYNTHETIC_AWS_SECRET_VALUE",
+            "SYNTHETIC_AUTH_TOKEN_VALUE",
+        ):
+            assert value not in redacted
+
+    def test_enforce_context_budget_truncates_large_single_line(self):
+        from inject_context import enforce_context_budget
+
+        huge_line = "````python\n" + ("x" * 100_000) + "\n````"
+        capped = enforce_context_budget(huge_line, max_bytes=300, max_tokens=80)
+        assert len(capped.encode("utf-8")) <= 300
+        assert "\n" in capped
+        assert "````\n\n<!-- Context truncated to stay within budget -->" in capped
 
     def test_format_retrieved_context_redacts_secrets(self):
         chunks = [

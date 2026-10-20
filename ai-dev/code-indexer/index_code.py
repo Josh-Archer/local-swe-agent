@@ -1592,6 +1592,12 @@ def main(args: Optional[List[str]] = None):
     if parsed_args.qdrant_url:
         os.environ["QDRANT_URL"] = parsed_args.qdrant_url
 
+    if parsed_args.query and not parsed_args.repo:
+        logger.warning("Repository filter is required for retrieval; skipping query.")
+        if parsed_args.output:
+            Path(parsed_args.output).write_text("", encoding="utf-8")
+        return 0
+
     try:
         config_path = parsed_args.config
         if not Path(config_path).exists():
