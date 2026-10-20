@@ -373,8 +373,8 @@ MAX_NUM_SEQS: "256"              # Batch size
 Edit `code-indexer/config.yaml`:
 
 ```yaml
-chunk_size: 500       # Lines per chunk
-chunk_overlap: 50     # Overlap between chunks
+chunk_size: 256       # Tokens per chunk (fits embedding model context window)
+chunk_overlap: 32     # Token overlap between chunks
 embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
 ```
 
