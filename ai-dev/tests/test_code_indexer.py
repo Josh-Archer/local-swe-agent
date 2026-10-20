@@ -2057,40 +2057,63 @@ class TestSecretDenylistAndRedaction:
             assert results[0]["file_path"] == "src/app.py"
 
     def test_redact_secrets_patterns(self):
+        github_token = "ghp_" + ("x" * 36)
+        aws_secret = "/".join(("wJalrXUtnFEMI", "K7MDENG", "bPxRfiCYEXAMPLEKEY"))
+        aws_access_id = "AKIA" + "IOSFODNN7EXAMPLE"
+        slack_token = "xoxb-" + "1234567890-1234567890123"
         text = (
-            "token=abcdef123456\n"
-            "GITHUB_TOKEN=ghp_123456789012345678901234567890123456\n"
-            "PUSHOVER_TOKEN=xyz789\n"
-            "DB_PASSWORD=hunter2password\n"
-            "MY_SECRET=supersecretval\n"
-            "APP_KEY=secret_app_key\n"
-            "api_token: secret_api_token\n"
-            '{"password": "hunter2password", "api_token": "tokenval"}\n'
-            "secret=some_secret_value\n"
-            "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n"
-            "password=abc12\n"
-            "Authorization: token gh_auth_token_123\n"
-            "Authorization: Bearer my_very_secret_token_12345\n"
-            "AKIAIOSFODNN7EXAMPLE\n"
-            "xoxb-1234567890-1234567890123\n"
-            "-----BEGIN PRIVATE KEY-----\nMIIEogIBAAKCAQEA...\n-----END PRIVATE KEY-----\n"
+            "token="
+            + "SYNTHETIC_TOKEN_VALUE\n"
+            + "GITHUB_TOKEN="
+            + github_token
+            + "\n"
+            + "PUSHOVER_TOKEN="
+            + "SYNTHETIC_PUSHOVER_VALUE\n"
+            + "DB_PASSWORD="
+            + "SYNTHETIC_DB_PASSWORD_VALUE\n"
+            + "MY_SECRET="
+            + "SYNTHETIC_SECRET_VALUE\n"
+            + "APP_KEY="
+            + "SYNTHETIC_APP_KEY_VALUE\n"
+            + "api_token: "
+            + "SYNTHETIC_API_TOKEN_VALUE\n"
+            + '{"password": "'
+            + "SYNTHETIC_JSON_PASSWORD_VALUE"
+            + '", "api_token": "SYNTHETIC_JSON_TOKEN_VALUE"}\n'
+            + "secret="
+            + "SYNTHETIC_SECRET_VALUE\n"
+            + "aws_secret_access_key = "
+            + aws_secret
+            + "\n"
+            + "password="
+            + "SYNTHETIC_SHORT_VALUE\n"
+            + "Authorization: token "
+            + "SYNTHETIC_AUTH_TOKEN_VALUE\n"
+            + "Authorization: Bearer "
+            + "SYNTHETIC_BEARER_VALUE\n"
+            + aws_access_id
+            + "\n"
+            + slack_token
+            + "\n"
+            + "-----BEGIN PRIVATE KEY-----\nSYNTHETIC_KEY_BODY...\n-----END PRIVATE KEY-----\n"
         )
         redacted = redact_secrets(text)
-        assert "abcdef123456" not in redacted
-        assert "ghp_1234567890" not in redacted
-        assert "xyz789" not in redacted
-        assert "hunter2password" not in redacted
-        assert "supersecretval" not in redacted
-        assert "secret_app_key" not in redacted
-        assert "secret_api_token" not in redacted
-        assert "some_secret_value" not in redacted
-        assert "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" not in redacted
-        assert "abc12" not in redacted
-        assert "gh_auth_token_123" not in redacted
-        assert "my_very_secret_token_12345" not in redacted
-        assert "AKIAIOSFODNN7EXAMPLE" not in redacted
-        assert "xoxb-" not in redacted
-        assert "MIIEogIBAAKCAQEA" not in redacted
+        assert github_token not in redacted
+        assert "SYNTHETIC_TOKEN_VALUE" not in redacted
+        assert "SYNTHETIC_PUSHOVER_VALUE" not in redacted
+        assert "SYNTHETIC_DB_PASSWORD_VALUE" not in redacted
+        assert "SYNTHETIC_SECRET_VALUE" not in redacted
+        assert "SYNTHETIC_APP_KEY_VALUE" not in redacted
+        assert "SYNTHETIC_API_TOKEN_VALUE" not in redacted
+        assert "SYNTHETIC_JSON_PASSWORD_VALUE" not in redacted
+        assert "SYNTHETIC_JSON_TOKEN_VALUE" not in redacted
+        assert aws_secret not in redacted
+        assert "SYNTHETIC_SHORT_VALUE" not in redacted
+        assert "SYNTHETIC_AUTH_TOKEN_VALUE" not in redacted
+        assert "SYNTHETIC_BEARER_VALUE" not in redacted
+        assert aws_access_id not in redacted
+        assert slack_token not in redacted
+        assert "SYNTHETIC_KEY_BODY" not in redacted
         assert "[REDACTED_SECRET]" in redacted
         assert "[REDACTED_AWS_KEY]" in redacted
         assert "[REDACTED_GITHUB_TOKEN]" in redacted
@@ -2099,18 +2122,18 @@ class TestSecretDenylistAndRedaction:
 
     def test_redact_secrets_split_private_keys(self):
         # BEGIN without END in chunk (redact from BEGIN onward)
-        chunk_begin = "def get_key():\n    # Key begins here\n    -----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkq...\n"
+        chunk_begin = "def get_key():\n    # Key begins here\n    -----BEGIN PRIVATE KEY-----\nSYNTHETIC_KEY_BODY...\n"
         redacted_begin = redact_secrets(chunk_begin)
         assert "-----BEGIN PRIVATE KEY-----" not in redacted_begin
-        assert "MIIEvgIBADANBgkq" not in redacted_begin
+        assert "SYNTHETIC_KEY_BODY" not in redacted_begin
         assert "[REDACTED_PRIVATE_KEY]" in redacted_begin
         assert "def get_key():" in redacted_begin
 
         # END tail without BEGIN in chunk (redact from start up to END)
-        chunk_end = "MIIEvgIBADANBgkq...\n-----END PRIVATE KEY-----\n    return key\n"
+        chunk_end = "SYNTHETIC_KEY_BODY...\n-----END PRIVATE KEY-----\n    return key\n"
         redacted_end = redact_secrets(chunk_end)
         assert "-----END PRIVATE KEY-----" not in redacted_end
-        assert "MIIEvgIBADANBgkq" not in redacted_end
+        assert "SYNTHETIC_KEY_BODY" not in redacted_end
         assert "[REDACTED_PRIVATE_KEY]" in redacted_end
         assert "return key" in redacted_end
 
@@ -2156,12 +2179,12 @@ class TestSecretDenylistAndRedaction:
                 "file_path": "src/auth.py",
                 "start_line": 1,
                 "end_line": 5,
-                "content": "DB_PASSWORD = 'xyz'\napi_key: 'topsecretkey123'\n",
+                "content": "DB_PASSWORD = 'SYNTHETIC_DB_PASSWORD'\napi_key: 'SYNTHETIC_API_KEY'\n",
             }
         ]
         formatted = CodeIndexer.format_retrieved_context(chunks)
-        assert "xyz" not in formatted
-        assert "topsecretkey123" not in formatted
+        assert "SYNTHETIC_DB_PASSWORD" not in formatted
+        assert "SYNTHETIC_API_KEY" not in formatted
         assert "[REDACTED_SECRET]" in formatted
 
 
