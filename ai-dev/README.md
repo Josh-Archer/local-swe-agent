@@ -394,18 +394,11 @@ model:
 
 To fine-tune LoRA adapters:
 
-1. Prepare training data from your code
-2. Use Axolotl or Unsloth in a Kubernetes Job
-3. Save adapters to `adapter-storage` PVC
-4. Enable in vLLM deployment:
+1. Prepare training data and train an adapter with Axolotl, Unsloth, or another tool.
+2. Copy the adapter files, including `adapter_config.json`, into `/adapters/custom-lora` on the `adapter-storage` PVC.
+3. Set `LORA_ADAPTER_PATH` in `vllm/vllm-configmap.yaml` to that directory, then apply the ConfigMap and restart `vllm-server`.
 
-```yaml
-args:
-  - --enable-lora
-  - --lora-modules=custom=/adapters/custom-lora
-```
-
-See separate `TRAINING.md` for detailed guide.
+The startup script always enables LoRA runtime support. It adds the static model name `custom` only when the configured directory contains `adapter_config.json`; an empty PVC therefore does not prevent vLLM from starting. Once registered, request the adapter with model name `custom`.
 
 ## Monitoring
 

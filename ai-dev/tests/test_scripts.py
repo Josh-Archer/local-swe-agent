@@ -2,6 +2,7 @@
 Tests for shell scripts in the ai-dev system.
 """
 
+import os
 import pytest
 import subprocess
 from pathlib import Path
@@ -348,19 +349,29 @@ class TestManifestValidation:
             in deploy_safe
         )
 
-    def test_vllm_deployment_enables_lora_flags(self):
-        """vLLM deployment must enable LoRA flags and adapter volume mount."""
+    def test_vllm_deployment_enables_lora_flags(self, tmp_path):
+        """The startup script advertises only provisioned static LoRA adapters."""
         import yaml
 
-        dep_path = Path(__file__).parent.parent / "vllm" / "vllm-deployment.yaml"
-        docs = list(yaml.safe_load_all(dep_path.read_text(encoding="utf-8")))
-        dep = next(doc for doc in docs if doc and doc.get("kind") == "Deployment")
+        vllm_dir = Path(__file__).parent.parent / "vllm"
+        dep_docs = list(
+            yaml.safe_load_all(
+                (vllm_dir / "vllm-deployment.yaml").read_text(encoding="utf-8")
+            )
+        )
+        config_docs = list(
+            yaml.safe_load_all(
+                (vllm_dir / "vllm-configmap.yaml").read_text(encoding="utf-8")
+            )
+        )
+        dep = next(doc for doc in dep_docs if doc and doc.get("kind") == "Deployment")
+        config = next(
+            doc for doc in config_docs if doc and doc.get("kind") == "ConfigMap"
+        )
         pod_spec = dep["spec"]["template"]["spec"]
         vllm_container = next(c for c in pod_spec["containers"] if c["name"] == "vllm")
-        args = vllm_container.get("args", [])
-
-        assert "--enable-lora" in args
-        assert "--lora-modules=custom=/adapters/custom-lora" in args
+        assert vllm_container["command"] == ["/bin/bash", "/scripts/start-vllm.sh"]
+        startup_script = config["data"]["start-vllm.sh"]
 
         mount_paths = [vm["mountPath"] for vm in vllm_container.get("volumeMounts", [])]
         assert "/adapters" in mount_paths
@@ -371,6 +382,52 @@ class TestManifestValidation:
             if "persistentVolumeClaim" in v
         ]
         assert "adapter-storage" in claim_names
+
+        shim_dir = tmp_path
+        capture_file = shim_dir / "captured-args"
+        fake_python = shim_dir / "python3"
+        fake_python.write_text(
+            '#!/bin/bash\nprintf \'%s\\n\' "$@" > "$CAPTURE_ARGS"\n',
+            encoding="utf-8",
+        )
+        fake_python.chmod(0o755)
+        script_path = shim_dir / "start-vllm.sh"
+        script_path.write_text(startup_script, encoding="utf-8")
+
+        env = {
+            **os.environ,
+            "PATH": f"{shim_dir}:{os.environ['PATH']}",
+            "CAPTURE_ARGS": str(capture_file),
+            "MODEL_PATH": "/models/test",
+            "HOST": "0.0.0.0",
+            "PORT": "8000",
+            "GPU_MEMORY_UTILIZATION": "0.7",
+            "MAX_MODEL_LEN": "8192",
+            "DTYPE": "auto",
+            "SERVED_MODEL_NAME": "test-model",
+            "MAX_NUM_SEQS": "256",
+            "QUANTIZATION": "awq",
+        }
+        adapter_path = shim_dir / "custom-lora"
+        env["LORA_ADAPTER_PATH"] = str(adapter_path)
+
+        subprocess.run(
+            ["bash", str(script_path)], env=env, check=True, capture_output=True
+        )
+        args_without_adapter = capture_file.read_text(encoding="utf-8").splitlines()
+        assert "--enable-lora" in args_without_adapter
+        assert not any(
+            arg.startswith("--lora-modules=") for arg in args_without_adapter
+        )
+
+        adapter_path.mkdir()
+        (adapter_path / "adapter_config.json").write_text("{}", encoding="utf-8")
+        subprocess.run(
+            ["bash", str(script_path)], env=env, check=True, capture_output=True
+        )
+        args_with_adapter = capture_file.read_text(encoding="utf-8").splitlines()
+        assert "--enable-lora" in args_with_adapter
+        assert f"--lora-modules=custom={adapter_path}" in args_with_adapter
 
 
 @pytest.mark.integration

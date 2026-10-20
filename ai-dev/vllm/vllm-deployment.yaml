@@ -82,26 +82,7 @@ spec:
       containers:
       - name: vllm
         image: vllm/vllm-openai:v0.6.3.post1
-        command:
-        - python3
-        - -m
-        - vllm.entrypoints.openai.api_server
-        args:
-        - --model=$(MODEL_PATH)
-        - --host=$(HOST)
-        - --port=$(PORT)
-        - --gpu-memory-utilization=$(GPU_MEMORY_UTILIZATION)
-        - --max-model-len=$(MAX_MODEL_LEN)
-        - --dtype=$(DTYPE)
-        - --trust-remote-code
-        - --served-model-name=$(SERVED_MODEL_NAME)
-        - --enable-prefix-caching
-        - --max-num-seqs=$(MAX_NUM_SEQS)
-        # Quantization enabled for AWQ model
-        - --quantization=$(QUANTIZATION)
-        # LoRA adapters enabled
-        - --enable-lora
-        - --lora-modules=custom=/adapters/custom-lora
+        command: ["/bin/bash", "/scripts/start-vllm.sh"]
         ports:
         - name: http
           containerPort: 8000
@@ -152,6 +133,11 @@ spec:
             configMapKeyRef:
               name: vllm-config
               key: MAX_NUM_SEQS
+        - name: LORA_ADAPTER_PATH
+          valueFrom:
+            configMapKeyRef:
+              name: vllm-config
+              key: LORA_ADAPTER_PATH
         - name: MODEL_NAME
           valueFrom:
             configMapKeyRef:
