@@ -159,6 +159,8 @@ spec:
         volumeMounts:
         - name: models
           mountPath: /models
+        - name: scripts
+          mountPath: /scripts
         - name: adapters
           mountPath: /adapters
         - name: shm

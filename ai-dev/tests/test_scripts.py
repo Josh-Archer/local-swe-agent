@@ -374,6 +374,7 @@ class TestManifestValidation:
         startup_script = config["data"]["start-vllm.sh"]
 
         mount_paths = [vm["mountPath"] for vm in vllm_container.get("volumeMounts", [])]
+        assert "/scripts" in mount_paths
         assert "/adapters" in mount_paths
 
         claim_names = [
