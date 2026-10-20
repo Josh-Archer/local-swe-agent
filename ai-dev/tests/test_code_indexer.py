@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch, MagicMock
 
 import pytest
+import yaml
 
 # Add code-indexer to sys.path
 INDEXER_DIR = Path(__file__).parent.parent / "code-indexer"
@@ -20,7 +21,20 @@ if str(INDEXER_DIR) not in sys.path:
 if "sentence_transformers" not in sys.modules:
     sys.modules["sentence_transformers"] = MagicMock()
 
-from index_code import CodeIndexer, generate_point_id  # noqa: E402
+from index_code import (  # noqa: E402
+    CodeIndexer,
+    CodeRetriever,
+    generate_point_id,
+    main,
+    MAX_TOP_K,
+    DEFAULT_MAX_CONTEXT_BYTES,
+    is_secret_path,
+    is_secret_content,
+)
+from inject_context import (  # noqa: E402
+    inject_context_into_system_template,
+    redact_secrets,
+)
 from qdrant_client import QdrantClient  # noqa: E402
 from qdrant_client.models import PointStruct  # noqa: E402
 
@@ -1317,6 +1331,894 @@ class TestEndToEnd:
 
         points = indexer.get_repository_point_ids("large-repo")
         assert len(points) >= 5
+
+
+class TestCodeRetrieval:
+    """Tests for code retrieval functionality (Issue #15)."""
+
+    @pytest.fixture
+    def indexed_qdrant(self, in_memory_qdrant, mock_config):
+        """Prepare an in-memory Qdrant instance populated with sample indexed points."""
+        from qdrant_client.models import VectorParams, Distance
+
+        collection_name = mock_config["qdrant"]["collection_name"]
+        in_memory_qdrant.create_collection(
+            collection_name=collection_name,
+            vectors_config=VectorParams(size=384, distance=Distance.COSINE),
+        )
+
+        vec1 = [0.1] * 384
+        vec1[0] = 0.9
+
+        vec2 = [0.1] * 384
+        vec2[1] = 0.9
+
+        vec3 = [0.1] * 384
+        vec3[0] = 0.95
+
+        in_memory_qdrant.upsert(
+            collection_name=collection_name,
+            points=[
+                PointStruct(
+                    id=generate_point_id("repo1", "src/auth.py", 0),
+                    vector=vec1,
+                    payload={
+                        "repository": "repo1",
+                        "file_path": "src/auth.py",
+                        "content": "def authenticate(user, password):\n    return check_creds(user, password)",
+                        "start_line": 1,
+                        "end_line": 2,
+                        "language": "py",
+                        "content_hash": "hash1",
+                        "indexed_at": "2026-10-17T00:00:00",
+                    },
+                ),
+                PointStruct(
+                    id=generate_point_id("repo1", "src/db.py", 0),
+                    vector=vec2,
+                    payload={
+                        "repository": "repo1",
+                        "file_path": "src/db.py",
+                        "content": "def get_connection():\n    return pool.acquire()",
+                        "start_line": 1,
+                        "end_line": 2,
+                        "language": "py",
+                        "content_hash": "hash2",
+                        "indexed_at": "2026-10-17T00:00:00",
+                    },
+                ),
+                PointStruct(
+                    id=generate_point_id("repo2", "auth/service.py", 0),
+                    vector=vec3,
+                    payload={
+                        "repository": "repo2",
+                        "file_path": "auth/service.py",
+                        "content": "class AuthService:\n    def login(self, token): pass",
+                        "start_line": 1,
+                        "end_line": 2,
+                        "language": "py",
+                        "content_hash": "hash3",
+                        "indexed_at": "2026-10-17T00:00:00",
+                    },
+                ),
+            ],
+        )
+        return in_memory_qdrant
+
+    def test_retrieve_code_basic(
+        self, mock_config, indexed_qdrant, mock_embedding_model
+    ):
+        indexer = CodeIndexer(
+            config_path=mock_config,
+            qdrant_client=indexed_qdrant,
+            embedding_model=mock_embedding_model,
+        )
+        q_vec = [0.1] * 384
+        q_vec[0] = 0.9
+        mock_embedding_model.encode.return_value = MagicMock(tolist=lambda: q_vec)
+
+        results = indexer.retrieve_code(
+            "fix user authentication bug", repo_name="repo1", limit=5
+        )
+        assert len(results) >= 1
+        top = results[0]
+        assert top["repository"] == "repo1"
+        assert top["file_path"] == "src/auth.py"
+        assert "authenticate" in top["content"]
+        assert top["start_line"] == 1
+        assert top["end_line"] == 2
+        assert top["language"] == "py"
+        assert "score" in top
+        assert top["score"] > 0.0
+
+    def test_retrieve_code_filters_by_repository(
+        self, mock_config, indexed_qdrant, mock_embedding_model
+    ):
+        indexer = CodeIndexer(
+            config_path=mock_config,
+            qdrant_client=indexed_qdrant,
+            embedding_model=mock_embedding_model,
+        )
+        q_vec = [0.1] * 384
+        q_vec[0] = 0.9
+        mock_embedding_model.encode.return_value = MagicMock(tolist=lambda: q_vec)
+
+        results_repo1 = indexer.retrieve_code("auth", repo_name="repo1")
+        assert all(r["repository"] == "repo1" for r in results_repo1)
+        assert not any(r["repository"] == "repo2" for r in results_repo1)
+
+        results_repo2 = indexer.retrieve_code("auth", repo_name="repo2")
+        assert all(r["repository"] == "repo2" for r in results_repo2)
+        assert not any(r["repository"] == "repo1" for r in results_repo2)
+
+    def test_retrieve_code_all_repositories_when_repo_unspecified(
+        self, mock_config, indexed_qdrant, mock_embedding_model
+    ):
+        indexer = CodeIndexer(
+            config_path=mock_config,
+            qdrant_client=indexed_qdrant,
+            embedding_model=mock_embedding_model,
+        )
+        results = indexer.retrieve_code("auth", repo_name=None, limit=10)
+        repos = {r["repository"] for r in results}
+        assert "repo1" in repos
+        assert "repo2" in repos
+
+    def test_retrieve_code_respects_limit(
+        self, mock_config, indexed_qdrant, mock_embedding_model
+    ):
+        indexer = CodeIndexer(
+            config_path=mock_config,
+            qdrant_client=indexed_qdrant,
+            embedding_model=mock_embedding_model,
+        )
+        results = indexer.retrieve_code("auth", limit=1)
+        assert len(results) == 1
+
+    def test_retrieve_code_empty_and_whitespace_query(
+        self, mock_config, indexed_qdrant, mock_embedding_model
+    ):
+        indexer = CodeIndexer(
+            config_path=mock_config,
+            qdrant_client=indexed_qdrant,
+            embedding_model=mock_embedding_model,
+        )
+        assert indexer.retrieve_code("") == []
+        assert indexer.retrieve_code("   \n\t  ") == []
+        assert indexer.retrieve_code(None) == []  # type: ignore
+
+    def test_retrieve_code_nonexistent_collection(
+        self, mock_config, in_memory_qdrant, mock_embedding_model
+    ):
+        indexer = CodeIndexer(
+            config_path=mock_config,
+            qdrant_client=in_memory_qdrant,
+            embedding_model=mock_embedding_model,
+        )
+        assert indexer.retrieve_code("query") == []
+
+    def test_retrieve_code_score_threshold(
+        self, mock_config, indexed_qdrant, mock_embedding_model
+    ):
+        indexer = CodeIndexer(
+            config_path=mock_config,
+            qdrant_client=indexed_qdrant,
+            embedding_model=mock_embedding_model,
+        )
+        results = indexer.retrieve_code("auth", score_threshold=0.999999)
+        for r in results:
+            assert r["score"] >= 0.999999
+
+    def test_retrieve_code_long_query_token_chunking(
+        self, mock_config, indexed_qdrant, mock_embedding_model
+    ):
+        """Long query exceeding embedder window is chunked using chunk_code (#17 pair)."""
+        indexer = CodeIndexer(
+            config_path=mock_config,
+            qdrant_client=indexed_qdrant,
+            embedding_model=mock_embedding_model,
+        )
+        indexer.max_seq_length = 10
+        indexer.chunk_size = 10
+        indexer.chunk_overlap = 2
+
+        long_query = "word " * 30
+        results = indexer.retrieve_code(long_query, limit=5)
+        assert isinstance(results, list)
+
+    def test_format_retrieved_context(self):
+        chunks = [
+            {
+                "file_path": "ai-dev/main.py",
+                "start_line": 10,
+                "end_line": 20,
+                "language": "py",
+                "score": 0.912,
+                "content": "def run():\n    pass",
+            }
+        ]
+        context = CodeIndexer.format_retrieved_context(chunks)
+        assert "## Relevant Code Context" in context
+        assert "ai-dev/main.py" in context
+        assert "lines 10-20" in context
+        assert "def run():" in context
+        assert "0.912" in context
+
+        assert CodeIndexer.format_retrieved_context([]) == ""
+
+    def test_search_and_query_aliases(
+        self, mock_config, indexed_qdrant, mock_embedding_model
+    ):
+        indexer = CodeIndexer(
+            config_path=mock_config,
+            qdrant_client=indexed_qdrant,
+            embedding_model=mock_embedding_model,
+        )
+        with patch.object(
+            indexer, "retrieve_code", return_value=[{"id": "1"}]
+        ) as mock_ret:
+            indexer.search("foo", repo_name="repo1", limit=3)
+            mock_ret.assert_called_once_with(
+                query="foo", repo_name="repo1", limit=3, score_threshold=None
+            )
+
+        with patch.object(
+            indexer, "retrieve_code", return_value=[{"id": "1"}]
+        ) as mock_ret:
+            indexer.query("bar", repo_name="repo2", limit=4)
+            mock_ret.assert_called_once_with(
+                query="bar", repo_name="repo2", limit=4, score_threshold=None
+            )
+
+    def test_code_retriever_class(
+        self, mock_config, indexed_qdrant, mock_embedding_model
+    ):
+        retriever = CodeRetriever(
+            config_path=mock_config,
+            qdrant_client=indexed_qdrant,
+            embedding_model=mock_embedding_model,
+        )
+        chunks = retriever.retrieve("auth", repo_name="repo1")
+        assert isinstance(chunks, list)
+
+        formatted = retriever.retrieve_and_format("auth", repo_name="repo1")
+        assert isinstance(formatted, str)
+
+    def test_cli_main_retrieval(self, temp_workspace):
+        out_file = temp_workspace / "context.md"
+        with patch("index_code.CodeIndexer") as mock_cls:
+            mock_inst = MagicMock()
+            mock_inst.retrieve_code.return_value = [{"content": "hello"}]
+            mock_inst.format_retrieved_context.return_value = "## Formatted"
+            mock_cls.return_value = mock_inst
+
+            rc = main(
+                [
+                    "--query",
+                    "sample query",
+                    "--repo",
+                    "synthetic-repo",
+                    "--output",
+                    str(out_file),
+                ]
+            )
+            assert rc == 0
+            assert out_file.read_text(encoding="utf-8") == "## Formatted"
+            mock_inst.retrieve_code.assert_called_once()
+
+    def test_cli_skips_unscoped_retrieval(self, temp_workspace):
+        out_file = temp_workspace / "context.md"
+        out_file.write_text("stale context", encoding="utf-8")
+        with patch("index_code.CodeIndexer") as mock_cls:
+            assert main(["--query", "sample query", "--output", str(out_file)]) == 0
+        mock_cls.assert_not_called()
+        assert out_file.read_text(encoding="utf-8") == ""
+
+    def test_retrieval_settings_keep_zero_values(
+        self, in_memory_qdrant, mock_embedding_model
+    ):
+        """top_k 0 and score_threshold 0.0 must not be treated as missing."""
+        indexer = CodeIndexer(
+            config_path={
+                "top_k": 0,
+                "retrieval": {"top_k": 9, "score_threshold": 0.5},
+                "score_threshold": 0.0,
+            },
+            qdrant_client=in_memory_qdrant,
+            embedding_model=mock_embedding_model,
+        )
+        assert indexer.default_top_k == 0
+        assert indexer.default_score_threshold == 0.0
+
+    def test_nested_retrieval_defaults(self, in_memory_qdrant, mock_embedding_model):
+        indexer = CodeIndexer(
+            config_path={"retrieval": {"top_k": 3, "score_threshold": 0.0}},
+            qdrant_client=in_memory_qdrant,
+            embedding_model=mock_embedding_model,
+        )
+        assert indexer.default_top_k == 3
+        assert indexer.default_score_threshold == 0.0
+
+    def test_query_points_falls_back_to_search(self, mock_config, mock_embedding_model):
+        client = MagicMock()
+        client.collection_exists.return_value = True
+        client.query_points.side_effect = RuntimeError("query_points unavailable")
+        point = MagicMock()
+        point.id = "abc"
+        point.score = 0.0
+        point.payload = {
+            "repository": "repo1",
+            "file_path": "src/a.py",
+            "content": "def zero():\n    return 0",
+            "start_line": 1,
+            "end_line": 2,
+            "language": "py",
+        }
+        client.search.return_value = [point]
+        indexer = CodeIndexer(
+            config_path=mock_config,
+            qdrant_client=client,
+            embedding_model=mock_embedding_model,
+        )
+        q_vec = [0.2] * 384
+        mock_embedding_model.encode.return_value = MagicMock(tolist=lambda: q_vec)
+        results = indexer.retrieve_code("zero score", limit=2)
+        assert len(results) == 1
+        assert results[0]["score"] == 0.0
+        assert results[0]["file_path"] == "src/a.py"
+        client.search.assert_called_once()
+
+
+class TestInjectRetrievedContext:
+    """Retrieved snippets must land inside the agent system prompt."""
+
+    SAMPLE = """\
+agent:
+  system_template: |
+    You are an autonomous software engineering agent.
+    never force-push.
+  templates:
+    system_template: |
+      You are an autonomous software engineering agent.
+      never force-push.
+
+# Environment configuration
+environment:
+  type: "docker"
+"""
+
+    def test_injects_into_every_system_template(self):
+        context = (
+            "## Relevant Code Context (retrieved from indexed codebase)\n\n"
+            "### Snippet 1: `ai-dev/main.py` (lines 10-20)\n"
+            "```py\n"
+            "def run():\n"
+            "    return 1\n"
+            "```\n"
+        )
+        updated = inject_context_into_system_template(self.SAMPLE, context)
+        loaded = yaml.safe_load(updated)
+        for text in (
+            loaded["agent"]["system_template"],
+            loaded["agent"]["templates"]["system_template"],
+        ):
+            assert "def run():" in text
+            assert "ai-dev/main.py" in text
+            assert "never force-push." in text
+        assert loaded["environment"]["type"] == "docker"
+
+    def test_inject_is_idempotent(self):
+        context = "def run():\n    return 1\n"
+        once = inject_context_into_system_template(self.SAMPLE, context)
+        twice = inject_context_into_system_template(once, context)
+        assert once == twice
+
+    def test_empty_context_is_noop(self):
+        assert inject_context_into_system_template(self.SAMPLE, "  \n") == self.SAMPLE
+
+    def test_missing_template_raises(self):
+        with pytest.raises(ValueError):
+            inject_context_into_system_template("agent:\n  max_steps: 1\n", "code")
+
+
+class TestRepoSnippetLabelling:
+    """Tests that snippets are labelled with their repository in retrieved context."""
+
+    def test_snippets_are_labelled_with_repo(self):
+        chunks = [
+            {
+                "repository": "alpha-repo",
+                "file_path": "src/main.py",
+                "start_line": 1,
+                "end_line": 10,
+                "language": "py",
+                "score": 0.95,
+                "content": "def main():\n    pass",
+            },
+            {
+                "repository": "beta-repo",
+                "file_path": "lib/utils.js",
+                "start_line": 5,
+                "end_line": 15,
+                "language": "js",
+                "score": 0.88,
+                "content": "function util() {}",
+            },
+        ]
+        context = CodeIndexer.format_retrieved_context(chunks)
+        assert "[alpha-repo] `src/main.py`" in context
+        assert "[beta-repo] `lib/utils.js`" in context
+
+    def test_snippets_without_repo_omit_brackets(self):
+        chunks = [
+            {
+                "file_path": "orphan.py",
+                "start_line": 1,
+                "end_line": 5,
+                "language": "py",
+                "content": "x = 1",
+            }
+        ]
+        context = CodeIndexer.format_retrieved_context(chunks)
+        assert "`orphan.py`" in context
+        assert "[None]" not in context
+        assert "[]" not in context
+
+
+class TestTopKCappingAndBudgets:
+    """Tests for capping top_k and enforcing token/byte budgets."""
+
+    def test_default_max_context_bytes_constant(self):
+        assert DEFAULT_MAX_CONTEXT_BYTES == 16384
+
+    def test_top_k_is_capped_at_max(self, in_memory_qdrant, mock_embedding_model):
+        indexer = CodeIndexer(
+            config_path={
+                "collection_name": "test_topk",
+                "retrieval": {"top_k": 500},
+            },
+            qdrant_client=in_memory_qdrant,
+            embedding_model=mock_embedding_model,
+        )
+        assert indexer.default_top_k == MAX_TOP_K
+
+        # Also when limit is passed explicitly to retrieve_code
+        with patch.object(
+            indexer, "collection_exists", return_value=True
+        ), patch.object(indexer, "_search_points", return_value=[]) as mock_search:
+            indexer.retrieve_code("query", limit=100)
+            mock_search.assert_called_once()
+            # The second argument to _search_points is top_k, which must be <= MAX_TOP_K
+            call_top_k = mock_search.call_args[0][1]
+            assert call_top_k <= MAX_TOP_K
+
+    def test_format_retrieved_context_enforces_byte_budget(self):
+        # 10 chunks of 200 bytes each
+        chunks = [
+            {
+                "repository": "repo",
+                "file_path": f"file_{i}.py",
+                "start_line": 1,
+                "end_line": 10,
+                "content": "a" * 200,
+            }
+            for i in range(10)
+        ]
+        # Low byte budget of 500 bytes
+        formatted = CodeIndexer.format_retrieved_context(chunks, max_bytes=500)
+        assert len(formatted.encode("utf-8")) <= 500
+        # Should contain at least snippet 1, but not all 10
+        assert "file_0.py" in formatted
+        assert "file_9.py" not in formatted
+
+    def test_format_retrieved_context_enforces_token_budget(self):
+        chunks = [
+            {
+                "repository": "repo",
+                "file_path": f"file_{i}.py",
+                "start_line": 1,
+                "end_line": 10,
+                "content": f"word_{i} " * 50,
+            }
+            for i in range(10)
+        ]
+        formatted = CodeIndexer.format_retrieved_context(chunks, max_tokens=100)
+        assert "file_0.py" in formatted
+        assert "file_9.py" not in formatted
+
+    def test_format_retrieved_context_caps_oversized_chunk(self):
+        huge_chunk = [
+            {
+                "repository": "repo",
+                "file_path": "huge.py",
+                "start_line": 1,
+                "end_line": 2000,
+                "content": "word " * 1000,
+            }
+        ]
+        formatted = CodeIndexer.format_retrieved_context(huge_chunk)
+        assert "chunk truncated" in formatted
+
+    def test_format_retrieved_context_enforces_budget_on_first_huge_snippet(self):
+        # 1,000,000-char single minified line
+        huge_chunk = [
+            {
+                "repository": "repo",
+                "file_path": "minified.js",
+                "start_line": 1,
+                "end_line": 1,
+                "content": "var x=" + ("a" * 1000000) + ";",
+            }
+        ]
+        formatted = CodeIndexer.format_retrieved_context(huge_chunk)
+        assert len(formatted.encode("utf-8")) <= DEFAULT_MAX_CONTEXT_BYTES
+        assert "chunk truncated" in formatted
+        assert formatted.endswith("```")
+
+    def test_format_retrieved_context_enforces_budget_on_500_large_words(self):
+        # 500 words of 2 KB each
+        content = " ".join(["x" * 2000 for _ in range(500)])
+        chunk = [
+            {
+                "repository": "repo",
+                "file_path": "bigwords.txt",
+                "start_line": 1,
+                "end_line": 10,
+                "content": content,
+            }
+        ]
+        formatted = CodeIndexer.format_retrieved_context(chunk)
+        assert len(formatted.encode("utf-8")) <= DEFAULT_MAX_CONTEXT_BYTES
+        assert "chunk truncated" in formatted
+        assert formatted.endswith("```")
+
+    def test_format_retrieved_context_preserves_newlines_and_indentation(self):
+        # 5,000-line snippet
+        code_lines = ["def compute():\n"] + [
+            f"    step_{i} = {i} * 2\n" for i in range(5000)
+        ]
+        content = "".join(code_lines)
+        chunk = [
+            {
+                "repository": "repo",
+                "file_path": "large_script.py",
+                "start_line": 1,
+                "end_line": 5001,
+                "language": "python",
+                "content": content,
+            }
+        ]
+        formatted = CodeIndexer.format_retrieved_context(chunk)
+        assert len(formatted.encode("utf-8")) <= DEFAULT_MAX_CONTEXT_BYTES
+        assert formatted.endswith("```")
+        # Ensure newlines and indentation were not flattened into space-delimited text
+        lines = formatted.splitlines()
+        assert len(lines) > 20
+        assert any(line.startswith("    step_") for line in lines)
+
+    def test_inject_context_enforces_byte_budget(self):
+        sample = "agent:\n  system_template: |\n    Original prompt.\n"
+        huge_context = "## Relevant Code\n" + ("line of retrieved code\n" * 500)
+        updated = inject_context_into_system_template(
+            sample, huge_context, max_bytes=300
+        )
+        loaded = yaml.safe_load(updated)
+        template = loaded["agent"]["system_template"]
+        assert "Context truncated to stay within budget" in template
+
+    def test_enforce_context_budget_closes_open_code_fence(self):
+        from inject_context import enforce_context_budget
+
+        unclosed = (
+            "## Relevant Code Context\n"
+            "```python\n"
+            "for item in items:\n"
+            "    process(item)\n" * 100
+        )
+        capped = enforce_context_budget(unclosed, max_bytes=350)
+        assert len(capped.encode("utf-8")) <= 350
+        assert "<!-- Context truncated to stay within budget -->" in capped
+        assert "```\n\n<!-- Context truncated to stay within budget -->" in capped
+
+
+class TestSecretDenylistAndRedaction:
+    """Tests ensuring secrets and sensitive paths never reach the prompt."""
+
+    @pytest.mark.parametrize(
+        "secret_path",
+        [
+            "config/secrets.yaml",
+            "secrets.yaml",
+            "config/credentials.json",
+            "credentials.json",
+            "deploy/env.sh",
+            "env.sh",
+            ".env",
+            "deploy/.env",
+            ".env.production",
+            "keys",
+            "keys.json",
+            "api_keys.py",
+            "server.key",
+            "id_rsa",
+            "id_rsa.pub",
+            "id_ed25519",
+            "terraform.tfvars",
+            "prod.tfvars.json",
+            "secrets/database.yaml",
+            "credentials/google.json",
+            ".npmrc",
+            "kubeconfig",
+            "KUBECONFIG",
+            "k8s/kubeconfig.yaml",
+            "kube/config",
+            ".kube/config",
+            ".netrc",
+            ".pypirc",
+            ".htpasswd",
+            "htpasswd",
+            ".docker/config.json",
+            "service-account.json",
+            "service-account-prod.json",
+            "aws_credentials",
+            "nested/KUBECONFIG",
+            "nested/KUBE/config",
+            "nested/.DOCKER/config.json",
+            "nested/SERVICE-ACCOUNT.json",
+            "nested/AWS_CREDENTIALS",
+        ],
+    )
+    def test_is_secret_path_denylist(self, secret_path):
+        assert is_secret_path(secret_path) is True
+
+    @pytest.mark.parametrize(
+        "safe_path",
+        [
+            "index_code.py",
+            "src/main.py",
+            "src/huge.py",
+            "ai-dev/tests/test_code_indexer.py",
+            "keyboard_handler.py",
+            "monkeypatch.py",
+            "src/monkey.py",
+            "src/hotkeys.py",
+            "monkey.py",
+            "hotkeys.py",
+        ],
+    )
+    def test_is_secret_path_safe_files(self, safe_path):
+        assert is_secret_path(safe_path) is False
+
+    def test_is_secret_content(self):
+        assert is_secret_content("apiVersion: v1\nkind: Secret\n") is True
+        assert is_secret_content("-----BEGIN RSA PRIVATE KEY-----\n") is True
+        assert is_secret_content("-----BEGIN PRIVATE KEY-----\n") is True
+        assert is_secret_content("-----END PRIVATE KEY-----\n") is True
+        assert is_secret_content("-----END RSA PRIVATE KEY-----\n") is True
+        assert is_secret_content("def run(): pass") is False
+
+    def test_should_index_file_blocks_secret_paths(
+        self, in_memory_qdrant, mock_embedding_model
+    ):
+        indexer = CodeIndexer(
+            config_path={},
+            qdrant_client=in_memory_qdrant,
+            embedding_model=mock_embedding_model,
+        )
+        assert indexer.should_index_file(Path("config/secrets.yaml")) is False
+        assert indexer.should_index_file(Path("config/credentials.json")) is False
+        assert indexer.should_index_file(Path("deploy/env.sh")) is False
+        assert indexer.should_index_file(Path(".env")) is False
+        assert indexer.should_index_file(Path("keys.json")) is False
+        assert indexer.should_index_file(Path("main.py")) is True
+
+    def test_retrieve_code_filters_secret_paths_and_manifests(
+        self, in_memory_qdrant, mock_embedding_model
+    ):
+        indexer = CodeIndexer(
+            config_path={},
+            qdrant_client=in_memory_qdrant,
+            embedding_model=mock_embedding_model,
+        )
+        fake_points = [
+            Mock(
+                id="1",
+                score=0.99,
+                payload={
+                    "repository": "alpha",
+                    "file_path": "config/secrets.yaml",
+                    "content": "secret_key: supersecret",
+                },
+            ),
+            Mock(
+                id="2",
+                score=0.98,
+                payload={
+                    "repository": "alpha",
+                    "file_path": "k8s/secret.yaml",
+                    "content": "apiVersion: v1\nkind: Secret\ndata:\n  token: c2VjcmV0\n",
+                },
+            ),
+            Mock(
+                id="3",
+                score=0.95,
+                payload={
+                    "repository": "alpha",
+                    "file_path": "src/app.py",
+                    "content": "def app(): pass",
+                },
+            ),
+        ]
+        with patch.object(
+            indexer, "collection_exists", return_value=True
+        ), patch.object(indexer, "_search_points", return_value=fake_points):
+            results = indexer.retrieve_code("app")
+            assert len(results) == 1
+            assert results[0]["file_path"] == "src/app.py"
+
+    def test_redact_secrets_patterns(self):
+        github_token = "ghp_" + ("x" * 36)
+        aws_secret = "/".join(("wJalrXUtnFEMI", "K7MDENG", "bPxRfiCYEXAMPLEKEY"))
+        aws_access_id = "AKIA" + "IOSFODNN7EXAMPLE"
+        slack_token = "xoxb-" + "1234567890-1234567890123"
+        text = (
+            "token="
+            + "SYNTHETIC_TOKEN_VALUE\n"
+            + "GITHUB_TOKEN="
+            + github_token
+            + "\n"
+            + "PUSHOVER_TOKEN="
+            + "SYNTHETIC_PUSHOVER_VALUE\n"
+            + "DB_PASSWORD="
+            + "SYNTHETIC_DB_PASSWORD_VALUE\n"
+            + "MY_SECRET="
+            + "SYNTHETIC_SECRET_VALUE\n"
+            + "APP_KEY="
+            + "SYNTHETIC_APP_KEY_VALUE\n"
+            + "api_token: "
+            + "SYNTHETIC_API_TOKEN_VALUE\n"
+            + '{"password": "'
+            + "SYNTHETIC_JSON_PASSWORD_VALUE"
+            + '", "api_token": "SYNTHETIC_JSON_TOKEN_VALUE"}\n'
+            + "secret="
+            + "SYNTHETIC_SECRET_VALUE\n"
+            + "aws_secret_access_key = "
+            + aws_secret
+            + "\n"
+            + "password="
+            + "SYNTHETIC_SHORT_VALUE\n"
+            + "Authorization: token "
+            + "SYNTHETIC_AUTH_TOKEN_VALUE\n"
+            + "Authorization: Bearer "
+            + "SYNTHETIC_BEARER_VALUE\n"
+            + aws_access_id
+            + "\n"
+            + slack_token
+            + "\n"
+            + "-----BEGIN PRIVATE KEY-----\nSYNTHETIC_KEY_BODY...\n-----END PRIVATE KEY-----\n"
+        )
+        redacted = redact_secrets(text)
+        assert github_token not in redacted
+        assert "SYNTHETIC_TOKEN_VALUE" not in redacted
+        assert "SYNTHETIC_PUSHOVER_VALUE" not in redacted
+        assert "SYNTHETIC_DB_PASSWORD_VALUE" not in redacted
+        assert "SYNTHETIC_SECRET_VALUE" not in redacted
+        assert "SYNTHETIC_APP_KEY_VALUE" not in redacted
+        assert "SYNTHETIC_API_TOKEN_VALUE" not in redacted
+        assert "SYNTHETIC_JSON_PASSWORD_VALUE" not in redacted
+        assert "SYNTHETIC_JSON_TOKEN_VALUE" not in redacted
+        assert aws_secret not in redacted
+        assert "SYNTHETIC_SHORT_VALUE" not in redacted
+        assert "SYNTHETIC_AUTH_TOKEN_VALUE" not in redacted
+        assert "SYNTHETIC_BEARER_VALUE" not in redacted
+        assert aws_access_id not in redacted
+        assert slack_token not in redacted
+        assert "SYNTHETIC_KEY_BODY" not in redacted
+        assert "[REDACTED_SECRET]" in redacted
+        assert "[REDACTED_AWS_KEY]" in redacted
+        assert "[REDACTED_GITHUB_TOKEN]" in redacted
+        assert "[REDACTED_PRIVATE_KEY]" in redacted
+        assert "[REDACTED_TOKEN]" in redacted
+
+    def test_redact_secrets_split_private_keys(self):
+        # BEGIN without END in chunk (redact from BEGIN onward)
+        chunk_begin = "def get_key():\n    # Key begins here\n    -----BEGIN PRIVATE KEY-----\nSYNTHETIC_KEY_BODY...\n"
+        redacted_begin = redact_secrets(chunk_begin)
+        assert "-----BEGIN PRIVATE KEY-----" not in redacted_begin
+        assert "SYNTHETIC_KEY_BODY" not in redacted_begin
+        assert "[REDACTED_PRIVATE_KEY]" in redacted_begin
+        assert "def get_key():" in redacted_begin
+
+        # END tail without BEGIN in chunk (redact from start up to END)
+        chunk_end = "SYNTHETIC_KEY_BODY...\n-----END PRIVATE KEY-----\n    return key\n"
+        redacted_end = redact_secrets(chunk_end)
+        assert "-----END PRIVATE KEY-----" not in redacted_end
+        assert "SYNTHETIC_KEY_BODY" not in redacted_end
+        assert "[REDACTED_PRIVATE_KEY]" in redacted_end
+        assert "return key" in redacted_end
+
+    def test_redact_qa_key_value_forms(self):
+        text = (
+            "token=SYNTHETIC_TOKEN_VALUE\n"
+            "GITHUB_TOKEN=SYNTHETIC_GITHUB_VALUE\n"
+            "PUSHOVER_TOKEN=SYNTHETIC_PUSHOVER_VALUE\n"
+            "DB_PASSWORD=SYNTHETIC_PASSWORD_VALUE\n"
+            "api_token: SYNTHETIC_API_TOKEN_VALUE\n"
+            '"password": "SYNTHETIC_JSON_PASSWORD_VALUE"\n'
+            "secret=SYNTHETIC_SECRET_VALUE\n"
+            "aws_secret_access_key = SYNTHETIC_AWS_SECRET_VALUE\n"
+            "Authorization: token SYNTHETIC_AUTH_TOKEN_VALUE\n"
+        )
+        redacted = redact_secrets(text)
+        for value in (
+            "SYNTHETIC_TOKEN_VALUE",
+            "SYNTHETIC_GITHUB_VALUE",
+            "SYNTHETIC_PUSHOVER_VALUE",
+            "SYNTHETIC_PASSWORD_VALUE",
+            "SYNTHETIC_API_TOKEN_VALUE",
+            "SYNTHETIC_JSON_PASSWORD_VALUE",
+            "SYNTHETIC_SECRET_VALUE",
+            "SYNTHETIC_AWS_SECRET_VALUE",
+            "SYNTHETIC_AUTH_TOKEN_VALUE",
+        ):
+            assert value not in redacted
+
+    def test_enforce_context_budget_truncates_large_single_line(self):
+        from inject_context import enforce_context_budget
+
+        huge_line = "````python\n" + ("x" * 100_000) + "\n````"
+        capped = enforce_context_budget(huge_line, max_bytes=300, max_tokens=80)
+        assert len(capped.encode("utf-8")) <= 300
+        assert "\n" in capped
+        assert "````\n\n<!-- Context truncated to stay within budget -->" in capped
+
+    def test_format_retrieved_context_redacts_secrets(self):
+        chunks = [
+            {
+                "repository": "alpha",
+                "file_path": "src/auth.py",
+                "start_line": 1,
+                "end_line": 5,
+                "content": "DB_PASSWORD = 'SYNTHETIC_DB_PASSWORD'\napi_key: 'SYNTHETIC_API_KEY'\n",
+            }
+        ]
+        formatted = CodeIndexer.format_retrieved_context(chunks)
+        assert "SYNTHETIC_DB_PASSWORD" not in formatted
+        assert "SYNTHETIC_API_KEY" not in formatted
+        assert "[REDACTED_SECRET]" in formatted
+
+
+class TestNitsEmbedderAndFences:
+    """Tests for lazy embedder load and triple-backtick fence handling."""
+
+    def test_embedder_lazy_loaded_after_qdrant_check(self):
+        # Point to an unreachable Qdrant
+        indexer = CodeIndexer(
+            config_path={"qdrant_url": "http://127.0.0.1:1"},
+        )
+        # SentenceTransformer must not have been loaded yet
+        assert indexer._embedding_model is None
+        # In query mode when Qdrant is down, retrieve_code must return [] without loading embedder
+        results = indexer.retrieve_code("query")
+        assert results == []
+        assert indexer._embedding_model is None
+
+    def test_triple_backtick_escaping_in_snippets(self):
+        chunks = [
+            {
+                "repository": "repo",
+                "file_path": "docs.py",
+                "start_line": 1,
+                "end_line": 5,
+                "language": "py",
+                "content": 'code = """\n```python\nprint("hello")\n```\n"""',
+            }
+        ]
+        formatted = CodeIndexer.format_retrieved_context(chunks)
+        # Must use fence of 4 or more backticks so inner triple backticks don't break the code block
+        assert "````py\n" in formatted
+        assert "\n````" in formatted
+        assert 'print("hello")' in formatted
 
 
 # Pytest configuration

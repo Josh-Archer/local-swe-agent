@@ -20,8 +20,8 @@ RUN pip install --no-cache-dir \
 # Create working directory
 WORKDIR /app
 
-# Copy indexer script
-COPY index_code.py /app/
+# Copy indexer script and the stdlib context injector
+COPY index_code.py inject_context.py /app/
 COPY config.yaml /app/
 
 # Set permissions
