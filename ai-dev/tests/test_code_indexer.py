@@ -2516,6 +2516,93 @@ class TestSecretDenylistAndRedaction:
         }
 
     @pytest.mark.parametrize(
+        "template,redact",
+        [
+            ("adminPassword: {value}", True),
+            ("auth.rootPassword: {value}", True),
+            ('{"spring.datasource.password":"{value}"}', True),
+            ("DB_PASSWD={value}", True),
+            ("MYSQL_PWD={value}", True),
+            ("password: &pw {value}\ncopy: *pw\n", True),
+            ('{"env":[{"name":"MYSQL_ROOT_PASSWORD","value":"{value}"}]}', True),
+            ("password:\n  value: {value}\n", True),
+            ("api_key:\n  key: {value}\n", True),
+            ("token:\n  - {value}\n", True),
+            (
+                "password: {value}\n---\nenv:\n  - name: DB_PASSWORD\n    value: {value}\n",
+                True,
+            ),
+            ("```yaml\nenv:\n  - name: DB_PASSWORD\n    value: {value}\n```", True),
+            ("env:\n  - name: DB_PASSWORD\n    value: {number}\n", True),
+            ("DB_PASSWORD={value}.suffix", True),
+            ("https://user:{value}%2Fpart#frag@host/path", True),
+            ('- "MYSQL_ROOT_PASSWORD={value}"', True),
+            ('command: ["sshpass", "-p", "{value}"]', True),
+            ("default: info\n", False),
+            ("parser.add_argument('--level', default='info')", False),
+            ("d.get(k, default=0)", False),
+            ("add_argument('-p', '--port')", False),
+            ("find . -print -prune", False),
+            ("gcc -pthread && mkdir -pv out", False),
+            ("cp -pr source destination", False),
+            ('password := "{value}"', True),
+            ("authorization = get_auth_header()", False),
+            ("authorization: str = Header(None)", False),
+            ("existingSecret: benign-db-reference", False),
+            ("pageToken: nextPageToken", False),
+            ("primary_key: id", False),
+            ("routing-key: orders", False),
+            ('cache_key = f"user:{uid}"', False),
+            ("token: number;", False),
+            ("password: SecretStr", False),
+            ("password is required", False),
+            ("Bearer authentication", False),
+            ('password: str = "{value}"', True),
+            ('let token: string = "{value}"', True),
+        ],
+    )
+    def test_redaction_issue_28_29_regression_matrix(self, template, redact):
+        value = "".join(["runtime", "fixture", "731"])
+        numeric = str(73519000 + 46)
+        source = template.replace("{value}", value).replace("{number}", numeric)
+        output = redact_secrets(source)
+        if redact:
+            assert value not in output
+            if "{number}" in template:
+                assert numeric not in output
+        else:
+            assert output == source
+
+    def test_json_redaction_keeps_pretty_layout_and_folded_yaml_valid(self):
+        import json
+        import yaml
+
+        value = "".join(["pretty", "fixture", "731"])
+        source = '{\n  "password": "' + value + '",\n  "keep": 1\n}'
+        output = redact_secrets(source)
+        assert '\n  "keep"' in output
+        assert json.loads(output)["password"] == "[REDACTED_SECRET]"
+        folded = "token: >-\n  " + value + "\nother: keep\n"
+        redacted = redact_secrets(folded)
+        assert value not in redacted
+        assert yaml.safe_load(redacted)["other"] == "keep"
+
+    def test_yaml_dependency_is_optional_for_text_fallback(self, monkeypatch):
+        import builtins
+
+        original_import = builtins.__import__
+
+        def import_without_yaml(name, *args, **kwargs):
+            if name == "yaml":
+                raise ImportError("optional dependency disabled")
+            return original_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", import_without_yaml)
+        value = "".join(["fallback", "fixture", "731"])
+        output = redact_secrets("password: " + value)
+        assert value not in output
+
+    @pytest.mark.parametrize(
         "template",
         [
             'requests.post(url, json={"password": "{value}"})',
@@ -2534,7 +2621,6 @@ class TestSecretDenylistAndRedaction:
             "DB_ADMIN_PASSWORD = '{value}'",
             "- name: MYSQL_ROOT_PASSWORD\n  value: {value}",
             "private_key: {value}",
-            'default = "{value}"',
             "password: !!binary {value}",
             "curl --user bob:{value} https://example.invalid",
             'requests.post(url, json={"password": "{value}",',
@@ -2864,7 +2950,7 @@ class TestSecretDenylistAndRedaction:
             assert timings[1] < 7.5
             # Four times the input may take longer on a busy runner, but must
             # not show the sixteen-fold growth expected from a quadratic path.
-            assert timings[1] < max(1.0, timings[0]) * 8
+            assert timings[1] < max(0.05, timings[0]) * 8
 
         assert_scales((make_large(20000), make_large(80000)), large_value)
 
@@ -2890,7 +2976,7 @@ class TestSecretDenylistAndRedaction:
 
         assert_scales((make_numeric_env(30000), make_numeric_env(120000)), "7351904")
 
-        # Pure-Python loader path (mid-text BOM) and BOM-prefixed input.
+        # Mid-text BOMs and BOM-prefixed input, including a dense BOM sample.
         assert_scales(
             (
                 "\ufeff" + make_large_yaml(5000) + "\ufeffz: 1\n",
@@ -2900,6 +2986,13 @@ class TestSecretDenylistAndRedaction:
         )
         assert_scales(
             ("\ufeff" + make_large_yaml(10000), "\ufeff" + make_large_yaml(40000)),
+            yaml_secret,
+        )
+        assert_scales(
+            (
+                "\ufeff" + make_large_yaml(5000).replace("\n", "\n\ufeff"),
+                "\ufeff" + make_large_yaml(20000).replace("\n", "\n\ufeff"),
+            ),
             yaml_secret,
         )
 
@@ -2918,6 +3011,31 @@ class TestSecretDenylistAndRedaction:
             )
         assert repeated_timings[1] < 6.0
         assert repeated_timings[1] < max(0.25, repeated_timings[0]) * 6
+
+        certificate = "CERTI" + "FICATE"
+        end_certificate = f"{dash_marker}{_TEST_END} {certificate}{dash_marker}"
+        base64_like = "".join(["YW", "Jj", "MTIz", "NDU2"])
+        end_only_timings = []
+        complete_key_timings = []
+        for count in (5000, 20000):
+            end_only = base64_like + "\n" + (end_certificate + "\n") * count
+            start = time.perf_counter()
+            assert base64_like not in redact_secrets(end_only)
+            end_only_timings.append(time.perf_counter() - start)
+
+            complete_keys = (
+                f"{dash_marker}{_TEST_BEGIN} {_TEST_PRIVATE_KEY}{dash_marker}\n"
+                + base64_like
+                + "\n"
+                + f"{dash_marker}{_TEST_END} {_TEST_PRIVATE_KEY}{dash_marker}\n"
+            ) * count
+            start = time.perf_counter()
+            assert base64_like not in redact_secrets(complete_keys)
+            complete_key_timings.append(time.perf_counter() - start)
+        assert end_only_timings[1] < 6.0
+        assert end_only_timings[1] < max(0.05, end_only_timings[0]) * 8
+        assert complete_key_timings[1] < 6.0
+        assert complete_key_timings[1] < max(0.05, complete_key_timings[0]) * 8
 
     def test_truncation_notes_respect_tiny_budgets(self):
         from inject_context import enforce_context_budget
