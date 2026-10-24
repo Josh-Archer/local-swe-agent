@@ -313,7 +313,16 @@ data:
         # 5. Slack tokens
         text = re.sub(r"\bxox[baprs]-[0-9A-Za-z\-]{10,}\b", "[REDACTED_SLACK_TOKEN]", text)
 
-        # 6. Authorization headers (token or Bearer)
+        # 6. Credentials embedded in URLs (scheme://user:password@host). The
+        # password may contain '/', '%' or '#', so match everything up to '@'
+        # before whitespace rather than stopping at '/'.
+        text = re.sub(
+            r"(?i)\b([a-z][a-z0-9+.-]*://)([^:/\s@]*:)[^@\s]+(@)",
+            r"\g<1>\g<2>[REDACTED_SECRET]\g<3>",
+            text,
+        )
+
+        # 6b. Authorization headers (token or Bearer)
         text = re.sub(
             r"(?i)\b(authorization\s*:\s*(?:bearer|token)\s+)[^\s\r\n]+",
             r"\g<1>[REDACTED_TOKEN]",
