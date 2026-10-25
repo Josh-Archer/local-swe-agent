@@ -38,11 +38,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install \
             qdrant-client==1.11.3 \
-            sentence-transformers==3.2.1 \
-            gitpython==3.1.43 \
+            sentence-transformers==6.2.0 \
+            gitpython==3.2.1 \
             pyyaml==6.0.2 \
-            transformers==4.46.2 \
-            torch==2.5.1 \
+            transformers==5.20.2 \
+            torch==2.14.1 \
             --extra-index-url https://download.pytorch.org/whl/cpu
           pip install pytest pytest-cov pytest-mock black flake8 mypy
 
@@ -96,8 +96,8 @@ jobs:
         run: |
           pip install \
             qdrant-client==1.11.3 \
-            sentence-transformers==3.2.1 \
-            gitpython==3.1.43 \
+            sentence-transformers==6.2.0 \
+            gitpython==3.2.1 \
             pyyaml==6.0.2
           pylint ai-dev/code-indexer/index_code.py --disable=C,R --max-line-length=120 || true
 
@@ -105,10 +105,10 @@ jobs:
         run: |
           pip install \
             qdrant-client==1.11.3 \
-            sentence-transformers==3.2.1 \
-            gitpython==3.1.43 \
+            sentence-transformers==6.2.0 \
+            gitpython==3.2.1 \
             pyyaml==6.0.2 \
-            transformers==4.46.2 \
-            torch==2.5.1 \
+            transformers==5.20.2 \
+            torch==2.14.1 \
             --extra-index-url https://download.pytorch.org/whl/cpu
           safety check --json || true

@@ -10,11 +10,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Use extra-index-url to add PyTorch CPU repo while keeping PyPI for other packages
 RUN pip install --no-cache-dir \
     qdrant-client==1.11.3 \
-    sentence-transformers==3.2.1 \
-    gitpython==3.1.43 \
+    sentence-transformers==6.2.0 \
+    gitpython==3.2.1 \
     pyyaml==6.0.2 \
-    transformers==4.46.2 \
-    torch==2.5.1 \
+    transformers==5.20.2 \
+    torch==2.14.1 \
     --extra-index-url https://download.pytorch.org/whl/cpu
 
 # Create working directory
