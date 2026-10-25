@@ -2228,3 +2228,135 @@ def pytest_configure(config):
         "markers", "slow: marks tests as slow (deselect with '-m \"not slow\"')"
     )
     config.addinivalue_line("markers", "integration: marks tests as integration tests")
+
+
+class RecordingTokenizer:
+    """Fake tokenizer that records each encode call and its keyword arguments.
+
+    With special tokens it adds [CLS]/[SEP] ids, like a real BERT tokenizer.
+    """
+
+    def __init__(self):
+        self.calls = []
+
+    def encode(self, text, add_special_tokens=True):
+        self.calls.append({"text": text, "add_special_tokens": add_special_tokens})
+        ids = [7] * len(str(text).split())
+        if add_special_tokens:
+            ids = [101] + ids + [102]
+        return ids
+
+
+class RecordingEncoder:
+    """Fake embedding model that records the exact text passed to ``encode``."""
+
+    max_seq_length = 256
+    tokenizer = None
+
+    def __init__(self, dim=384):
+        self.dim = dim
+        self.encoded = []
+
+    def get_embedding_dimension(self):
+        return self.dim
+
+    def encode(self, text, *args, **kwargs):
+        self.encoded.append(text)
+        return MagicMock(tolist=lambda: [0.1] * self.dim)
+
+
+class TestFakeTokenizerAndEncoder:
+    """Pin tokenizer flags and encoded chunk text without a real model (Issue #32)."""
+
+    def test_token_ids_do_not_request_special_tokens(
+        self, mock_config, in_memory_qdrant
+    ):
+        tokenizer = RecordingTokenizer()
+        indexer = CodeIndexer(
+            config_path=mock_config,
+            qdrant_client=in_memory_qdrant,
+            embedding_model=RecordingEncoder(),
+            tokenizer=tokenizer,
+        )
+
+        ids = indexer._token_ids("alpha beta gamma")
+
+        assert ids == [7, 7, 7]
+        assert indexer.count_tokens("alpha beta gamma") == 3
+        assert tokenizer.calls, "tokenizer.encode was not called"
+        for call in tokenizer.calls:
+            assert call["add_special_tokens"] is False
+
+    def test_index_repository_encodes_exact_chunk_text(
+        self, mock_config, in_memory_qdrant, temp_workspace
+    ):
+        encoder = RecordingEncoder()
+        indexer = CodeIndexer(
+            config_path=mock_config,
+            qdrant_client=in_memory_qdrant,
+            embedding_model=encoder,
+            tokenizer=WordCountTokenizer(),
+        )
+        repo_dir = temp_workspace / "exact-repo"
+        repo_dir.mkdir()
+        source = "def exact_text():\n    return 'abc123'\n"
+        (repo_dir / "main.py").write_text(source)
+
+        with patch.object(indexer, "clone_or_pull_repo", return_value=repo_dir):
+            indexer.index_repository("https://github.com/org/exact.git", "exact")
+
+        expected = [c["content"] for c in indexer.chunk_code(source, "main.py")]
+        assert expected, "expected at least one chunk"
+        assert encoder.encoded == expected
+        assert all(isinstance(text, str) for text in encoder.encoded)
+        assert "def exact_text():" in encoder.encoded[0]
+
+        points, _ = in_memory_qdrant.scroll(
+            collection_name=indexer.collection_name, with_payload=True
+        )
+        assert [p.payload["content"] for p in points] == expected
+
+
+class TestEmbeddingDimensionApi:
+    """Prefer get_embedding_dimension; fall back to the deprecated name."""
+
+    def test_prefers_new_api(self, mock_config, in_memory_qdrant):
+        model = RecordingEncoder(dim=512)
+        indexer = CodeIndexer(
+            config_path=mock_config,
+            qdrant_client=in_memory_qdrant,
+            embedding_model=model,
+        )
+        assert indexer.embedding_dim == 512
+
+    def test_falls_back_to_legacy_api(self, mock_config, in_memory_qdrant):
+        class Legacy:
+            tokenizer = None
+
+            def get_sentence_embedding_dimension(self):
+                return 768
+
+        indexer = CodeIndexer(
+            config_path=mock_config,
+            qdrant_client=in_memory_qdrant,
+            embedding_model=Legacy(),
+        )
+        assert indexer.embedding_dim == 768
+
+    def test_new_api_does_not_call_deprecated_method(
+        self, mock_config, in_memory_qdrant
+    ):
+        model = Mock(
+            spec=["get_embedding_dimension", "get_sentence_embedding_dimension"]
+        )
+        model.get_embedding_dimension.return_value = 256
+        model.get_sentence_embedding_dimension.side_effect = AssertionError(
+            "deprecated API called"
+        )
+        indexer = CodeIndexer(
+            config_path=mock_config,
+            qdrant_client=in_memory_qdrant,
+            embedding_model=model,
+        )
+        assert indexer.embedding_dim == 256
+        model.get_sentence_embedding_dimension.assert_not_called()

@@ -220,6 +220,26 @@ def _whitespace_spans(text: str) -> List[Tuple[int, int]]:
     return spans
 
 
+def _embedding_dimension(model: Any) -> Optional[int]:
+    """Return the model's embedding dimension, or None when it is unknown.
+
+    sentence-transformers 6.x renamed ``get_sentence_embedding_dimension`` to
+    ``get_embedding_dimension`` and deprecated the old name. Prefer the new
+    method and fall back to the old one for older releases.
+    """
+    for name in ("get_embedding_dimension", "get_sentence_embedding_dimension"):
+        method = getattr(model, name, None)
+        if not callable(method):
+            continue
+        try:
+            dim = method()
+        except Exception:
+            continue
+        if isinstance(dim, int) and not isinstance(dim, bool) and dim > 0:
+            return dim
+    return None
+
+
 def generate_point_id(repo_name: str, file_path: str, chunk_index: int = 0) -> str:
     """Generate a deterministic point ID (UUID5) for a chunk within a repository file."""
     normalized_path = file_path.replace("\\", "/")
@@ -288,8 +308,9 @@ class CodeIndexer:
         self.embedding_dim: int = int(qdrant_dict.get("vector_size", 384))
         self.max_seq_length: int = 256
         if embedding_model is not None:
-            if hasattr(embedding_model, "get_sentence_embedding_dimension"):
-                self.embedding_dim = embedding_model.get_sentence_embedding_dimension()
+            dim = _embedding_dimension(embedding_model)
+            if dim is not None:
+                self.embedding_dim = dim
             max_seq_len = getattr(embedding_model, "max_seq_length", None)
             if isinstance(max_seq_len, int) and max_seq_len > 0:
                 self.max_seq_length = max_seq_len
@@ -415,10 +436,9 @@ class CodeIndexer:
         if self._embedding_model is None:
             logger.info(f"Loading embedding model: {self._embedding_model_name}")
             self._embedding_model = SentenceTransformer(self._embedding_model_name)
-            if hasattr(self._embedding_model, "get_sentence_embedding_dimension"):
-                self.embedding_dim = (
-                    self._embedding_model.get_sentence_embedding_dimension()
-                )
+            dim = _embedding_dimension(self._embedding_model)
+            if dim is not None:
+                self.embedding_dim = dim
             max_seq_len = getattr(self._embedding_model, "max_seq_length", None)
             if isinstance(max_seq_len, int) and max_seq_len > 0:
                 self.max_seq_length = max_seq_len
@@ -428,8 +448,9 @@ class CodeIndexer:
     def embedding_model(self, model: Any) -> None:
         self._embedding_model = model
         if model is not None:
-            if hasattr(model, "get_sentence_embedding_dimension"):
-                self.embedding_dim = model.get_sentence_embedding_dimension()
+            dim = _embedding_dimension(model)
+            if dim is not None:
+                self.embedding_dim = dim
             max_seq_len = getattr(model, "max_seq_length", None)
             if isinstance(max_seq_len, int) and max_seq_len > 0:
                 self.max_seq_length = max_seq_len
