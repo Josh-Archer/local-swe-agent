@@ -15,7 +15,7 @@ Complete overview of the testing and CI/CD infrastructure for the AI-Dev system.
 - **Triggers**: Push to main/develop, Pull Requests
 
 **2. Python Tests** (`.github/workflows/python-tests.yml`)
-- ✅ Multi-version testing (Python 3.10, 3.11)
+- ✅ Multi-version testing (Python 3.11, 3.12)
 - ✅ Code formatting (black)
 - ✅ Linting (flake8)
 - ✅ Type checking (mypy)

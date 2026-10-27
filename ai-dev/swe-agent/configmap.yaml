@@ -546,20 +546,13 @@ data:
                     # parsing and retain a boundary map so edits still target the
                     # original text. Keep the C loader's linear-time performance.
                     offset_map = None
-                    bom_prefix = None
                     if "\ufeff" in text:
-                        clean_chars = []
                         offset_map = []
-                        bom_prefix = []
-                        bom_count = 0
-                        for index, char in enumerate(text):
-                            if char == "\ufeff":
-                                bom_count += 1
-                            else:
-                                clean_chars.append(char)
-                                offset_map.append(index)
-                                bom_prefix.append(bom_count)
-                        ytext = "".join(clean_chars)
+                        # Extend whole runs in C rather than tracing a Python loop
+                        # for every character when coverage runs on Python 3.12.
+                        for run in re.finditer(r"[^\ufeff]+", text):
+                            offset_map.extend(range(run.start(), run.end()))
+                        ytext = yaml_input
                     else:
                         ytext = text
                     loader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
@@ -614,7 +607,7 @@ data:
                             start = offset_map[clean_start]
                             end = offset_map[clean_end - 1] + 1
                             retained_boms = "\ufeff" * (
-                                bom_prefix[clean_end - 1] - bom_prefix[clean_start]
+                                end - start - (clean_end - clean_start)
                             )
                         marker += retained_boms
                         style = node.style
