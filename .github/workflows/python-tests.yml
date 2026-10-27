@@ -23,7 +23,8 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ['3.10', '3.11']
+        # filelock>=4.2.1 and httpx2==2.16.0 require Python >=3.11.
+        python-version: ['3.11', '3.12']
 
     steps:
       - name: Checkout code
@@ -46,8 +47,12 @@ jobs:
             pyyaml==6.0.2 \
             transformers==5.20.2 \
             torch==2.14.1 \
+            certifi==2026.10.23 \
+            filelock==4.2.4 \
+            httpx2==2.16.0 \
+            httpcore2==2.16.0 \
             --extra-index-url https://download.pytorch.org/whl/cpu
-          pip install pytest pytest-cov pytest-mock black flake8 mypy
+          pip install pytest pytest-cov pytest-mock black==26.10.1 flake8 mypy
 
       - name: Lint with black
         run: |
@@ -89,7 +94,7 @@ jobs:
 
       - name: Install linting tools
         run: |
-          pip install bandit pylint safety
+          pip install bandit pylint safety==3.2.3 requests==2.34.2
 
       - name: Run bandit security linter
         run: |
@@ -101,7 +106,11 @@ jobs:
             qdrant-client==1.11.3 \
             sentence-transformers==6.2.0 \
             gitpython==3.2.1 \
-            pyyaml==6.0.2
+            pyyaml==6.0.2 \
+            certifi==2026.10.23 \
+            filelock==4.2.4 \
+            httpx2==2.16.0 \
+            httpcore2==2.16.0
           pylint ai-dev/code-indexer/index_code.py --disable=C,R --max-line-length=120 || true
 
       - name: Check dependencies for vulnerabilities
@@ -113,5 +122,9 @@ jobs:
             pyyaml==6.0.2 \
             transformers==5.20.2 \
             torch==2.14.1 \
+            certifi==2026.10.23 \
+            filelock==4.2.4 \
+            httpx2==2.16.0 \
+            httpcore2==2.16.0 \
             --extra-index-url https://download.pytorch.org/whl/cpu
           safety check --json || true
