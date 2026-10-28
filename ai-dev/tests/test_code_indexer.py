@@ -2002,13 +2002,49 @@ class TestSecretDenylistAndRedaction:
             "src/hotkeys.py",
             "monkey.py",
             "hotkeys.py",
+        ],
+    )
+    def test_is_secret_path_safe_files(self, safe_path):
+        assert is_secret_path(safe_path) is False
+
+    @pytest.mark.parametrize(
+        "path",
+        [
             "auth/credentials_manager.py",
             "credential_helpers.go",
             "src/private/crypto.py",
         ],
     )
-    def test_is_secret_path_safe_files(self, safe_path):
-        assert is_secret_path(safe_path) is False
+    def test_is_secret_path_strict_master_rules(self, path):
+        assert is_secret_path(path) is True
+
+    @pytest.mark.parametrize(
+        "path", ["private/notes.txt", "a/Private/b.py", "src/PRIVATE/x.go"]
+    )
+    def test_is_secret_path_private_folder_rule(self, path):
+        assert is_secret_path(path) is True
+
+    @pytest.mark.parametrize(
+        "path", ["credential.py", "my_credential_store.rb", "Credential.txt"]
+    )
+    def test_is_secret_path_credential_filename_rule(self, path):
+        assert is_secret_path(path) is True
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "credentials",
+            "credentials.json",
+            ".aws/credentials",
+            "x/aws/credentials.bak",
+        ],
+    )
+    def test_is_secret_path_credentials_pattern_rule(self, path):
+        assert is_secret_path(path) is True
+
+    @pytest.mark.parametrize("path", ["privateer.py", "src/credentialing.py"])
+    def test_is_secret_path_strict_rules_no_overmatch(self, path):
+        assert is_secret_path(path) is False
 
     def test_is_secret_content(self):
         dashes = "-----"

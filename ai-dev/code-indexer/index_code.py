@@ -58,6 +58,7 @@ SECRET_FILE_PATTERNS = [
     r"(^|/)\.?htpasswd.*$",
     r"(^|/)(\.docker|docker)/config\.json$",
     r"(^|/)service[-_]account.*\.json$",
+    r"(^|/)(\.?aws/)?credentials.*$",
     r"(^|/)aws_credentials(\..+)?$",
     r"(^|/)\.git-credentials$",
     r"(^|/)\.pgpass$",
@@ -85,7 +86,10 @@ def is_secret_path(file_path: Union[str, Path]) -> bool:
             return True
 
     parts = [part.lower() for part in p.parts]
-    if any(part in ("secrets", "credentials", ".ssh", ".gnupg") for part in parts):
+    if any(
+        part in ("secrets", "credentials", ".ssh", ".gnupg", "private")
+        for part in parts
+    ):
         return True
     if any(part in (".kube", "kube") for part in parts) and (
         name == "config" or name.startswith("config.") or name.startswith("kubeconfig")
@@ -127,6 +131,8 @@ def is_secret_path(file_path: Union[str, Path]) -> bool:
         ".txt",
         ".ini",
     ):
+        return True
+    if re.search(r"(\b|_)credential(\b|_)", name, re.IGNORECASE):
         return True
     if name in ("env.sh", ".env", "keys", "id_rsa") or name.startswith(".env"):
         return True
