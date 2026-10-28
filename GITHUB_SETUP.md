@@ -262,7 +262,7 @@ Use [shields.io](https://shields.io) for custom badges:
 
 ```markdown
 ![Kubernetes](https://img.shields.io/badge/kubernetes-v1.28+-blue)
-![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11-blue)
+![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue)
 ![GPU](https://img.shields.io/badge/GPU-Time--Slicing-green)
 ```
 

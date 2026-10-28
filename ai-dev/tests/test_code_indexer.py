@@ -1611,6 +1611,15 @@ class TestCodeRetrieval:
             )
             assert rc == 0
             assert out_file.read_text(encoding="utf-8") == "## Formatted"
+            mock_inst.retrieve_code.assert_called_once()
+
+    def test_cli_skips_unscoped_retrieval(self, temp_workspace):
+        out_file = temp_workspace / "context.md"
+        out_file.write_text("stale context", encoding="utf-8")
+        with patch("index_code.CodeIndexer") as mock_cls:
+            assert main(["--query", "sample query", "--output", str(out_file)]) == 0
+        mock_cls.assert_not_called()
+        assert out_file.read_text(encoding="utf-8") == ""
 
     def test_retrieval_settings_keep_zero_values(
         self, in_memory_qdrant, mock_embedding_model
@@ -1970,6 +1979,11 @@ class TestSecretDenylistAndRedaction:
             ".vault-token",
             "secrets.toml",
             "signing.ppk",
+            "nested/KUBECONFIG",
+            "nested/KUBE/config",
+            "nested/.DOCKER/config.json",
+            "nested/SERVICE-ACCOUNT.json",
+            "nested/AWS_CREDENTIALS",
         ],
     )
     def test_is_secret_path_denylist(self, secret_path):
@@ -3071,9 +3085,10 @@ class TestSecretDenylistAndRedaction:
         assert CodeIndexer.truncate_snippet_content("content", 0, 0) == ("", True)
 
     def test_cli_requires_repo_and_json_output_is_redacted(self, capsys):
-        with pytest.raises(SystemExit) as exc:
-            main(["--query", "query"])
-        assert exc.value.code == 2
+        # Unscoped retrieval is skipped instead of querying every repository.
+        with patch("index_code.CodeIndexer") as unscoped_cls:
+            assert main(["--query", "query"]) == 0
+        unscoped_cls.assert_not_called()
 
         api_key = "".join(["api", "Key"])
         value = "json-" + "credential-value"
@@ -3096,6 +3111,38 @@ class TestSecretDenylistAndRedaction:
         assert value not in output
         assert "[REDACTED_SECRET]" in output
         assert "[REDACTED_TOKEN]" in output
+
+    def test_redact_qa_key_value_forms(self):
+        def fake(label):
+            return "SYNTHETIC_" + label + "_VALUE"
+
+        pwd_word = "".join(["pass", "word"])
+        names = [
+            ("token", "TOKEN"),
+            ("GITHUB_TOKEN", "GITHUB"),
+            ("PUSHOVER_TOKEN", "PUSHOVER"),
+            ("DB_" + pwd_word.upper(), "DB_PWD"),
+            ("secret", "SECRET"),
+            ("aws_secret_access_key", "AWS_SECRET"),
+        ]
+        lines = [f"{name}={fake(label)}" for name, label in names]
+        lines.append(f"api_token: {fake('API_TOKEN')}")
+        lines.append(f'"{pwd_word}": "{fake("JSON_PWD")}"')
+        lines.append(f"Authorization: token {fake('AUTH_TOKEN')}")
+        redacted = redact_secrets("\n".join(lines) + "\n")
+        labels = [label for _, label in names]
+        labels += ["API_TOKEN", "JSON_PWD", "AUTH_TOKEN"]
+        for label in labels:
+            assert fake(label) not in redacted
+
+    def test_enforce_context_budget_truncates_large_single_line(self):
+        from inject_context import enforce_context_budget
+
+        huge_line = "````python\n" + ("x" * 100_000) + "\n````"
+        capped = enforce_context_budget(huge_line, max_bytes=300, max_tokens=80)
+        assert len(capped.encode("utf-8")) <= 300
+        assert "\n" in capped
+        assert "````\n\n<!-- Context truncated to stay within budget -->" in capped
 
     def test_format_retrieved_context_redacts_secrets(self):
         pwd_var = "".join(["DB_", "PASS", "WORD"])
@@ -3171,3 +3218,135 @@ def pytest_configure(config):
         "markers", "slow: marks tests as slow (deselect with '-m \"not slow\"')"
     )
     config.addinivalue_line("markers", "integration: marks tests as integration tests")
+
+
+class RecordingTokenizer:
+    """Fake tokenizer that records each encode call and its keyword arguments.
+
+    With special tokens it adds [CLS]/[SEP] ids, like a real BERT tokenizer.
+    """
+
+    def __init__(self):
+        self.calls = []
+
+    def encode(self, text, add_special_tokens=True):
+        self.calls.append({"text": text, "add_special_tokens": add_special_tokens})
+        ids = [7] * len(str(text).split())
+        if add_special_tokens:
+            ids = [101] + ids + [102]
+        return ids
+
+
+class RecordingEncoder:
+    """Fake embedding model that records the exact text passed to ``encode``."""
+
+    max_seq_length = 256
+    tokenizer = None
+
+    def __init__(self, dim=384):
+        self.dim = dim
+        self.encoded = []
+
+    def get_embedding_dimension(self):
+        return self.dim
+
+    def encode(self, text, *args, **kwargs):
+        self.encoded.append(text)
+        return MagicMock(tolist=lambda: [0.1] * self.dim)
+
+
+class TestFakeTokenizerAndEncoder:
+    """Pin tokenizer flags and encoded chunk text without a real model (Issue #32)."""
+
+    def test_token_ids_do_not_request_special_tokens(
+        self, mock_config, in_memory_qdrant
+    ):
+        tokenizer = RecordingTokenizer()
+        indexer = CodeIndexer(
+            config_path=mock_config,
+            qdrant_client=in_memory_qdrant,
+            embedding_model=RecordingEncoder(),
+            tokenizer=tokenizer,
+        )
+
+        ids = indexer._token_ids("alpha beta gamma")
+
+        assert ids == [7, 7, 7]
+        assert indexer.count_tokens("alpha beta gamma") == 3
+        assert tokenizer.calls, "tokenizer.encode was not called"
+        for call in tokenizer.calls:
+            assert call["add_special_tokens"] is False
+
+    def test_index_repository_encodes_exact_chunk_text(
+        self, mock_config, in_memory_qdrant, temp_workspace
+    ):
+        encoder = RecordingEncoder()
+        indexer = CodeIndexer(
+            config_path=mock_config,
+            qdrant_client=in_memory_qdrant,
+            embedding_model=encoder,
+            tokenizer=WordCountTokenizer(),
+        )
+        repo_dir = temp_workspace / "exact-repo"
+        repo_dir.mkdir()
+        source = "def exact_text():\n    return 'abc123'\n"
+        (repo_dir / "main.py").write_text(source)
+
+        with patch.object(indexer, "clone_or_pull_repo", return_value=repo_dir):
+            indexer.index_repository("https://github.com/org/exact.git", "exact")
+
+        expected = [c["content"] for c in indexer.chunk_code(source, "main.py")]
+        assert expected, "expected at least one chunk"
+        assert encoder.encoded == expected
+        assert all(isinstance(text, str) for text in encoder.encoded)
+        assert "def exact_text():" in encoder.encoded[0]
+
+        points, _ = in_memory_qdrant.scroll(
+            collection_name=indexer.collection_name, with_payload=True
+        )
+        assert [p.payload["content"] for p in points] == expected
+
+
+class TestEmbeddingDimensionApi:
+    """Prefer get_embedding_dimension; fall back to the deprecated name."""
+
+    def test_prefers_new_api(self, mock_config, in_memory_qdrant):
+        model = RecordingEncoder(dim=512)
+        indexer = CodeIndexer(
+            config_path=mock_config,
+            qdrant_client=in_memory_qdrant,
+            embedding_model=model,
+        )
+        assert indexer.embedding_dim == 512
+
+    def test_falls_back_to_legacy_api(self, mock_config, in_memory_qdrant):
+        class Legacy:
+            tokenizer = None
+
+            def get_sentence_embedding_dimension(self):
+                return 768
+
+        indexer = CodeIndexer(
+            config_path=mock_config,
+            qdrant_client=in_memory_qdrant,
+            embedding_model=Legacy(),
+        )
+        assert indexer.embedding_dim == 768
+
+    def test_new_api_does_not_call_deprecated_method(
+        self, mock_config, in_memory_qdrant
+    ):
+        model = Mock(
+            spec=["get_embedding_dimension", "get_sentence_embedding_dimension"]
+        )
+        model.get_embedding_dimension.return_value = 256
+        model.get_sentence_embedding_dimension.side_effect = AssertionError(
+            "deprecated API called"
+        )
+        indexer = CodeIndexer(
+            config_path=mock_config,
+            qdrant_client=in_memory_qdrant,
+            embedding_model=model,
+        )
+        assert indexer.embedding_dim == 256
+        model.get_sentence_embedding_dimension.assert_not_called()

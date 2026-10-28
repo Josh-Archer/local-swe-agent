@@ -39,6 +39,8 @@ data:
   TENSOR_PARALLEL_SIZE: "1"  # Single GPU
   ENABLE_PREFIX_CACHING: "true"
   DISABLE_LOG_REQUESTS: "false"
+  # Static adapter is advertised only after a valid adapter is provisioned here.
+  LORA_ADAPTER_PATH: "/adapters/custom-lora"
 
   # ---------------------------------------------------------------------------
   # Model download script (mounted at /scripts/download-model.sh)
@@ -100,3 +102,33 @@ data:
       echo "PVC usage after download:"
       df -h /models || true
     fi
+
+  # vLLM entrypoint wrapper. Runtime LoRA loading stays enabled, while the
+  # static custom model is advertised only when its adapter is present.
+  start-vllm.sh: |
+    #!/bin/bash
+    set -euo pipefail
+
+    args=(
+      "--model=${MODEL_PATH}"
+      "--host=${HOST}"
+      "--port=${PORT}"
+      "--gpu-memory-utilization=${GPU_MEMORY_UTILIZATION}"
+      "--max-model-len=${MAX_MODEL_LEN}"
+      "--dtype=${DTYPE}"
+      "--trust-remote-code"
+      "--served-model-name=${SERVED_MODEL_NAME}"
+      "--enable-prefix-caching"
+      "--max-num-seqs=${MAX_NUM_SEQS}"
+      "--quantization=${QUANTIZATION}"
+      "--enable-lora"
+    )
+
+    if [[ -n "${LORA_ADAPTER_PATH:-}" && -f "${LORA_ADAPTER_PATH}/adapter_config.json" ]]; then
+      echo "Registering LoRA adapter 'custom' from ${LORA_ADAPTER_PATH}"
+      args+=("--lora-modules=custom=${LORA_ADAPTER_PATH}")
+    else
+      echo "No configured LoRA adapter found; starting with runtime LoRA loading only"
+    fi
+
+    exec python3 -m vllm.entrypoints.openai.api_server "${args[@]}"

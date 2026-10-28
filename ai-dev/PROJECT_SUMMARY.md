@@ -272,11 +272,7 @@ match: Host(`your-domain.com`)
 ```
 
 ### Configure Fine-Tuning
-Uncomment in `vllm/vllm-deployment.yaml`:
-```yaml
-- --enable-lora
-- --lora-modules=custom=/adapters/custom-lora
-```
+Copy the trained adapter, including `adapter_config.json`, into `/adapters/custom-lora` on the `adapter-storage` PVC and configure `LORA_ADAPTER_PATH` in `vllm/vllm-configmap.yaml`. The startup script always enables runtime LoRA support and registers the API model name `custom` only when that adapter is present. Apply the ConfigMap and restart `vllm-server` after provisioning.
 
 ## Testing Strategy
 

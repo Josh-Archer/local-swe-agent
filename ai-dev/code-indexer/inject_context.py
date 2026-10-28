@@ -51,15 +51,18 @@ def redact_secrets(text: str) -> str:
         return "".join(pieces)
 
     go_tag_lines = []
+    go_tag_prefix = "__CODE_INDEXER_GO_TAG_"
+    while go_tag_prefix in text:
+        go_tag_prefix = "_" + go_tag_prefix
 
     def protect_go_tag(match):
-        token = f"__CODE_INDEXER_GO_TAG_{len(go_tag_lines)}__"
+        token = f"{go_tag_prefix}{len(go_tag_lines)}__"
         go_tag_lines.append(match.group(0))
         return token
 
     if '`json:"' in text:
         text = re.sub(
-            r'(?m)^.*\b[A-Z][A-Za-z0-9_]*\s+[A-Za-z0-9_*]+\s+`json:"[^"\n]+"`.*$',
+            r'(?m)^[ \t]*[A-Z][A-Za-z0-9_]*[ \t]+[A-Za-z0-9_*]+[ \t]+`json:"[^"\n]+"`',
             protect_go_tag,
             text,
         )
@@ -178,11 +181,9 @@ def redact_secrets(text: str) -> str:
     # Structural passes preserve JSON types and YAML syntax. They are an
     # additional layer: code and shell patterns below always run afterward.
     secret_name_re = re.compile(
-        r"(?i)(?:password|passwd|passphrase|pwd|secret|token|"
-        r"(?:[a-z0-9]+[._-])*[a-z0-9]*(?:password|passwd|passphrase|pwd|secret|token)|"
-        r"(?:[a-z0-9]+[._-])*api[-_]?key|(?:[a-z0-9]+[._-])*x[-_]api[-_]key|"
-        r"(?:[a-z0-9]+[._-])*[a-z0-9]*_key|"
-        r"secret_key_base|aws_secret_access_key|aws_access_key_id)"
+        r"(?i)(?:[a-z0-9_.-]*(?:password|passwd|passphrase|pwd|secret|token)|"
+        r"[a-z0-9_.-]*api[-_]?key|[a-z0-9_.-]*_keys?|"
+        r"secret_key_base|aws_secret_access_key|aws_access_key_id|token_value)"
     )
 
     def is_secret_name(name):
@@ -201,94 +202,85 @@ def redact_secrets(text: str) -> str:
         scheme = re.match(r"^([A-Za-z][A-Za-z0-9_-]*)\s+", value)
         return (scheme.group(1) + " " if scheme else "") + "[REDACTED_TOKEN]"
 
-    candidate = text.lstrip()
+    candidate = text.lstrip("\ufeff \t\r\n")
     yaml_structural_ok = False
     if candidate.startswith(("{", "[")):
-        try:
-            parsed = json.loads(text)
-            stack = [parsed]
-            changed = False
-            while stack:
-                item = stack.pop()
-                if isinstance(item, dict):
-                    for key, value in list(item.items()):
-                        normalized_key = (
-                            key.replace("\ufeff", "") if isinstance(key, str) else key
-                        )
-                        secret_key = is_secret_name(normalized_key)
-                        if (
-                            isinstance(key, str)
-                            and key.lower() == "name"
-                            and isinstance(value, str)
-                            and is_secret_name(value)
-                            and isinstance(item.get("value"), str)
-                            and item["value"]
-                        ):
-                            item["value"] = "[REDACTED_SECRET]"
-                            changed = True
-                        if (
-                            isinstance(key, str)
-                            and key.lower() == "authorization"
-                            and isinstance(value, str)
-                            and value
-                        ):
-                            item[key] = auth_redacted(value)
-                            changed = True
-                        elif (
-                            isinstance(key, str)
-                            and secret_key
-                            and isinstance(value, str)
-                            and value
-                        ):
-                            item[key] = "[REDACTED_SECRET]"
-                            changed = True
-                        elif secret_key and isinstance(value, (dict, list)):
-                            # Keep the structure valid; redact string leaves only.
-                            leaves = [value]
-                            while leaves:
-                                node = leaves.pop()
-                                pairs = (
-                                    node.items()
-                                    if isinstance(node, dict)
-                                    else enumerate(node)
-                                )
-                                for sub_key, sub_value in list(pairs):
-                                    if isinstance(sub_value, str) and sub_value:
-                                        node[sub_key] = "[REDACTED_SECRET]"
-                                        changed = True
-                                    elif isinstance(sub_value, (dict, list)):
-                                        leaves.append(sub_value)
-                        elif isinstance(value, (dict, list)):
-                            stack.append(value)
-                elif isinstance(item, list):
-                    if (
-                        item
-                        and isinstance(item[0], str)
-                        and item[0].lower() == "sshpass"
-                    ):
-                        for index, arg in enumerate(item[:-1]):
-                            if (
-                                arg == "-p"
-                                and isinstance(item[index + 1], str)
-                                and item[index + 1]
-                            ):
-                                item[index + 1] = "[REDACTED_SECRET]"
-                                changed = True
-                    stack.extend(
-                        value for value in item if isinstance(value, (dict, list))
-                    )
-            if changed:
-                newline_indent = re.search(r"\n([ \t]+)\"", text)
-                pretty = newline_indent is not None
-                indent = len(newline_indent.group(1)) if pretty else None
-                text = json.dumps(
-                    parsed,
-                    ensure_ascii=False,
-                    indent=indent,
-                    separators=(",", ": ") if pretty else (",", ":"),
+        # Scan JSON tokens instead of decoding/re-serializing the document.
+        # This preserves every byte outside edited strings, supports partial
+        # chunks, and uses an explicit stack for arbitrarily deep JSON.
+        tokens = re.compile(r'"(?:\\.|[^"\\])*"|[{}\[\]:,]|[^\s\ufeff{}\[\]:,"]+')
+        frames = []
+        edits = []
+        for token in tokens.finditer(text):
+            raw = token.group()
+            frame = frames[-1] if frames else None
+            if raw in ("}", "]"):
+                if not frames:
+                    continue
+                closed = frames.pop()
+                entries = closed["entries"]
+                name = entries.get("name")
+                value = entries.get("value")
+                if name and value and is_secret_name(name[0]) and value[0]:
+                    edits.append((*value[1], json.dumps("[REDACTED_SECRET]")))
+                args = closed["args"]
+                if args and args[0][0] == "sshpass":
+                    for previous, argument in zip(args, args[1:]):
+                        if previous[0] == "-p" and argument[0]:
+                            edits.append(
+                                (*argument[1], json.dumps("[REDACTED_SECRET]"))
+                            )
+                continue
+            if raw == ":":
+                if frame:
+                    frame["expect_key"] = False
+                continue
+            if raw == ",":
+                if frame:
+                    frame["expect_key"] = frame["object"]
+                    frame["key"] = None
+                continue
+            key = frame["key"] if frame else None
+            inherited = bool(frame and frame["secret"])
+            if raw in ("{", "["):
+                frames.append(
+                    {
+                        "object": raw == "{",
+                        "expect_key": raw == "{",
+                        "key": None,
+                        "secret": inherited or is_secret_name(key),
+                        "entries": {},
+                        "args": [],
+                    }
                 )
-        except (ValueError, TypeError, RecursionError):
-            pass
+                continue
+            if not frame:
+                continue
+            try:
+                value = json.loads(raw) if raw.startswith('"') else None
+            except ValueError:
+                continue
+            if frame["expect_key"]:
+                frame["key"] = value
+            else:
+                span = token.span()
+                if frame["object"]:
+                    frame["entries"][key] = (value, span)
+                else:
+                    frame["args"].append((value, span))
+                if value and (inherited or is_secret_name(key)):
+                    edits.append((*span, json.dumps("[REDACTED_SECRET]")))
+                elif value and key == "authorization":
+                    edits.append((*span, json.dumps(auth_redacted(value))))
+        pieces = []
+        cursor = 0
+        for start, end, replacement in sorted(set(edits)):
+            if start < cursor:
+                continue
+            pieces.extend((text[cursor:start], replacement))
+            cursor = end
+        pieces.append(text[cursor:])
+        text = "".join(pieces)
     else:
         yaml_input = text.replace("\ufeff", "")
         looks_yaml = not re.search(r'`[A-Za-z_][\w-]*:"[^"\n]*"`', text) and (
@@ -301,25 +293,23 @@ def redact_secrets(text: str) -> str:
         if looks_yaml:
             try:
                 import yaml
+            except ImportError:
+                yaml = None
+            try:
+                if yaml is None:
+                    raise ImportError("PyYAML is optional; use text fallback")
 
                 # libyaml ignores U+FEFF in mark offsets. Strip every one for
                 # parsing and retain a boundary map so edits still target the
                 # original text. Keep the C loader's linear-time performance.
                 offset_map = None
-                bom_prefix = None
                 if "\ufeff" in text:
-                    clean_chars = []
                     offset_map = []
-                    bom_prefix = []
-                    bom_count = 0
-                    for index, char in enumerate(text):
-                        if char == "\ufeff":
-                            bom_count += 1
-                        else:
-                            clean_chars.append(char)
-                            offset_map.append(index)
-                            bom_prefix.append(bom_count)
-                    ytext = "".join(clean_chars)
+                    # Extend whole runs in C rather than tracing a Python loop
+                    # for every character when coverage runs on Python 3.12.
+                    for run in re.finditer(r"[^\ufeff]+", text):
+                        offset_map.extend(range(run.start(), run.end()))
+                    ytext = yaml_input
                 else:
                     ytext = text
                 loader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
@@ -374,7 +364,7 @@ def redact_secrets(text: str) -> str:
                         start = offset_map[clean_start]
                         end = offset_map[clean_end - 1] + 1
                         retained_boms = "\ufeff" * (
-                            bom_prefix[clean_end - 1] - bom_prefix[clean_start]
+                            end - start - (clean_end - clean_start)
                         )
                     marker += retained_boms
                     style = node.style
@@ -383,7 +373,8 @@ def redact_secrets(text: str) -> str:
                     elif style == "'":
                         replacement = "'" + marker + "'"
                     elif style in ("|", ">"):
-                        header, _, body = raw.partition("\n")
+                        scalar_raw = raw[anchor.end() :] if anchor else raw
+                        header, _, body = scalar_raw.partition("\n")
                         indent = re.match(r"[ \t]*", body).group(0)
                         replacement = (
                             header
@@ -399,24 +390,33 @@ def redact_secrets(text: str) -> str:
                     edits.append((start, end, replacement))
 
                 def redact_yaml_leaves(value):
-                    if isinstance(value, yaml.ScalarNode):
-                        add_scalar(value)
-                    elif isinstance(value, yaml.MappingNode):
-                        for child_key, child_value in value.value:
-                            if isinstance(
-                                child_key, yaml.ScalarNode
-                            ) and child_key.value.lower() in {
-                                "value",
-                                "key",
-                                "data",
-                                "stringdata",
-                            }:
-                                redact_yaml_leaves(child_value)
-                            else:
-                                visit(child_value)
-                    elif isinstance(value, yaml.SequenceNode):
-                        for child in value.value:
-                            redact_yaml_leaves(child)
+                    # Follow aliases once, including recursive YAML graphs.
+                    leaves = [value]
+                    visited = set()
+                    while leaves:
+                        child = leaves.pop()
+                        if id(child) in visited:
+                            continue
+                        visited.add(id(child))
+                        if isinstance(child, yaml.ScalarNode):
+                            add_scalar(child)
+                        elif isinstance(child, yaml.MappingNode):
+                            # Redact payload-like children; keep schema
+                            # metadata (required, description) readable.
+                            for child_key, child_value in child.value:
+                                if isinstance(
+                                    child_key, yaml.ScalarNode
+                                ) and child_key.value.lower() in {
+                                    "value",
+                                    "key",
+                                    "data",
+                                    "stringdata",
+                                }:
+                                    leaves.append(child_value)
+                                else:
+                                    visit(child_value)
+                        elif isinstance(child, yaml.SequenceNode):
+                            leaves.extend(child.value)
 
                 def visit(node):
                     ident = id(node)
@@ -487,26 +487,25 @@ def redact_secrets(text: str) -> str:
                     pieces = []
                     cursor = 0
                     for start, end, replacement in sorted(set(edits)):
+                        if start < cursor:
+                            continue
                         pieces.append(text[cursor:start])
                         pieces.append(replacement)
                         cursor = end
                     pieces.append(text[cursor:])
                     text = "".join(pieces)
-            except Exception:
-                pass
+            except ImportError:
+                pass  # Optional structural layer; text rules below still run.
+            except (yaml.YAMLError, RecursionError):
+                pass  # Partial or deeply nested snippets use the text fallback.
 
     # Targeted code and shell forms. Quoted literals may contain escaped quotes;
     # bare values are redacted only when they look like literals, not names or
     # expressions. Separators and closing syntax stay outside the match.
-    credential_names = (
-        r"(?:password|passwd|passphrase|pwd|secret|token|SECRET_KEY|"
-        r"secret_key_base|aws_secret_access_key|aws_access_key_id|"
-        r"(?:[A-Za-z0-9]+[._-])*[A-Za-z0-9]*(?:PASSWORD|PASSWD|PASSPHRASE|PWD|SECRET|TOKEN)|"
-        r"(?:[A-Za-z0-9]+[._-])*api[-_]?key|(?:[A-Za-z0-9]+[._-])*x[-_]api[-_]key|"
-        r"(?:[A-Za-z0-9]+[._-])*[A-Za-z0-9]*_KEY|TOKEN_VALUE|"
-        r"[A-Za-z0-9]+(?:Password|Passwd|Passphrase|Pwd|Secret|Token)|"
-        r"api[-_]?key|apiKey|x-api-key)"
-    )
+    # The structural and text passes share the same name grammar. The
+    # predicate adds exclusions for references and common non-secret keys.
+    credential_names = secret_name_re.pattern.removeprefix("(?i)")
+
     expression_call = re.compile(r"\s*[\[(]")
     text = _sub_if(
         "!!binary",
@@ -540,11 +539,7 @@ def redact_secrets(text: str) -> str:
             .strip("'\"`")
             .lower()
         )
-        if keyname in {"primary_key", "routing-key", "cache_key"}:
-            return match.group(0)
-        if keyname == "pagetoken" and value.lower() == "nextpagetoken":
-            return match.group(0)
-        if keyname == "existingsecret":
+        if not is_secret_name(keyname):
             return match.group(0)
         if value == "$" and text.startswith("{", match.end()):
             return match.group(0)
@@ -558,7 +553,7 @@ def redact_secrets(text: str) -> str:
             return match.group(0)
         if value[0] in "'\"`":
             inner = value[1:-1]
-            if inner.startswith("${"):
+            if inner.startswith(("[REDACTED_", "${")):
                 return match.group(0)
             if len(value) == 2:
                 return match.group(0)
@@ -582,8 +577,6 @@ def redact_secrets(text: str) -> str:
                 "string",
                 "optional",
                 "none",
-                "true",
-                "false",
             }:
                 return match.group(0)  # common prose and type annotation values
         if value in {
@@ -607,7 +600,11 @@ def redact_secrets(text: str) -> str:
             # Keep JSON/YAML scalar types intact, but only for ":" mappings.
             # "=" assignments in code, shell, env and compose text are strings.
             if ":" in match.group("prefix") and (
-                json_scalar_re.fullmatch(value) or yaml_scalar_re.fullmatch(value)
+                (
+                    json_scalar_re
+                    if match.group("prefix").lstrip().startswith(('"', "'"))
+                    else yaml_scalar_re
+                ).fullmatch(value)
             ):
                 return match.group(0)
         if expression_call.match(text, match.end()):
@@ -619,24 +616,29 @@ def redact_secrets(text: str) -> str:
         )
         return match.group("prefix") + marker
 
+    anchored_value = re.compile(
+        rf"(?im)(?P<prefix>^[ \t]*(?:{credential_names})[ \t]*:[ \t\ufeff]*"
+        r"&[A-Za-z0-9_-]+[ \t\ufeff]+)(?P<value>"
+        r"'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"|[^\s,#\[\]{}|>*!]+)"
+    )
+    if not yaml_structural_ok:
+        text = anchored_value.sub(replace_literal, text)
+
     kv = re.compile(
         rf"(?i)(?P<prefix>(?<![\w'\"])(?:\b{credential_names})\b[ \t]*"
-        r"(?:(?<![:=])=(?!=)[ \t]*|(?<!:):[ \t]*(?![=])))[ \t]*(?P<value>"
+        r"(?:(?<![:=])=(?!=)[ \t]*|(?<!:):[ \t]*(?![=])))[ \t\ufeff]*(?P<value>"
         rf"(?:'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"|`(?:\\.|[^`\\])*`|[^\s,;,)}}\[{{('`\"(]+))"
     )
 
     # Redact typed literals in Python and TypeScript assignments while keeping
     # the annotation intact (the untyped pattern below intentionally skips it).
     typed_secret = re.compile(
-        rf"(?i)(?P<prefix>(?:let[ \t]+|const[ \t]+|var[ \t]+)?(?:{credential_names})"
+        rf"(?i)(?P<prefix>(?<![\w'\"])(?:let[ \t]+|const[ \t]+|var[ \t]+)?(?:{credential_names})"
         r"[ \t]*:[ \t]*(?:str|string|SecretStr|number)[ \t]*=[ \t]*)"
         r"(?P<value>'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\")"
     )
     lowered_text = text.casefold()
-    if any(
-        marker in lowered_text
-        for marker in (": str =", ": string =", ": secretstr =", ": number =")
-    ):
+    if ":" in text and "=" in text:
         text = typed_secret.sub(
             lambda m: m.group("prefix")
             + m.group("value")[0]
@@ -647,20 +649,14 @@ def redact_secrets(text: str) -> str:
     go_secret_decl = re.compile(
         rf"(?i)(?P<prefix>\b(?:{credential_names})[ \t]*:=[ \t]*)(?P<quote>['\"])(?P<value>(?:\\.|(?!\2)[^\\])*)\2"
     )
-    go_short_declarations = []
-
-    def protect_go_secret_decl(match):
-        marker = f"__GO_SHORT_DECL_{len(go_short_declarations)}__"
-        go_short_declarations.append(
-            match.group("prefix")
-            + match.group("quote")
-            + "[REDACTED_SECRET]"
-            + match.group("quote")
-        )
-        return marker
-
     if ":=" in text:
-        text = go_secret_decl.sub(protect_go_secret_decl, text)
+        text = go_secret_decl.sub(
+            lambda m: m.group("prefix")
+            + m.group("quote")
+            + "[REDACTED_SECRET]"
+            + m.group("quote"),
+            text,
+        )
     if any(
         marker in lowered_text
         for marker in (
@@ -673,6 +669,7 @@ def redact_secrets(text: str) -> str:
             "api_key",
             "api-key",
             "apikey",
+            "key",
         )
     ):
         text = kv.sub(replace_literal, text)
@@ -688,13 +685,11 @@ def redact_secrets(text: str) -> str:
     # Quoted keys occur in partial JSON and inline code dictionaries. Match
     # their literal value independently of whether the surrounding chunk parses.
     quoted_key = re.compile(
-        rf"(?i)(?P<prefix>(?P<keyquote>['\"])(?:{credential_names})(?P=keyquote)[ \t]*:[ \t]*)(?P<value>"
+        rf"(?i)(?P<prefix>(?P<keyquote>['\"])(?:{credential_names})(?P=keyquote)[ \t]*:[ \t\ufeff]*)(?P<value>"
         rf"(?:'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"|`(?:\\.|[^`\\])*`|(?![{{\[])[^\s,;}}\]]+))"
     )
     if '"' in text or "'" in text:
         text = quoted_key.sub(replace_literal, text)
-    for index, declaration in enumerate(go_short_declarations):
-        text = text.replace(f"__GO_SHORT_DECL_{index}__", declaration)
 
     # Preserve block scalar headers while replacing only their indented bodies
     # in mixed snippets that are not a complete YAML document.
@@ -779,6 +774,16 @@ def redact_secrets(text: str) -> str:
         text,
     )
 
+    text = re.sub(
+        r"(?i)(['\"]sshpass['\"][ \t]*,[ \t]*['\"]-p['\"][ \t]*,[ \t]*)"
+        r"(?P<quote>['\"])(?:\\.|(?!(?P=quote))[^\\])*(?P=quote)",
+        lambda m: m.group(1)
+        + m.group("quote")
+        + "[REDACTED_SECRET]"
+        + m.group("quote"),
+        text,
+    )
+
     # Short -p forms and common client-specific password switches.
     text = re.sub(
         r"(?i)(\bsshpass\s+(?:[^\s]+\s+)*-p\s+|\bdocker\s+login\b[^\n]*?\s-p\s+)"
@@ -791,16 +796,10 @@ def redact_secrets(text: str) -> str:
         ),
         text,
     )
-    text = _sub_if(
-        ("sshpass", "docker"),
-        r"(?i)(sshpass\s+-p\s+|docker\s+login\b[^\n]*?\s-p\s+)([^\s]+)",
-        r"\1[REDACTED_SECRET]",
-        text,
-    )
     text = re.sub(
-        r"(?i)\b(?:mysql|mysqldump|mariadb|mariadb-dump)\b[^\n]*?"
-        r"(?<![\w-])-p(?P<value>'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"|[^\s]+)",
-        lambda m: "-p"
+        r"(?P<prefix>(?i:\b(?:mysql|mysqldump|mariadb|mariadb-dump)\b)[^\n]*?"
+        r"(?<![\w-])-p)(?P<value>'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"|[^\s]+)",
+        lambda m: m.group("prefix")
         + (
             m.group("value")[0] + "[REDACTED_SECRET]" + m.group("value")[0]
             if m.group("value")[0] in "'\""
@@ -865,8 +864,15 @@ def redact_secrets(text: str) -> str:
         r"\1[REDACTED_TOKEN]",
         text,
     )
-    for index, source_line in enumerate(go_tag_lines):
-        text = text.replace(f"__CODE_INDEXER_GO_TAG_{index}__", source_line)
+    text = (
+        re.sub(
+            re.escape(go_tag_prefix) + r"(\d+)__",
+            lambda m: go_tag_lines[int(m.group(1))],
+            text,
+        )
+        if go_tag_lines
+        else text
+    )
     return text
 
 
@@ -911,83 +917,60 @@ def enforce_context_budget(
             else DEFAULT_MAX_INJECT_TOKENS
         )
 
-    if max_bytes <= 0 or max_tokens <= 0:
-        return ""
-
-    # Fast path if within limits and fences are closed
     encoded = context.encode("utf-8")
-    words = context.split()
     lines = context.splitlines(keepends=True)
     if (
         len(encoded) <= max_bytes
-        and len(words) <= max_tokens
+        and len(context.split()) <= max_tokens
         and _find_unclosed_fence(lines) is None
     ):
         return context
 
-    kept_lines: List[str] = []
-    current_bytes = 0
-    current_words = 0
-    truncated = False
-
     trunc_comment = "\n\n<!-- Context truncated to stay within budget -->"
 
-    for line in lines:
-        line_bytes = len(line.encode("utf-8"))
-        line_words = len(line.split())
-        if (current_bytes + line_bytes > max_bytes) or (
-            current_words + line_words > max_tokens
-        ):
-            truncated = True
-            if not kept_lines:
-                # Truncate oversized single line to fit
-                max_slice = max(0, max_bytes - len(trunc_comment.encode("utf-8")) - 10)
-                raw = line.encode("utf-8")[:max_slice].decode("utf-8", errors="ignore")
-                if raw:
-                    kept_lines.append(raw)
-            break
-        kept_lines.append(line)
-        current_bytes += line_bytes
-        current_words += line_words
+    def fit_prefix(candidate: str) -> str:
+        """Fit a prefix plus truncation marker and any required closing fence."""
+        # Respect word budget without flattening whitespace or line endings.
+        word_count = 0
+        token_end = len(candidate)
+        for match in re.finditer(r"\S+", candidate):
+            word_count += 1
+            if word_count > max_tokens:
+                token_end = match.start()
+                break
+        candidate = candidate[:token_end]
 
-    if not truncated and len(encoded) <= max_bytes and len(words) <= max_tokens:
-        open_fence = _find_unclosed_fence(kept_lines)
-        if open_fence:
-            close_str = f"\n{open_fence[0]}{open_fence[1]}\n"
-            closed = ("".join(kept_lines).rstrip() + close_str).strip()
+        while candidate:
+            open_fence = _find_unclosed_fence(candidate.splitlines(keepends=True))
+            close_fence = f"\n{open_fence[0]}{open_fence[1]}" if open_fence else ""
+            suffix = close_fence + trunc_comment
+            result = candidate.rstrip() + suffix
             if (
-                len(closed.encode("utf-8")) <= max_bytes
-                and len(closed.split()) <= max_tokens
+                len(result.encode("utf-8")) <= max_bytes
+                and len(result.split()) <= max_tokens
             ):
-                return closed
-            # Closing the fence can exceed a tight budget. Fall through to the
-            # trimming path, which budgets both the fence and truncation note.
-            truncated = True
-        else:
-            return context
+                return result
 
-    # Truncated: ensure any open code fence is closed and budget is respected
-    while kept_lines:
-        open_fence = _find_unclosed_fence(kept_lines)
-        close_fence = f"\n{open_fence[0]}{open_fence[1]}" if open_fence else ""
-        suffix = f"{close_fence}{trunc_comment}"
-        suffix_bytes = len(suffix.encode("utf-8"))
-        suffix_words = len(suffix.split())
+            # Remove a complete line first to preserve source formatting. If
+            # the only line is oversized, trim at a UTF-8 character boundary.
+            if "\n" in candidate.rstrip("\n"):
+                candidate = candidate.rsplit("\n", 1)[0] + "\n"
+            else:
+                candidate = candidate[:-1]
 
-        current_bytes = len("".join(kept_lines).encode("utf-8"))
-        current_words = len("".join(kept_lines).split())
+        # Very small budgets cannot fit the full marker. Return a bounded
+        # prefix of it rather than exceeding the caller's byte limit.
+        marker = "<!-- Context truncated -->"
+        return marker.encode("utf-8")[: max(0, max_bytes)].decode(
+            "utf-8", errors="ignore"
+        )
 
-        if (current_bytes + suffix_bytes <= max_bytes) and (
-            current_words + suffix_words <= max_tokens
-        ):
-            trimmed = "".join(kept_lines).rstrip() + suffix
-            return trimmed
-        kept_lines.pop()
-
-    note = trunc_comment.strip()
-    if len(note.encode("utf-8")) > max_bytes or len(note.split()) > max_tokens:
-        return ""
-    return note
+    # Keep a newline-aware prefix first. Oversized individual lines are then
+    # shortened by bytes, preserving any newline characters in the prefix.
+    reserve = len(trunc_comment.encode("utf-8")) + 8
+    max_prefix_bytes = max(0, max_bytes - reserve)
+    prefix = encoded[:max_prefix_bytes].decode("utf-8", errors="ignore")
+    return fit_prefix(prefix)
 
 
 def _context_already_present(block_text: str, context: str) -> bool:
