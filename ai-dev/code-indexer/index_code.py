@@ -60,6 +60,16 @@ SECRET_FILE_PATTERNS = [
     r"(^|/)service[-_]account.*\.json$",
     r"(^|/)(\.?aws/)?credentials.*$",
     r"(^|/)aws_credentials(\..+)?$",
+    r"(^|/)\.git-credentials$",
+    r"(^|/)\.pgpass$",
+    r"(^|/)\.dockercfg$",
+    r"(^|/)[^/]*\.tfstate[^/]*$",
+    r"(^|/)gcp-credentials\.json$",
+    r"(^|/)serviceaccount\.json$",
+    r"(^|/)\.s3cfg$",
+    r"(^|/)\.vault-token$",
+    r"(^|/)secrets\.toml$",
+    r"(^|/)[^/]*\.ppk$",
 ]
 
 
@@ -136,7 +146,11 @@ def is_secret_content(content: str) -> bool:
         return False
     if re.search(r"^\s*kind:\s*Secret\b", content, re.MULTILINE):
         return True
-    if re.search(r"-----(BEGIN|END)\s+([A-Z0-9_\s]*PRIVATE KEY)-----", content):
+    if re.search(
+        r"-----(?:BEGIN|END)\s+(?:[A-Z0-9_]+\s+)*PRIVATE KEY(?:\s+BLOCK)?-----",
+        content,
+        re.IGNORECASE,
+    ):
         return True
     return False
 
@@ -1347,6 +1361,8 @@ class CodeIndexer:
 
         marker_bytes = len(truncation_marker.encode("utf-8"))
         marker_words = len(truncation_marker.split())
+        if max_bytes < marker_bytes or max_tokens < marker_words:
+            return "", True
         target_bytes = max(0, max_bytes - marker_bytes)
         target_words = max(0, max_tokens - marker_words)
 
@@ -1641,7 +1657,37 @@ def main(args: Optional[List[str]] = None):
             if parsed_args.format == "json":
                 import json
 
-                output_str = json.dumps(chunks, indent=2)
+                safe_chunks = []
+
+                def redact_json_value(value):
+                    if isinstance(value, str):
+                        return redact_secrets(value)
+                    if isinstance(value, list):
+                        return [redact_json_value(item) for item in value]
+                    if isinstance(value, dict):
+                        result = {}
+                        for key, item in value.items():
+                            safe_key = redact_secrets(str(key))
+                            if isinstance(item, str):
+                                marker_probe = redact_secrets(f"{key}={item}")
+                                if "[REDACTED_" in marker_probe:
+                                    safe_value = marker_probe.split("=", 1)[-1]
+                                    safe_value = safe_value.strip("'\"` ")
+                                else:
+                                    safe_value = redact_secrets(item)
+                            else:
+                                safe_value = redact_json_value(item)
+                            result[safe_key] = safe_value
+                        return result
+                    return value
+
+                for chunk in chunks:
+                    file_path = chunk.get("file_path", "")
+                    content = chunk.get("content", "")
+                    if is_secret_path(file_path) or is_secret_content(content):
+                        continue
+                    safe_chunks.append(redact_json_value(chunk))
+                output_str = json.dumps(safe_chunks, indent=2)
             else:
                 output_str = markdown
 

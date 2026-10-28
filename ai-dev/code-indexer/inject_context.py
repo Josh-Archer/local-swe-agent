@@ -6,15 +6,29 @@ syntax-aware text rules when it is unavailable. The same file is mounted
 from the swe-agent ConfigMap at /config/inject_context.py.
 """
 
+import gc
 import os
 import re
 import sys
 import json
+import operator
+from itertools import chain, compress, repeat
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 DEFAULT_MAX_INJECT_BYTES: int = 16384  # 16 KiB default byte budget
 DEFAULT_MAX_INJECT_TOKENS: int = 2048  # Default token/word estimate budget
+
+
+# JSON-encoded redaction marker, computed once instead of per edit.
+_REDACTED_JSON = json.dumps("[REDACTED_SECRET]")
+_NONEMPTY_STRING = re.compile(r'"[^"]').match
+_GROUP_KEY = operator.itemgetter("key")
+_GROUP_VALUE = operator.itemgetter("value")
+_VALUE_START = operator.methodcaller("start", "value")
+_VALUE_END = operator.methodcaller("end", "value")
+# A JSON string without escapes or control characters decodes to its body.
+_SIMPLE_JSON_STRING = re.compile(r'"[^"\\\x00-\x1f]*"')
 
 
 def _sub_if(needles, pattern, repl, text):
@@ -34,6 +48,20 @@ def _sub_if(needles, pattern, repl, text):
 
 def redact_secrets(text: str) -> str:
     """Redact secret keys, tokens, credentials, and private keys from text."""
+    # The YAML node graph and per-match objects for large chunks trigger many
+    # cyclic-GC passes whose cost grows with the whole heap, which makes big
+    # inputs superlinear. Nothing here creates garbage cycles that must be
+    # reclaimed mid-call, so pause collection and restore the prior state.
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        return _redact_secrets(text)
+    finally:
+        if gc_was_enabled:
+            gc.enable()
+
+
+def _redact_secrets(text: str) -> str:
     if not text:
         return ""
 
@@ -183,7 +211,7 @@ def redact_secrets(text: str) -> str:
     secret_name_re = re.compile(
         r"(?i)(?:[a-z0-9_.-]*(?:password|passwd|passphrase|pwd|secret|token)|"
         r"[a-z0-9_.-]*api[-_]?key|[a-z0-9_.-]*_keys?|"
-        r"secret_key_base|aws_secret_access_key|aws_access_key_id)"
+        r"secret_key_base|aws_secret_access_key|aws_access_key_id|token_value)"
     )
 
     def is_secret_name(name):
@@ -209,37 +237,57 @@ def redact_secrets(text: str) -> str:
         # This preserves every byte outside edited strings, supports partial
         # chunks, and uses an explicit stack for arbitrarily deep JSON.
         tokens = re.compile(r'"(?:\\.|[^"\\])*"|[{}\[\]:,]|[^\s\ufeff{}\[\]:,"]+')
+        # Most large JSON is flat objects of simple "key": value pairs.
+        # Matching such an object (or a lone pair) as one token keeps the
+        # per-item Python work small, which matters a lot under line tracers
+        # such as coverage on Python 3.12. Anything else (escapes, nesting,
+        # partial chunks) goes through the general token handler.
+        simple_string = r'"[^"\\\x00-\x1f]*"'
+        bare = r'[^\s\ufeff{}\[\]:,"]+'
+        gap = r"[\s\ufeff]*"
+        pair = rf"{simple_string}{gap}:{gap}(?:{simple_string}|{bare})"
+        pair_re = re.compile(
+            rf'"(?P<key>[^"\\\x00-\x1f]*)"{gap}:{gap}(?P<value>{simple_string}|{bare})'
+        )
+        flat_object = rf"\{{{gap}(?:{pair}(?:{gap},{gap}{pair})*)?{gap}\}}"
+        flat_object_re = re.compile(flat_object)
+        scan = re.compile(
+            rf"(?P<objects>{flat_object}(?:{gap},{gap}{flat_object})*)"
+            rf"(?:{gap}(?P<comma>,))?"
+            rf"|{pair_re.pattern}"
+            r'|"(?:\\.|[^"\\])*"|[{}\[\]:,]|[^\s\ufeff{}\[\]:,"]+'
+        )
         frames = []
         edits = []
-        for token in tokens.finditer(text):
+        secret_names = {}
+
+        def handle(token):
             raw = token.group()
             frame = frames[-1] if frames else None
             if raw in ("}", "]"):
                 if not frames:
-                    continue
+                    return
                 closed = frames.pop()
                 entries = closed["entries"]
                 name = entries.get("name")
                 value = entries.get("value")
                 if name and value and is_secret_name(name[0]) and value[0]:
-                    edits.append((*value[1], json.dumps("[REDACTED_SECRET]")))
+                    edits.append((*value[1], _REDACTED_JSON))
                 args = closed["args"]
                 if args and args[0][0] == "sshpass":
                     for previous, argument in zip(args, args[1:]):
                         if previous[0] == "-p" and argument[0]:
-                            edits.append(
-                                (*argument[1], json.dumps("[REDACTED_SECRET]"))
-                            )
-                continue
+                            edits.append((*argument[1], _REDACTED_JSON))
+                return
             if raw == ":":
                 if frame:
                     frame["expect_key"] = False
-                continue
+                return
             if raw == ",":
                 if frame:
                     frame["expect_key"] = frame["object"]
                     frame["key"] = None
-                continue
+                return
             key = frame["key"] if frame else None
             inherited = bool(frame and frame["secret"])
             if raw in ("{", "["):
@@ -253,13 +301,18 @@ def redact_secrets(text: str) -> str:
                         "args": [],
                     }
                 )
-                continue
+                return
             if not frame:
-                continue
+                return
             try:
-                value = json.loads(raw) if raw.startswith('"') else None
+                if not raw.startswith('"'):
+                    value = None
+                elif _SIMPLE_JSON_STRING.fullmatch(raw):
+                    value = raw[1:-1]
+                else:
+                    value = json.loads(raw)
             except ValueError:
-                continue
+                return
             if frame["expect_key"]:
                 frame["key"] = value
             else:
@@ -269,17 +322,103 @@ def redact_secrets(text: str) -> str:
                 else:
                     frame["args"].append((value, span))
                 if value and (inherited or is_secret_name(key)):
-                    edits.append((*span, json.dumps("[REDACTED_SECRET]")))
+                    edits.append((*span, _REDACTED_JSON))
                 elif value and key == "authorization":
                     edits.append((*span, json.dumps(auth_redacted(value))))
-        pieces = []
-        cursor = 0
-        for start, end, replacement in sorted(set(edits)):
-            if start < cursor:
+
+        for token in scan.finditer(text):
+            if token.group("objects") is not None:
+                # A run of flat objects of simple pairs: same result as
+                # pushing a frame per object, handling each pair, and closing
+                # it. Common runs are filtered with C-level map/compress so
+                # the per-pair cost stays low even under line tracers such
+                # as coverage on Python 3.12.
+                parent = frames[-1] if frames else None
+                if parent and parent["secret"]:
+                    secret = True
+                else:
+                    parent_key = parent["key"] if parent else None
+                    secret = secret_names.get(parent_key)
+                    if secret is None:
+                        secret = secret_names[parent_key] = is_secret_name(parent_key)
+                span = token.span("objects")
+                body = token.group("objects")
+                if '"name"' in body or '"authorization"' in body:
+                    for flat in flat_object_re.finditer(text, *span):
+                        entries = {}
+                        for item in pair_re.finditer(text, *flat.span()):
+                            key, raw = item.groups()
+                            value = raw[1:-1] if raw.startswith('"') else None
+                            entries[key] = (value, item.span("value"))
+                            if value and (secret or is_secret_name(key)):
+                                edits.append((*item.span("value"), _REDACTED_JSON))
+                            elif value and key == "authorization":
+                                edits.append(
+                                    (
+                                        *item.span("value"),
+                                        json.dumps(auth_redacted(value)),
+                                    )
+                                )
+                        name = entries.get("name")
+                        value = entries.get("value")
+                        if name and value and is_secret_name(name[0]) and value[0]:
+                            edits.append((*value[1], _REDACTED_JSON))
+                else:
+                    pairs = list(pair_re.finditer(text, *span))
+                    if not secret:
+                        keys = list(map(_GROUP_KEY, pairs))
+                        for key in set(keys).difference(secret_names):
+                            secret_names[key] = is_secret_name(key)
+                        pairs = list(
+                            compress(pairs, map(secret_names.__getitem__, keys))
+                        )
+                    pairs = list(
+                        compress(pairs, map(_NONEMPTY_STRING, map(_GROUP_VALUE, pairs)))
+                    )
+                    edits.extend(
+                        zip(
+                            map(_VALUE_START, pairs),
+                            map(_VALUE_END, pairs),
+                            repeat(_REDACTED_JSON),
+                        )
+                    )
+                if token.group("comma") and parent and parent["object"]:
+                    parent["expect_key"] = True
+                    parent["key"] = None
                 continue
-            pieces.extend((text[cursor:start], replacement))
-            cursor = end
-        pieces.append(text[cursor:])
+            key = token.group("key")
+            if key is None:
+                if frames and token.group() == ",":
+                    frame = frames[-1]
+                    frame["expect_key"] = frame["object"]
+                    frame["key"] = None
+                    continue
+                handle(token)
+                continue
+            frame = frames[-1] if frames else None
+            if not (frame and frame["object"] and frame["expect_key"]):
+                for part in tokens.finditer(text, *token.span()):
+                    handle(part)
+                continue
+            frame["key"] = key
+            frame["expect_key"] = False
+            raw = token.group("value")
+            value = raw[1:-1] if raw.startswith('"') else None
+            span = token.span("value")
+            frame["entries"][key] = (value, span)
+            if value and (frame["secret"] or is_secret_name(key)):
+                edits.append((*span, _REDACTED_JSON))
+            elif value and key == "authorization":
+                edits.append((*span, json.dumps(auth_redacted(value))))
+        # Scanner edits are whole string tokens, so spans never partially
+        # overlap; the set only drops duplicate edits of the same token.
+        # Slicing and joining happen in C rather than a per-edit loop.
+        pieces = [text]
+        if edits:
+            starts, ends, replacements = zip(*sorted(set(edits)))
+            gaps = map(text.__getitem__, map(slice, (0, *ends), starts))
+            pieces = list(chain.from_iterable(zip(gaps, replacements)))
+            pieces.append(text[ends[-1] :])
         text = "".join(pieces)
     else:
         yaml_input = text.replace("\ufeff", "")
@@ -401,6 +540,7 @@ def redact_secrets(text: str) -> str:
                         if isinstance(child, yaml.ScalarNode):
                             add_scalar(child)
                         elif isinstance(child, yaml.MappingNode):
+                            # Every string leaf under a secret-named key.
                             leaves.extend(v for _, v in child.value)
                         elif isinstance(child, yaml.SequenceNode):
                             leaves.extend(child.value)
@@ -497,7 +637,7 @@ def redact_secrets(text: str) -> str:
     text = _sub_if(
         "!!binary",
         rf"(?i)(?P<prefix>(?:\b{credential_names})\b[ \t]*:[ \t]*)!!binary[ \t]+[^\s,;}}]+",
-        lambda match: match.group("prefix") + json.dumps("[REDACTED_SECRET]"),
+        lambda match: match.group("prefix") + _REDACTED_JSON,
         text,
     )
     identifier_re = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*")
@@ -596,19 +736,35 @@ def redact_secrets(text: str) -> str:
                 return match.group(0)
         if expression_call.match(text, match.end()):
             return match.group(0)
-        marker = (
-            json.dumps("[REDACTED_SECRET]")
-            if ":" in match.group("prefix")
-            else "[REDACTED_SECRET]"
-        )
+        marker = _REDACTED_JSON if ":" in match.group("prefix") else "[REDACTED_SECRET]"
         return match.group("prefix") + marker
+
+    uncached_replace_literal = replace_literal
+    literal_cache = {}
+
+    def replace_literal(match):
+        # Large chunks repeat the same assignment many times. The decision
+        # depends only on the match text and the two lookahead checks, so
+        # memoize it instead of re-running every predicate per occurrence.
+        end = match.end()
+        key = (
+            match.group("prefix"),
+            match.group("value"),
+            text.startswith("{", end),
+            expression_call.match(text, end) is not None,
+        )
+        cached = literal_cache.get(key)
+        if cached is None:
+            cached = uncached_replace_literal(match)
+            literal_cache[key] = cached
+        return cached
 
     anchored_value = re.compile(
         rf"(?im)(?P<prefix>^[ \t]*(?:{credential_names})[ \t]*:[ \t\ufeff]*"
         r"&[A-Za-z0-9_-]+[ \t\ufeff]+)(?P<value>"
         r"'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"|[^\s,#\[\]{}|>*!]+)"
     )
-    if not yaml_structural_ok:
+    if not yaml_structural_ok and "&" in text:
         text = anchored_value.sub(replace_literal, text)
 
     kv = re.compile(
