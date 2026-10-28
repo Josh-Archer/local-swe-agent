@@ -74,7 +74,7 @@ Validates:
 **File**: `.github/workflows/python-tests.yml`
 
 Tests:
-- Python 3.10 and 3.11 compatibility
+- Python 3.11 and 3.12 compatibility
 - Code formatting with `black`
 - Linting with `flake8`
 - Type checking with `mypy`

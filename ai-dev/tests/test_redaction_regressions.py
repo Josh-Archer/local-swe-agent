@@ -206,11 +206,15 @@ def test_yaml_structure(redact, value, template):
         'password: "VAL\ufeffUE"\nkeep: yes\n',
         '\ufeffpassword: &pw \ufeff"VALUE"\ncopy: *pw\n',
         '{"password": \ufeff"VALUE", "keep": 1}',
+        '\ufeff\ufeffpass\ufeff\ufeffword: \ufeff\ufeff"VAL\ufeff\ufeffUE"\nkeep: yes\ufeff\ufeff',
+        'keep: yes\npassword: "VAL\ufeff\ufeffUE"\n\ufeff\ufefftoken: "VALUE"\ufeff\ufeff',
     ],
 )
 def test_BOM_before_and_inside_values(redact, value, template):
-    source = template.replace("VALUE", value).replace(
-        "VAL\ufeffUE", value[:3] + "\ufeff" + value[3:]
+    source = (
+        template.replace("VALUE", value)
+        .replace("VAL\ufeffUE", value[:3] + "\ufeff" + value[3:])
+        .replace("VAL\ufeff\ufeffUE", value[:3] + "\ufeff\ufeff" + value[3:])
     )
     output = redact(source)
     assert value not in output.replace("\ufeff", "")
