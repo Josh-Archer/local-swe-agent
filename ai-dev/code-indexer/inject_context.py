@@ -6,6 +6,7 @@ syntax-aware text rules when it is unavailable. The same file is mounted
 from the swe-agent ConfigMap at /config/inject_context.py.
 """
 
+import gc
 import os
 import re
 import sys
@@ -34,6 +35,20 @@ def _sub_if(needles, pattern, repl, text):
 
 def redact_secrets(text: str) -> str:
     """Redact secret keys, tokens, credentials, and private keys from text."""
+    # The YAML node graph and per-match objects for large chunks trigger many
+    # cyclic-GC passes whose cost grows with the whole heap, which makes big
+    # inputs superlinear. Nothing here creates garbage cycles that must be
+    # reclaimed mid-call, so pause collection and restore the prior state.
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        return _redact_secrets(text)
+    finally:
+        if gc_was_enabled:
+            gc.enable()
+
+
+def _redact_secrets(text: str) -> str:
     if not text:
         return ""
 
@@ -186,7 +201,18 @@ def redact_secrets(text: str) -> str:
         r"secret_key_base|aws_secret_access_key|aws_access_key_id|token_value)"
     )
 
+    secret_name_cache = {}
+
     def is_secret_name(name):
+        # Key names repeat heavily in large chunks; memoize the regex check.
+        if isinstance(name, str):
+            cached = secret_name_cache.get(name)
+            if cached is None:
+                cached = secret_name_cache[name] = uncached_is_secret_name(name)
+            return cached
+        return uncached_is_secret_name(name)
+
+    def uncached_is_secret_name(name):
         normalized = name.replace("\ufeff", "") if isinstance(name, str) else ""
         if normalized.lower() in {
             "existingsecret",
@@ -616,12 +642,32 @@ def redact_secrets(text: str) -> str:
         )
         return match.group("prefix") + marker
 
+    uncached_replace_literal = replace_literal
+    literal_cache = {}
+
+    def replace_literal(match):
+        # Large chunks repeat the same assignment many times. The decision
+        # depends only on the match text and the two lookahead checks, so
+        # memoize it instead of re-running every predicate per occurrence.
+        end = match.end()
+        key = (
+            match.group("prefix"),
+            match.group("value"),
+            text.startswith("{", end),
+            expression_call.match(text, end) is not None,
+        )
+        cached = literal_cache.get(key)
+        if cached is None:
+            cached = uncached_replace_literal(match)
+            literal_cache[key] = cached
+        return cached
+
     anchored_value = re.compile(
         rf"(?im)(?P<prefix>^[ \t]*(?:{credential_names})[ \t]*:[ \t\ufeff]*"
         r"&[A-Za-z0-9_-]+[ \t\ufeff]+)(?P<value>"
         r"'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"|[^\s,#\[\]{}|>*!]+)"
     )
-    if not yaml_structural_ok:
+    if not yaml_structural_ok and "&" in text:
         text = anchored_value.sub(replace_literal, text)
 
     kv = re.compile(
