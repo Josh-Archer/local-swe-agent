@@ -540,20 +540,8 @@ def _redact_secrets(text: str) -> str:
                         if isinstance(child, yaml.ScalarNode):
                             add_scalar(child)
                         elif isinstance(child, yaml.MappingNode):
-                            # Redact payload-like children; keep schema
-                            # metadata (required, description) readable.
-                            for child_key, child_value in child.value:
-                                if isinstance(
-                                    child_key, yaml.ScalarNode
-                                ) and child_key.value.lower() in {
-                                    "value",
-                                    "key",
-                                    "data",
-                                    "stringdata",
-                                }:
-                                    leaves.append(child_value)
-                                else:
-                                    visit(child_value)
+                            # Every string leaf under a secret-named key.
+                            leaves.extend(v for _, v in child.value)
                         elif isinstance(child, yaml.SequenceNode):
                             leaves.extend(child.value)
 

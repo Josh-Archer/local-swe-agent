@@ -2368,11 +2368,31 @@ class TestSecretDenylistAndRedaction:
             "key": "repository",
             "token_type": "phrase",
         }
+        # Secret-named mappings redact every string leaf (security over
+        # readability); non-string scalars such as booleans stay as-is.
         yaml = "password:\n  required: true\n  description: keep this\nnext: value\n"
-        assert redact_secrets(yaml) == yaml
+        assert redact_secrets(yaml) == (
+            'password:\n  required: true\n  description: "[REDACTED_SECRET]"\n'
+            "next: value\n"
+        )
         assert redact_secrets("key=\"repository\"\ntoken_type='phrase'\npasswd=''") == (
             "key=\"repository\"\ntoken_type='phrase'\npasswd=''"
         )
+
+    def test_yaml_secret_named_mappings_redact_all_nested_string_leaves(self):
+        from inject_context import redact_secrets
+
+        leaks = ["leak" + str(n) + "-" + "runtime" + "value" for n in (1, 3, 6)]
+        pw = "pass" + "word"
+        samples = [
+            f"{pw}:\n  prod: {leaks[0]}\n",
+            "credentials:\n  token:\n    x: " + leaks[1] + "\n",
+            f"db:\n  {pw}:\n    primary: {leaks[2]}\n",
+        ]
+        for sample, leak in zip(samples, leaks):
+            output = redact_secrets(sample)
+            assert leak not in output
+            assert "[REDACTED_SECRET]" in output
 
     def test_authorization_templates_and_scheme_less_values(self):
         import json
