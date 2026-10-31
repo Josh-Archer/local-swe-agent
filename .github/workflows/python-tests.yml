@@ -20,7 +20,7 @@ permissions:
 jobs:
   test-python-code:
     name: Test Python Code
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'uecb-shared' }}
     strategy:
       matrix:
         # filelock>=4.2.1 and httpx2==2.16.0 require Python >=3.11.
@@ -81,7 +81,7 @@ jobs:
 
   lint-python:
     name: Python Linting & Security
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'uecb-shared' }}
 
     steps:
       - name: Checkout code
