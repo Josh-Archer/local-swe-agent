@@ -13,7 +13,7 @@ permissions:
 jobs:
   validate-manifests:
     name: Validate Kubernetes Manifests
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'uecb-shared' }}
 
     steps:
       - name: Checkout code
@@ -63,7 +63,7 @@ jobs:
 
   lint-shell-scripts:
     name: Lint Shell Scripts
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'uecb-shared' }}
 
     steps:
       - name: Checkout code
@@ -77,7 +77,7 @@ jobs:
 
   check-security:
     name: Security Scanning
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'uecb-shared' }}
     permissions:
       contents: read
       security-events: write
@@ -117,7 +117,7 @@ jobs:
 
   test-deployment-dry-run:
     name: Test Deployment (Dry Run)
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'uecb-shared' }}
     needs: validate-manifests
 
     steps:
