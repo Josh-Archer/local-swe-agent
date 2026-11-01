@@ -2,7 +2,7 @@ name: Docker Build & Test
 
 on:
   push:
-    branches: [ main, master, develop ]
+    branches: [ master ]
     paths:
       - 'ai-dev/code-indexer/Dockerfile'
       - 'ai-dev/code-indexer/*.py'
@@ -21,6 +21,10 @@ env:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build-and-test:

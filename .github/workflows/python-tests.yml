@@ -2,7 +2,7 @@ name: Python Tests
 
 on:
   push:
-    branches: [ main, master, develop ]
+    branches: [ master ]
     paths:
       - 'ai-dev/code-indexer/**'
       - 'ai-dev/tests/**'
@@ -16,6 +16,10 @@ on:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test-python-code:
