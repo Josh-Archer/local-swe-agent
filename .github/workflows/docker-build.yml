@@ -29,7 +29,7 @@ concurrency:
 jobs:
   build-and-test:
     name: Build and Test Docker Image
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'uecb-shared' }}
     permissions:
       contents: read
       packages: write
@@ -120,7 +120,7 @@ jobs:
 
   hadolint:
     name: Lint Dockerfile
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'uecb-shared' }}
 
     steps:
       - name: Checkout code
